@@ -1,0 +1,26 @@
+[Unit]
+Description=iPhone OS 2 (emulated iPod touch 2G) kiosk on the main display
+After=systemd-user-sessions.service plymouth-quit-wait.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+User=rpiios
+Group=rpiios
+SupplementaryGroups=video render input audio
+# Own tty1 so SDL can become DRM master and read the keyboard.
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+Environment=SDL_VIDEODRIVER=kmsdrm
+ExecStart=/opt/rpiios/scripts/run-ios.sh
+# The guest has no clean shutdown path; if it crashes or you power it off
+# with P held, just start it again.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
