@@ -52,6 +52,11 @@ This fetches the pinned xnu-hd2 commit, applies `patches/xnu/`, builds the
 toolchain into `out/toolchain` and the kernel into `out/build/`.
 To build an SD card by hand instead, see `docs/SDCARD.txt`.
 
+`tools/flash-sdcard.sh` is the end-user version: given prebuilt boot files in
+`boot/` next to it, it writes a real card (`sudo tools/flash-sdcard.sh
+/dev/sdX ios7.rar`) or a `.img`, extracting `rootfs.hfs` from the HD2
+archive itself and reading everything back to verify.
+
 Test in QEMU (Raspberry Pi 2 machine: same peripherals as the 3B+ in 32-bit
 mode):
 
