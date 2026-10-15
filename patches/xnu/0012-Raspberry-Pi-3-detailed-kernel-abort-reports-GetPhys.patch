@@ -1,0 +1,222 @@
+From 8006a0d23ac9419a61a21a363770778ee24b4f9c Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 13:54:26 +0000
+Subject: [PATCH] Raspberry Pi 3: detailed kernel abort reports; GetPhysAddr,
+ IRQ T-bit, cache-attr range fixes
+
+Seventh real-hardware boot reached the iOS lock screen; unlocking
+panicked with a kernel prefetch abort at pc 0xc0ef1128, lr
+copyinmsg+0x2c: copyinmsg's saved return address on the kernel stack
+held a stale value (the caller's r6/r8) while sp was balanced. Not
+reproducible in QEMU. To find the writer, and to remove candidates:
+
+- Kernel prefetch/data abort panics on the Pi print all registers, 24
+  stack words from sp-0x20 and the r7 frame chain, using ATS1CPR to
+  never fault while reporting; the red screen shows 22 text lines.
+- GetPhysAddr (flush_dcache/invalidate_icache physical paths,
+  dcache_incoherent_io_flush64/store64) used callee-saved r4: use ip.
+- Kernel IRQ entry set bit 0 of the return address even for A32 code
+  (CONSTRAINED UNPREDICTABLE on ARMv8): only for Thumb.
+- pmap_set_cache_attributes ignores pages that are not managed RAM.
+---
+ xnu/osfmk/arm/asm_help.h  | 11 ++++++++
+ xnu/osfmk/arm/pmap.c      |  2 ++
+ xnu/osfmk/arm/trap.c      | 57 +++++++++++++++++++++++++++++++++++++++
+ xnu/osfmk/arm/traps_lo.s  | 11 ++++++++
+ xnu/pexpert/arm/pe_rpi3.c |  8 +++---
+ 5 files changed, 85 insertions(+), 4 deletions(-)
+
+diff --git a/xnu/osfmk/arm/asm_help.h b/xnu/osfmk/arm/asm_help.h
+index 258b8fb..ac3f54f 100644
+--- a/xnu/osfmk/arm/asm_help.h
++++ b/xnu/osfmk/arm/asm_help.h
+@@ -134,6 +134,16 @@
+ /*
+  * Helper macro to get physical address mapping in virtual address space.
+  */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++/* r4 is callee-saved and these routines are called from C: use ip. */
++#define GetPhysAddr(rX) \
++    LoadConstantToReg(_gPhysBase, ip); \
++    ldr     ip, [ip]; \
++    sub     rX, rX, ip; \
++    LoadConstantToReg(_gVirtBase, ip); \
++    ldr     ip, [ip]; \
++    add     rX, rX, ip
++#else
+ #define GetPhysAddr(rX) \
+     LoadConstantToReg(_gPhysBase, r4); \
+     ldr     r4, [r4]; \
+@@ -141,6 +151,7 @@
+     LoadConstantToReg(_gVirtBase, r4); \
+     ldr     r4, [r4]; \
+     add     rX, rX, r4
++#endif
+ 
+ /*
+  * Thread crap.
+diff --git a/xnu/osfmk/arm/pmap.c b/xnu/osfmk/arm/pmap.c
+index 1c62b99..66ac704 100644
+--- a/xnu/osfmk/arm/pmap.c
++++ b/xnu/osfmk/arm/pmap.c
+@@ -1448,6 +1448,8 @@ void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr)
+      * sharing ordinary RAM with the CPU (the display copies through the
+      * CPU), so only real I/O mappings stay uncached; the rest is RAM.
+      */
++    if (!pmap_valid_page(pn))
++        return;     /* not managed RAM: no pv entry to update (no range check below) */
+     boolean_t io = (cacheattr != VM_WIMG_USE_DEFAULT) &&
+                    (cacheattr & VM_MEM_NOT_CACHEABLE) && cacheattr != VM_WIMG_WCOMB;
+     template = io ? 0 : ARM_NORMAL_MEMORY_ATTR;
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index 727b21b..d668a89 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -394,6 +394,57 @@ void rpi3_watchdog_start(void)
+  * and hides this). So whenever an abort is handled and the instruction is
+  * about to be retried, drop all cached translations first.
+  */
++/* Read a kernel word only if the MMU can translate it (ATS1CPR/PAR), so a
++ * panic report never faults on a bad pointer. */
++static int rpi3_peek(uint32_t addr, uint32_t *out)
++{
++    uint32_t par;
++    if (addr & 3U)
++        return 0;
++    __asm__ volatile("mcr p15, 0, %1, c7, c8, 0\n"   /* ATS1CPR */
++                     "isb sy\n"
++                     "mrc p15, 0, %0, c7, c4, 0"      /* PAR */
++                     : "=r"(par) : "r"(addr) : "memory");
++    if (par & 1U)
++        return 0;
++    *out = *(volatile uint32_t *) addr;
++    return 1;
++}
++
++/*
++ * Kernel abort panic for the Pi's red screen (22 lines of 38 characters):
++ * registers, 24 stack words from sp-0x20, and the r7 frame chain (Thumb
++ * -O0 frames: [r7] = caller's r7, [r7+4] = return address).
++ */
++static void rpi3_kernel_abort_panic(abort_information_context_t *c, const char *what,
++                                    uint32_t far, uint32_t fsr)
++{
++    char b[900];
++    uint32_t n = 0, i, w, fp, at;
++    n += snprintf(b + n, sizeof(b) - n, "%s FAR %08x FSR %03x\n", what, far, fsr);
++    n += snprintf(b + n, sizeof(b) - n, "PC %08x LR %08x SP %08x\n", c->pc, c->lr, c->sp);
++    for (i = 0; i < 12; i += 4)
++        n += snprintf(b + n, sizeof(b) - n, "R%u %08x %08x %08x %08x\n", i,
++                      c->r[i], c->r[i + 1], c->r[i + 2], c->r[i + 3]);
++    n += snprintf(b + n, sizeof(b) - n, "R12 %08x CPSR %08x\nSTACK FROM SP-20:\n", c->r[12], c->cpsr);
++    for (at = c->sp - 0x20, i = 0; i < 24; i++, at += 4) {
++        if (rpi3_peek(at, &w)) n += snprintf(b + n, sizeof(b) - n, "%08x", w);
++        else n += snprintf(b + n, sizeof(b) - n, "--------");
++        n += snprintf(b + n, sizeof(b) - n, (i % 4 == 3) ? "\n" : " ");
++    }
++    n += snprintf(b + n, sizeof(b) - n, "BT");
++    for (fp = c->r[7], i = 0; i < 8; i++) {
++        uint32_t next, ret;
++        if (!rpi3_peek(fp, &next) || !rpi3_peek(fp + 4, &ret)) break;
++        n += snprintf(b + n, sizeof(b) - n, " %08x", ret);
++        if (i == 2) n += snprintf(b + n, sizeof(b) - n, "\n");
++        if (next <= fp) break;
++        fp = next;
++    }
++    snprintf(b + n, sizeof(b) - n, "\n");
++    panic_context(0, (void *) c, "%s", b);
++}
++
+ static void rpi3_sleh_abort(void *context, int reason);
+ void sleh_abort(void *context, int reason)
+ {
+@@ -524,6 +575,9 @@ void sleh_abort(void *context, int reason)
+                     /*
+                      * Still, die in a fire.
+                      */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++                    rpi3_kernel_abort_panic(arm_ctx, "KERNEL PREFETCH ABORT", ifar, ifsr);
++#endif
+                     panic_context(0, (void *) arm_ctx,
+                                   "Kernel prefetch abort. (faulting address: 0x%08x, saved state 0x%08x)\n"
+                                   "  r0: 0x%08x  r1: 0x%08x  r2: 0x%08x  r3: 0x%08x\n"
+@@ -574,6 +628,9 @@ void sleh_abort(void *context, int reason)
+                          * Attempt to fault the page against the kernel map.
+                          */
+                         if (!thread->recover) {
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++                            rpi3_kernel_abort_panic(arm_ctx, "KERNEL DATA ABORT", dfar, dfsr);
++#endif
+                             panic_context(0, (void *) arm_ctx,
+                                           "Kernel data abort. (faulting address: 0x%08x, saved state 0x%08x)\n"
+                                           "  r0: 0x%08x  r1: 0x%08x  r2: 0x%08x  r3: 0x%08x\n"
+diff --git a/xnu/osfmk/arm/traps_lo.s b/xnu/osfmk/arm/traps_lo.s
+index 657c7c3..1cbfc11 100644
+--- a/xnu/osfmk/arm/traps_lo.s
++++ b/xnu/osfmk/arm/traps_lo.s
+@@ -520,6 +520,16 @@ irqhandler_from_kernel:
+     sub     sp, sp, #0x50
+     stmea   sp, {r0-r12}
+ 
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    /* Save SPSR; mark the return address as Thumb only for Thumb code (an
++     * A32 return address with bit 0 set is CONSTRAINED UNPREDICTABLE on
++     * ARMv8). */
++    mrs     r4, spsr
++    str     r4, [sp, #0x40]
++    tst     r4, #0x20
++    orrne   lr, lr, #1
++    str     lr, [sp, #0x3C]
++#else
+     /* Set t-bit */
+     orr     lr, lr, #1
+ 
+@@ -529,6 +539,7 @@ irqhandler_from_kernel:
+     /* Save SPSR */
+     mrs     r4, spsr
+     str     r4, [sp, #0x40]
++#endif
+ 
+     /* Change modes */
+     mov     r5, sp
+diff --git a/xnu/pexpert/arm/pe_rpi3.c b/xnu/pexpert/arm/pe_rpi3.c
+index 9ae2088..15d7811 100644
+--- a/xnu/pexpert/arm/pe_rpi3.c
++++ b/xnu/pexpert/arm/pe_rpi3.c
+@@ -217,7 +217,7 @@ int ios7leo_fatal_report(unsigned int category, unsigned int site,
+ }
+ 
+ static volatile unsigned int panic_text_mode, panic_text_len, panic_text_truncated;
+-static char panic_text[384];
++static char panic_text[1024];
+ static unsigned int panic_reason, panic_reason_known;
+ 
+ int ios7leo_panic_text_begin(unsigned int reason, unsigned int reason_known,
+@@ -249,13 +249,13 @@ void ios7leo_panic_text_end(void)
+     if (panic_text_mode != 1) return;
+     panic_text_mode = 2;
+     if (!rpi_pixels) return;
+-    for (y = 280; y < 620; y++)
++    for (y = 280; y < RPI3_FB_HEIGHT; y++)
+         for (x = 0; x < RPI3_FB_WIDTH; x++)
+             rpi_pixels[y * RPI3_FB_WIDTH + x] = 0xf800;
+     draw_text("FORMATTED PANIC", 15, 8, 280);
+     draw_number(panic_reason_known ? panic_reason : 0xffffffffU, 8, 310, 0xffff);
+     draw_text("CONTEXT REASON", 14, 120, 310);
+-    for (line = 0; line < 12 && at < panic_text_len; line++) {
++    for (line = 0; line < 22 && at < panic_text_len; line++) {
+         for (n = 0; n < 38 && at < panic_text_len && panic_text[at] != '\n'; at++) {
+             char c = panic_text[at];
+             if (c != '\r') part[n++] = c;
+@@ -265,7 +265,7 @@ void ios7leo_panic_text_end(void)
+         if (at < panic_text_len && panic_text[at] == '\n') at++;
+     }
+     if (at < panic_text_len || panic_text_truncated)
+-        draw_text("TEXT TRUNCATED", 14, 8, 600);
++        draw_text("TEXT TRUNCATED", 14, 8, 782);
+     sync_writes();
+ }
+ 
+-- 
+2.43.0
+
