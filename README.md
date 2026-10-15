@@ -34,8 +34,11 @@ timer, display, SD, input) and reuses the root filesystem unchanged.
 | AppleKeyStore stand-in (no passcode) | done |
 | iOS 7 lock handoff (`thread_switch` options 3-5; contended locks used to spin) | done |
 | Render pacing: CPU rendering gets at most about half the CPU, so input and I/O keep up | done |
-| Slide to unlock, home screen, page swipes | **works in QEMU**; to be confirmed on the Pi |
-| Opening apps | not yet: a tapped icon highlights but the app does not open |
+| Slide to unlock, home screen, page swipes | works, QEMU and real hardware |
+| Apps: Settings opens and browses; right click = Home | works in QEMU (Settings also on the Pi) |
+| Guarded fd syscalls (sqlite), general IOSurfaceCreate, launch watchdog off (`tools/rootfs-tweaks.py`) | done |
+| ARM clock raised to the firmware maximum by the boot shim | done |
+| More than one CPU core | not yet: the kernel port is uniprocessor |
 
 The kernel is built with `-O2` on the Pi (the HD2 kernel stays `-O0`).
 
