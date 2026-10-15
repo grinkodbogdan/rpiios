@@ -1,4 +1,4 @@
-From 753d5ec51dd1ad34237c165d1601af95511fa74f Mon Sep 17 00:00:00 2001
+From 6ffc5221bd0095aa6d0b7864d7ef426ac52a5540 Mon Sep 17 00:00:00 2001
 From: rpiios <grinkod.bogdan@gmail.com>
 Date: Thu, 15 Oct 2026 14:19:44 +0000
 Subject: [PATCH] Raspberry Pi 3: reliable mouse-to-touch; right button as Home
@@ -21,8 +21,9 @@ pointer froze while the button was held.
   keyboard event layout follows IOHIDFamily's IOHIDKeyboardEventData).
 ---
  .../ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp  |  37 +++-
+ .../IOS7LeoTouchQueueProtocol.h               |   8 +-
  .../ARM/AppleARMPlatform/rpi3_touch.cpp       | 181 ++++++++++++------
- 2 files changed, 156 insertions(+), 62 deletions(-)
+ 3 files changed, 163 insertions(+), 63 deletions(-)
 
 diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp
 index 711073f..83c85f6 100644
@@ -93,6 +94,25 @@ index 711073f..83c85f6 100644
   if(!report.down && !previousDown){IOLockUnlock(lock);return;}
   if(!leo_touch_make_hid_packet(report.x,report.y,report.down,previousDown,
    mach_absolute_time(),getRegistryEntryID(),&pendingPacket)){IOLockUnlock(lock);return;}
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoTouchQueueProtocol.h b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoTouchQueueProtocol.h
+index dfa4eee..3e93841 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoTouchQueueProtocol.h
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoTouchQueueProtocol.h
+@@ -28,7 +28,13 @@ static int leo_touch_queue_enqueue(volatile QueueWord *head,volatile QueueWord *
+  typedef char LeoQueueWord32[(sizeof(QueueWord)==4)?1:-1];(void)sizeof(LeoQueueWord32);
+  if(notificationFlags)*notificationFlags=0;
+  if(!head || !tail || !queue || !data || !hooks || !hooks->barrier || !hooks->copy ||
+-  !notificationFlags || capacity!=4096U || bytes!=204U)return 0;
++  !notificationFlags || capacity!=4096U)return 0;
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++ /* 204-byte touch packets, and the 56-byte Home key packet (rpi3). */
++ if(bytes!=204U && bytes!=56U)return 0;
++#else
++ if(bytes!=204U)return 0;
++#endif
+  uint32_t h=*head,t=*tail,entry=bytes+4U;
+  if(h>capacity || t>capacity || (h&3U) || (t&3U))return 0;
+  hooks->barrier(hooks->cookie);
 diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
 index 1a059bc..f1699af 100644
 --- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
