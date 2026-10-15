@@ -1,0 +1,353 @@
+From 191ef7798cbc49b766fe9f7ab6e53a562ea7f676 Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 11:39:03 +0000
+Subject: [PATCH] Raspberry Pi 3: write-back cacheable RAM and early D-cache
+ (Cortex-A53)
+
+On real hardware the Pi kernel died at boot stage 6 with a data abort in
+try_add (hw_atomic_add from lck_grp_reference), FSR 0x405: "unsupported
+exclusive access". The Cortex-A53 handles ldrex/strex to non-cacheable
+memory through the external exclusive monitor, which the BCM2837 lacks.
+This kernel runs with the D-cache off until cache_initialize() and maps
+RAM write-through, which the A53 also treats as non-cacheable. The HD2's
+Scorpion and QEMU both accept that; the A53 does not, for the kernel or
+for iOS userland.
+
+For BOARD_CONFIG_RASPBERRYPI3 only:
+- locore.s: enable the D-cache together with the MMU; boot table walks
+  inner write-back (TTBR IRGN=01) so they see cached page-table writes.
+- set_mmu_ttb/_alt: same walk attributes.
+- RAM (linear map and pmap's default attributes) is write-back,
+  write-allocate instead of write-through.
+- pmap: clean the page and invalidate the I-cache when a page is mapped
+  executable, since code paged in by the CPU may still be in the D-cache.
+- arm_icache_inv_all no longer invalidates the L1 D-cache by set/way;
+  the user cache traps and invalidate_dcache(_region) clean instead of
+  discarding, so no dirty data is ever dropped.
+- rpi3_usb: clean+invalidate the DMA page around every transfer.
+---
+ .../ARM/AppleARMPlatform/rpi3_usb.c           | 18 ++++++++
+ xnu/osfmk/arm/arm_vm_init.c                   |  6 +++
+ xnu/osfmk/arm/armv/cache.s                    | 10 +++++
+ xnu/osfmk/arm/armv/cpufunc-v7.s               | 14 +++++++
+ xnu/osfmk/arm/locore.s                        | 20 +++++++++
+ xnu/osfmk/arm/machine_routines_asm.s          | 10 ++++-
+ xnu/osfmk/arm/pmap.c                          | 42 +++++++++++++++++--
+ xnu/osfmk/arm/traps_lo.s                      | 10 +++++
+ 8 files changed, 125 insertions(+), 5 deletions(-)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
+index 4a42642..8a989db 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
+@@ -90,6 +90,21 @@ static void wr(struct rpi3_usb *u, unsigned off, uint32_t v)
+     __asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * The DMA page is requested uncached, but make it correct even where that
++ * request is not honored (RAM is write-back on the Pi): clean and invalidate
++ * it to the point of coherency before the controller reads it, and again
++ * after it has written to it.
++ */
++static void dma_sync(struct rpi3_usb *u)
++{
++    uintptr_t a = (uintptr_t)u->io.dma, end = a + 4096;
++    __asm__ volatile("dsb sy" ::: "memory");
++    for (; a < end; a += 32)
++        __asm__ volatile("mcr p15, 0, %0, c7, c14, 1" :: "r"(a) : "memory");  /* DCCIMVAC */
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
+ static uint64_t now_us(struct rpi3_usb *u) { return u->io.now_ns(u->io.opaque) / 1000U; }
+ static void msleep(struct rpi3_usb *u, uint32_t ms) { u->io.sleep_ms(u->io.opaque, ms); }
+ 
+@@ -123,6 +138,7 @@ static uint32_t run_channel(struct rpi3_usb *u, uint32_t hcchar, uint32_t hcsplt
+         uint32_t next = (rd(u, HFNUM) + 1) & 1;
+         hcchar = (hcchar & ~(1u << 29)) | (next << 29);
+     }
++    dma_sync(u);
+     wr(u, HCSPLT, hcsplt);
+     wr(u, HCTSIZ, hctsiz);
+     wr(u, HCDMA, (u->io.dma_physical + dma_off) | 0xc0000000u);
+@@ -135,9 +151,11 @@ static uint32_t run_channel(struct rpi3_usb *u, uint32_t hcchar, uint32_t hcsplt
+             /* Abort: request a halt and wait for it. */
+             wr(u, HCCHAR, rd(u, HCCHAR) | (1u << 31) | (1u << 30));
+             (void)wait_bits(u, HCINT, HCINT_CHHLTD, HCINT_CHHLTD, 10000);
++            dma_sync(u);
+             return 0;  /* no completion bits: treated as timeout */
+         }
+     }
++    dma_sync(u);
+     return rd(u, HCINT);
+ }
+ 
+diff --git a/xnu/osfmk/arm/arm_vm_init.c b/xnu/osfmk/arm/arm_vm_init.c
+index 94e02ae..8261378 100644
+--- a/xnu/osfmk/arm/arm_vm_init.c
++++ b/xnu/osfmk/arm/arm_vm_init.c
+@@ -194,8 +194,14 @@ void l2_map_linear_range(uint32_t pa_cache_start, uint32_t phys_start,
+         *ptv |= L2_SMALL_PAGE;
+         *ptv |= L2_ACCESS_PRW;
+ 
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++        /* Write-back, write-allocate (TEX=101, C=0, B=1): exclusive
++         * accesses need cacheable memory on the Cortex-A53. */
++        *ptv |= (1 << 2) | (5 << 6);
++#else
+         /* Writethrough, no write allocate. */
+         *ptv |= (MMU_TEXCB_CA_WT_NWA << 2);
++#endif
+ 
+         pte_iter += sizeof(unsigned int);
+         phys_iter += PAGE_SIZE;
+diff --git a/xnu/osfmk/arm/armv/cache.s b/xnu/osfmk/arm/armv/cache.s
+index 6018a37..1f1a672 100644
+--- a/xnu/osfmk/arm/armv/cache.s
++++ b/xnu/osfmk/arm/armv/cache.s
+@@ -40,7 +40,12 @@
+  * Invalidate ARM data-cache.
+  */
+ EnterARM(invalidate_dcache)
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    /* Write-back RAM: clean as well, never drop dirty data. */
++    b _arm_dcache_wbinv_all
++#else
+     b _arm_dcache_inv_all
++#endif
+ 
+ /**
+  * invalidate_dcache_region
+@@ -48,7 +53,12 @@ EnterARM(invalidate_dcache)
+  * Invalidate an ARM data-cache region.
+  */
+ EnterARM(invalidate_dcache_region)
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    /* Partial lines at the edges may hold someone else's dirty data. */
++    b _arm_dcache_wbinv_range
++#else
+     b _arm_dcache_inv_range
++#endif
+ 
+ /**
+  * dcache_incoherent_io_store64
+diff --git a/xnu/osfmk/arm/armv/cpufunc-v7.s b/xnu/osfmk/arm/armv/cpufunc-v7.s
+index c7f423b..4b8191d 100644
+--- a/xnu/osfmk/arm/armv/cpufunc-v7.s
++++ b/xnu/osfmk/arm/armv/cpufunc-v7.s
+@@ -285,6 +285,20 @@ END(arm_idcache_wbinv_all)
+  */
+ /* * LINTSTUB: void arm_icache_inv_all(void); */
+ ENTRY_NP(arm_icache_inv_all)
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++	/*
++	 * The generic version below also invalidates the L1 data cache by
++	 * set/way, which throws away dirty lines once RAM is write-back.
++	 * Invalidate only the instruction cache and branch predictor.
++	 */
++	mov	r0, #0
++	dsb
++	mcr	p15, 0, r0, c7, c5, 0	@ ICIALLU
++	mcr	p15, 0, r0, c7, c5, 6	@ BPIALL
++	dsb
++	isb
++	bx	lr
++#endif
+ 	mov	r0, #0
+ 	mcr	p15, 2, r0, c0, c0, 0	@ set cache level to L1
+ 	mrc	p15, 1, r0, c0, c0, 0	@ read CCSIDR
+diff --git a/xnu/osfmk/arm/locore.s b/xnu/osfmk/arm/locore.s
+index a78b44e..0f909d8 100644
+--- a/xnu/osfmk/arm/locore.s
++++ b/xnu/osfmk/arm/locore.s
+@@ -102,7 +102,13 @@ mmu_reinitialize:
+     ldr     r12, [r0, BOOT_ARGS_MEMSIZE]
+ 
+     /* MMU cacheability value. */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    /* Table walks inner write-back too (IRGN=01), so they see page-table
++     * writes that sit in the data cache. */
++    orr     r5, r4, #0x58
++#else
+     orr     r5, r4, #0x18
++#endif
+ 
+     /* Now, we have to set our TTB to this value. */
+     mcr     p15, 0, r5, c2, c0, 0
+@@ -183,8 +189,18 @@ leo_identity_smi:
+ 
+     /* Start MMU. */
+     mrc     p15, 0, r3, c1, c0, 0
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    /* And the data cache with it: on the Cortex-A53 ldrex/strex fault on
++     * non-cacheable memory (no exclusive monitor on the BCM2837), and the
++     * kernel takes locks long before cache_initialize(). */
++    orr     r3, r3, #((1 << 0) | (1 << 2))
++    dsb     sy
++    mcr     p15, 0, r3, c1, c0, 0
++    isb     sy
++#else
+     orr     r3, r3, #1
+     mcr     p15, 0, r3, c1, c0, 0
++#endif
+ 
+     /*
+      * Hopefully, if we got here, things are looking good and we
+@@ -288,7 +304,11 @@ EnterARM(sleep_test)
+     ldr     r4, [r1, BOOT_ARGS_TOP_OF_KERNEL]
+ 
+     /* Set new page tables. (kernel bootstrap page table) */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    orr     r6, r4, #0x58
++#else
+     orr     r6, r4, #0x18
++#endif
+     mcr     p15, 0, r6, c2, c0, 0
+     mcr     p15, 0, r6, c2, c0, 1
+ 
+diff --git a/xnu/osfmk/arm/machine_routines_asm.s b/xnu/osfmk/arm/machine_routines_asm.s
+index a732180..d391923 100644
+--- a/xnu/osfmk/arm/machine_routines_asm.s
++++ b/xnu/osfmk/arm/machine_routines_asm.s
+@@ -273,12 +273,18 @@ EnterARM(current_thread)
+  *
+  * Set the current TTB control register for a split.
+  */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++/* Inner write-back table walks (IRGN=01) to match write-back page tables. */
++#define TTB_WALK_ATTR 0x58
++#else
++#define TTB_WALK_ATTR 0x18
++#endif
+ EnterARM(set_mmu_ttb)
+-    orr     r0, r0, #0x18
++    orr     r0, r0, #TTB_WALK_ATTR
+     mcr     p15, 0, r0, c2, c0, 0
+     bx      lr
+ EnterARM(set_mmu_ttb_alt)
+-    orr     r0, r0, #0x18
++    orr     r0, r0, #TTB_WALK_ATTR
+     mcr     p15, 0, r0, c2, c0, 1
+     bx      lr
+ EnterARM(set_mmu_ttbcr)
+diff --git a/xnu/osfmk/arm/pmap.c b/xnu/osfmk/arm/pmap.c
+index 34f49e5..8cf8d75 100644
+--- a/xnu/osfmk/arm/pmap.c
++++ b/xnu/osfmk/arm/pmap.c
+@@ -661,6 +661,19 @@ typedef enum {
+ #define ARM_L2_TEX_110          6
+ #define ARM_L2_TEX_111          7
+ 
++/*
++ * Attributes for ordinary RAM. The HD2 maps it write-through. The Pi 3's
++ * Cortex-A53 treats write-through as non-cacheable, and exclusive accesses
++ * (ldrex/strex: every lock and atomic, in the kernel and in iOS) to
++ * non-cacheable memory fault there because the BCM2837 has no external
++ * exclusive monitor. So on the Pi, RAM is write-back, write-allocate.
++ */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++#define ARM_NORMAL_MEMORY_ATTR  ((ARM_CACHEBIT_WB_WA_BUFFERED << 2) | (ARM_L2_4KB_TEX(ARM_L2_TEX_100 | ARM_CACHEBIT_WB_WA_BUFFERED)))
++#else
++#define ARM_NORMAL_MEMORY_ATTR  ((ARM_CACHEBIT_WT_NWA_BUFFERED << 2) | (ARM_L2_4KB_TEX(ARM_L2_TEX_100 | ARM_CACHEBIT_WT_NWA_BUFFERED)))
++#endif
++
+ /** Functions */
+ 
+ extern int pt_fake_zone_index;
+@@ -1202,7 +1215,7 @@ kern_return_t pmap_attribute_cache_sync(ppnum_t pn, vm_size_t size, vm_machine_a
+ unsigned int pmap_get_cache_attributes(ppnum_t pn) {
+     /* If the pmap subsystem isn't up, just assume writethrough cache. */
+     if(!pmap_initialized)
+-        return (ARM_CACHEBIT_WT_NWA_BUFFERED << 2) | (ARM_L2_4KB_TEX(ARM_L2_TEX_100 | ARM_CACHEBIT_WT_NWA_BUFFERED));
++        return ARM_NORMAL_MEMORY_ATTR;
+ 
+     /* If it's out of memory, assume it's not cacheable at all. */
+     if(!pmap_valid_page(pn))
+@@ -1219,12 +1232,32 @@ unsigned int pmap_get_cache_attributes(ppnum_t pn) {
+         /* No cache, strongly ordered memory. */
+         template |= 0;
+     else
+-        /* Assume writethrough, no write allocate for now. */
+-        template |= (ARM_CACHEBIT_WT_NWA_BUFFERED << 2) | (ARM_L2_4KB_TEX(ARM_L2_TEX_100 | ARM_CACHEBIT_WT_NWA_BUFFERED));
++        /* Ordinary RAM (write-through on the HD2, write-back on the Pi). */
++        template |= ARM_NORMAL_MEMORY_ATTR;
+ 
+     return template;
+ }
+ 
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++extern void arm_icache_inv_all(void);
++/*
++ * With write-back RAM, code just written to a page (paged in from the SD
++ * card by the CPU, or copied) can still sit in the L1 data cache, where
++ * instruction fetches do not look. Push it out and drop stale instructions
++ * whenever a page is mapped executable.
++ */
++static void rpi3_sync_code_page(ppnum_t pn)
++{
++    if (!pmap_valid_page(pn))
++        return;
++    arm_dcache_wb_range((vaddr_t) phys_to_virt(pn << PAGE_SHIFT), PAGE_SIZE);
++    arm_icache_inv_all();
++}
++#define PMAP_SYNC_CODE(pn, prot) do { if ((prot) & VM_PROT_EXECUTE) rpi3_sync_code_page(pn); } while (0)
++#else
++#define PMAP_SYNC_CODE(pn, prot) do { } while (0)
++#endif
++
+ 
+ /**
+  * pmap_cache_attributes
+@@ -1642,6 +1675,7 @@ static pt_entry_t leo_pte_build(pmap_t map,vm_map_offset_t va,ppnum_t pn,vm_prot
+     value|=pmap_vm_prot_to_page_flags(map,prot,wired,0);
+     if(va==_COMM_PAGE_BASE_ADDRESS)value|=L2_ACCESS_USER;
+     if(map==kernel_pmap&&va==IOS7LAB_COMMPAGE_ALIAS)value|=L2_ACCESS_USER|L2_ACCESS_APX|L2_NX_BIT;
++    PMAP_SYNC_CODE(pn,prot);
+     return value|pmap_get_cache_attributes(pn);
+ }
+ void pmap_expand(pmap_t,vm_offset_t);
+@@ -3248,6 +3282,7 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
+          * Add cacheability attributes.
+          */
+         template_pte |= pmap_get_cache_attributes(pa);
++        PMAP_SYNC_CODE(pa, prot);
+ 
+         if (wired) {
+             if (!phys_attribute_test(pa, PMAP_OSPTE_TYPE_WIRED)) {
+@@ -3440,6 +3475,7 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
+      * Add cacheability attributes.
+      */
+     template_pte |= pmap_get_cache_attributes(pa);
++    PMAP_SYNC_CODE(pa, prot);
+ 
+     *(uint32_t *) pte = template_pte;
+ 
+diff --git a/xnu/osfmk/arm/traps_lo.s b/xnu/osfmk/arm/traps_lo.s
+index a26efe8..657c7c3 100644
+--- a/xnu/osfmk/arm/traps_lo.s
++++ b/xnu/osfmk/arm/traps_lo.s
+@@ -268,11 +268,21 @@ ios7lab_timebase:
+ #endif
+ 
+ icache_inv_trap:
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    /* Write-back RAM: new code may still be in the data cache. */
++    bl      _arm_dcache_wbinv_all
++#endif
+     bl      _arm_icache_inv_all
+     bl      _thread_exception_return
+ 
+ dcache_inv_trap:
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    /* Never discard dirty lines (they hold other processes' and the
++     * kernel's data); clean them to memory as well. */
++    bl      _arm_dcache_wbinv_all
++#else
+     bl      _arm_dcache_inv_all
++#endif
+     bl      _thread_exception_return
+ 
+ thread_set_cthread_trap:
+-- 
+2.43.0
+

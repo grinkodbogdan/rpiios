@@ -25,7 +25,7 @@ if [[ "$(cat "$SRC/.rpiios-patches" 2>/dev/null)" != "$stamp" ]]; then
     echo "==> Applying patches on top of $XNU_COMMIT"
     git -C "$SRC" checkout -q -f -B rpiios "$XNU_COMMIT"
     git -C "$SRC" -c user.name=rpiios -c user.email=rpiios@localhost \
-        am -q --whitespace=nowarn "$here"/patches/xnu/*.patch
+        am -q --keep-cr --whitespace=nowarn "$here"/patches/xnu/*.patch
     echo "$stamp" > "$SRC/.rpiios-patches"
 fi
 
