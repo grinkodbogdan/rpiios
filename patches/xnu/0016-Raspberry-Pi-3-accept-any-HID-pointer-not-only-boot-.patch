@@ -1,0 +1,121 @@
+From 189d229ba1910f6a02e52069aa95cc420a6c4bb0 Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 15:45:32 +0000
+Subject: [PATCH] Raspberry Pi 3: accept any HID pointer, not only
+ boot-protocol mice
+
+Many mice, trackpads and all tablets do not declare the boot-mouse
+subclass/protocol (QEMU's usb-tablet: subclass 0, protocol 0), so they
+were never used. Consider every HID interface except a boot keyboard
+that has an interrupt IN endpoint; take the first whose report
+descriptor has X and Y (relative or absolute); fall back to boot
+protocol only for a declared boot mouse.
+---
+ .../ARM/AppleARMPlatform/rpi3_usb.c           | 72 +++++++++++++------
+ 1 file changed, 50 insertions(+), 22 deletions(-)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
+index 195b1c6..ca15f9f 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
+@@ -432,9 +432,17 @@ static int enumerate(struct rpi3_usb *u, uint8_t speed, uint8_t split, uint8_t t
+     uint8_t d[DATA_MAX];
+     uint32_t total, at;
+     uint8_t address, config_value, dev_class;
+-    int r, is_hub = 0, mouse_here = 0;
+-    struct rpi3_usb_endpoint mouse = {0};
+-    uint32_t mouse_iface = 0, mouse_report_len = 0;
++    int r, is_hub = 0;
++    /* HID interfaces that may be a pointer: anything but a boot keyboard
++     * with an interrupt IN endpoint. Many mice and all tablets do not
++     * declare the boot-mouse subclass/protocol, so the report descriptor
++     * decides (it must contain X and Y). */
++    struct candidate {
++        struct rpi3_usb_endpoint ep;
++        uint32_t iface, report_len;
++        uint8_t boot_mouse, has_ep;
++    } cand[4];
++    unsigned ncand = 0, c;
+ 
+     if (depth > 4 || u->next_address > 32) return RPI3_USB_ERROR;
+     ep0.speed = speed;
+@@ -467,20 +475,24 @@ static int enumerate(struct rpi3_usb *u, uint8_t speed, uint8_t split, uint8_t t
+                 iface_num = d[at + 2]; iface_class = d[at + 5];
+                 iface_sub = d[at + 6]; iface_proto = d[at + 7];
+                 if (iface_class == 9) is_hub = 1;
+-            } else if (d[at + 1] == 0x21 && at + 9 <= total && !mouse_here &&
+-                       iface_class == 3 && iface_sub == 1 && iface_proto == 2 && d[at + 6] == 0x22) {
+-                mouse_report_len = d[at + 7] | ((uint32_t)d[at + 8] << 8);  /* HID descriptor */
+-            } else if (d[at + 1] == 5 && at + 7 <= total) {
+-                if (!mouse_here && iface_class == 3 && iface_sub == 1 && iface_proto == 2 &&
+-                    (d[at + 2] & 0x80) && (d[at + 3] & 3) == 3) {
+-                    mouse = ep0;
+-                    mouse.endpoint = d[at + 2] & 0x0f;
+-                    mouse.max_packet = (uint8_t)(d[at + 4] > 64 ? 64 : d[at + 4]);
+-                    mouse.interval = d[at + 6];
+-                    mouse.toggle = PID_DATA0;
+-                    mouse_iface = iface_num;
+-                    mouse_here = 1;
++                if (iface_class == 3 && !(iface_sub == 1 && iface_proto == 1) && ncand < 4) {
++                    struct candidate *k = &cand[ncand++];
++                    k->ep = ep0; k->iface = iface_num; k->report_len = 0; k->has_ep = 0;
++                    k->boot_mouse = (iface_sub == 1 && iface_proto == 2);
++                } else {
++                    iface_class = 0;    /* not ours: ignore its HID/endpoint descriptors */
+                 }
++            } else if (d[at + 1] == 0x21 && at + 9 <= total && iface_class == 3 && ncand &&
++                       d[at + 6] == 0x22) {
++                cand[ncand - 1].report_len = d[at + 7] | ((uint32_t)d[at + 8] << 8);  /* HID descriptor */
++            } else if (d[at + 1] == 5 && at + 7 <= total && iface_class == 3 && ncand &&
++                       !cand[ncand - 1].has_ep && (d[at + 2] & 0x80) && (d[at + 3] & 3) == 3) {
++                struct candidate *k = &cand[ncand - 1];
++                k->ep.endpoint = d[at + 2] & 0x0f;
++                k->ep.max_packet = (uint8_t)(d[at + 4] > 64 ? 64 : d[at + 4]);
++                k->ep.interval = d[at + 6];
++                k->ep.toggle = PID_DATA0;
++                k->has_ep = 1;
+             }
+         }
+     }
+@@ -491,16 +503,32 @@ static int enumerate(struct rpi3_usb *u, uint8_t speed, uint8_t split, uint8_t t
+         ep0.split = split; ep0.tt_hub = tt_hub; ep0.tt_port = tt_port;
+         return hub_ports(u, &ep0, depth);
+     }
+-    if (mouse_here && !u->mouse_found) {
++    if (!u->mouse_found && ncand) {
+         /* Report protocol with the layout from the report descriptor: many
+-         * mice ignore SET_PROTOCOL(boot). Boot protocol only as a fallback. */
++         * mice ignore SET_PROTOCOL(boot). Boot protocol only as a fallback,
++         * for an interface that declares itself a boot mouse. */
+         struct rpi3_hid_layout l = {0};
+-        if (mouse_report_len) {
+-            uint32_t n = mouse_report_len > DATA_MAX ? DATA_MAX : mouse_report_len;
++        struct rpi3_usb_endpoint mouse = {0};
++        uint32_t mouse_iface = 0;
++        int chosen = -1;
++        for (c = 0; c < ncand && chosen < 0; c++) {
++            uint32_t n;
++            if (!cand[c].has_ep || !cand[c].report_len) continue;
++            n = cand[c].report_len > DATA_MAX ? DATA_MAX : cand[c].report_len;
+             for (at = 0; at < DATA_MAX; at++) d[at] = 0;
+-            if (get_descriptor(u, &ep0, 0x81, 0x2200, (uint16_t)mouse_iface, (uint16_t)n, d) == RPI3_USB_OK)
+-                parse_report_descriptor(d, n, &l);
++            if (get_descriptor(u, &ep0, 0x81, 0x2200, (uint16_t)cand[c].iface, (uint16_t)n, d) != RPI3_USB_OK)
++                continue;
++            parse_report_descriptor(d, n, &l);
++            if (l.valid) chosen = (int)c;
+         }
++        for (c = 0; c < ncand && chosen < 0; c++)
++            if (cand[c].has_ep && cand[c].boot_mouse) {
++                struct rpi3_hid_layout none = {0};
++                chosen = (int)c; l = none;
++            }
++        if (chosen < 0) return RPI3_USB_OK;
++        mouse = cand[chosen].ep;
++        mouse_iface = cand[chosen].iface;
+         if (l.valid) {
+             (void)control(u, &ep0, 0x21, 0x0b, 1, (uint16_t)mouse_iface, 0, 0);  /* SET_PROTOCOL report */
+         } else {
+-- 
+2.43.0
+
