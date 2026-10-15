@@ -27,7 +27,9 @@ timer, display, SD, input) and reuses the root filesystem unchanged.
 | Build the HD2 kernel from source; hand-written assembly matches the published HD2 kernel instruction for instruction | done |
 | Raspberry Pi 3B+ board target (boot shim, IRQ, timer, framebuffer) | done, tested in QEMU (raspi2b) |
 | SD card driver: root filesystem mounts, `launchd` starts | done, tested in QEMU |
-| USB mouse → touch | not started (no input yet) |
+| SpringBoard / iOS 7 lock screen on HDMI | done, tested in QEMU |
+| USB mouse → touch (DWC2 host, hubs, split transactions) | done; pointer and touches reach iOS in QEMU, unlock gesture not yet confirmed |
+| Cortex-A53 fixes (`swp`, HYP exit, SCTLR) | done |
 | SD card image builder | done |
 
 Nothing here has run on real Pi hardware yet.
@@ -46,19 +48,21 @@ tools/make-sdcard.sh --rootfs rootfs.hfs --kernel out/kernel7.img \
     --out out/sdcard.img [--firmware path/to/raspberrypi-firmware/boot]
 ```
 
+This fetches the pinned xnu-hd2 commit, applies `patches/xnu/`, builds the
+toolchain into `out/toolchain` and the kernel into `out/build/`.
+To build an SD card by hand instead, see `docs/SDCARD.txt`.
+
 Test in QEMU (Raspberry Pi 2 machine: same peripherals as the 3B+ in 32-bit
 mode):
 
 ```sh
 qemu-system-arm -M raspi2b -bios out/kernel7.img \
-    -drive file=out/sdcard.img,if=sd,format=raw -serial stdio
+    -drive file=out/sdcard.img,if=sd,format=raw -serial stdio \
+    -usb -device usb-mouse
 ```
 
 Add `rpi3_uart=1` to the boot-args (`--cmdline` or `cmdline.txt`) for kernel
 output on the serial port.
-
-This fetches the pinned xnu-hd2 commit, applies `patches/xnu/`, builds the
-toolchain into `out/toolchain` and the kernel into `out/build/`.
 
 ## What is not in this repo
 
