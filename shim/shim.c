@@ -324,6 +324,10 @@ void shim_main(uint32_t load_addr, uint32_t firmware_r2, uint32_t entry_cpsr, ui
     arm_base = v[0]; arm_bytes = v[1];
     { uint32_t id = 1; if (mbox_tag(0x00030002, &id, 1, v, 2)) emmc_hz = v[1]; }
     if (mbox_tag(0x00040003, 0, 0, v, 2)) { disp_w = v[0]; disp_h = v[1]; }
+    {   /* Power the USB host controller (device 3: on, wait until stable). */
+        uint32_t in[2] = {3, 3};
+        if (mbox_tag(0x00028001, in, 2, v, 2)) say("USB power state", v[1]);
+    }
     say("board revision", revision);
     say("ARM memory bytes", arm_bytes);
     say("EMMC clock Hz", emmc_hz);

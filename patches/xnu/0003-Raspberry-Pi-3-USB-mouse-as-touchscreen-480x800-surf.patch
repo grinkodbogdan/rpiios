@@ -1,0 +1,969 @@
+From 2aedadb0fd1318b7a1cfe5e5cc51696c2f9befa1 Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 07:00:33 +0000
+Subject: [PATCH] Raspberry Pi 3: USB mouse as touchscreen; 480x800 surface 1:1
+
+- rpi3_usb.c: polled DWC2 host (buffer DMA, channel 0): root port,
+  recursive hubs, split transactions through a hub's transaction
+  translator, HID boot-protocol mouse.
+- rpi3_touch.cpp: leo_touch_transport_init/poll for the HD2 HID touch
+  service; mouse moves a pointer, left button is the finger.
+- IOS7LeoHIDTouch.cpp builds on the Pi without the HD2 register maps;
+  leo_touch_transport.c (HD2 I2C) excluded on the Pi.
+- pe_rpi3.c: pointer overlay; present copies the public tree's 480x800
+  surface 1:1 (320x533 render-mode surfaces are still scaled).
+---
+ .../ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp  |   6 +-
+ .../ARM/AppleARMPlatform/IOS7Rpi3Input.cpp    |  24 -
+ .../AppleARMPlatform/leo_touch_transport.c    |   4 +
+ .../ARM/AppleARMPlatform/rpi3_touch.cpp       | 147 ++++++
+ .../ARM/AppleARMPlatform/rpi3_usb.c           | 472 ++++++++++++++++++
+ .../ARM/AppleARMPlatform/rpi3_usb.h           |  54 ++
+ xnu/iokit/conf/files.arm                      |   3 +-
+ xnu/pexpert/arm/pe_rpi3.c                     | 100 +++-
+ xnu/pexpert/arm/rpi3_board.h                  |   1 +
+ 9 files changed, 774 insertions(+), 37 deletions(-)
+ delete mode 100644 xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3Input.cpp
+ create mode 100644 xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
+ create mode 100644 xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
+ create mode 100644 xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.h
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp
+index 69d9c26..711073f 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp
+@@ -1,6 +1,6 @@
+ /* HTC HD2 integration/publication changes: Garysss123, 2026-10-04. Original license notices are preserved. */
+-/* HTC HD2 hardware; the Raspberry Pi 3 board supplies its own. */
+-#if defined(BOARD_CONFIG_QSD8250_LEO) && !defined(BOARD_CONFIG_RASPBERRYPI3)
++/* Also used on the Raspberry Pi 3, with a USB mouse transport (rpi3_touch.cpp). */
++#if defined(BOARD_CONFIG_QSD8250_LEO)
+ /* Real Type2A controller reports through the original iOS7 IOHIDLib queue.
+  * PL050, synthetic contacts, buttons and userland routing helpers are absent. */
+ #include <IOKit/IOService.h>
+@@ -264,6 +264,7 @@ bool IOHIDEventService::start(IOService *provider)
+  if(!lock || !queue || !queue->initWithCapacity(4096))return false;
+  queueMemory=queue->getMemoryDescriptor();if(!queueMemory)return false;
+  static const uint32_t physical[LEO_TOUCH_REGIONS]={0xa9900000U,0xa8600000U,0xa9000000U,0xa9100000U};
++#if !defined(BOARD_CONFIG_RASPBERRYPI3) /* the Pi transport maps its own USB controller */
+  for(unsigned n=0;n<LEO_TOUCH_REGIONS;n++){
+   device[n]=IOMemoryDescriptor::withPhysicalAddress(physical[n],4096,kIODirectionInOut);
+   mapping[n]=device[n]?device[n]->map(kIOMapInhibitCache):0;
+@@ -272,6 +273,7 @@ bool IOHIDEventService::start(IOService *provider)
+   }
+   registers[n]=(volatile uint8_t *)mapping[n]->getAddress();
+  }
++#endif
+  LeoTouchIO io={this,readRegister,writeRegister,nowNanoseconds,delayMicroseconds,4096};
+  int result=leo_touch_transport_init(&state,&io);
+  initValid=1;initResult=result;publishSnapshot();
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3Input.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3Input.cpp
+deleted file mode 100644
+index 0f14855..0000000
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3Input.cpp
++++ /dev/null
+@@ -1,24 +0,0 @@
+-/*
+- * Raspberry Pi 3 input for the iOS 7 kernel.
+- *
+- * Placeholder until the USB mouse transport lands: no touch service is
+- * published, so iOS boots without input. The observation hook reports
+- * "unknown" as the HD2 driver does before its controller is ready.
+- */
+-#if defined(BOARD_CONFIG_RASPBERRYPI3)
+-#include <IOKit/IOService.h>
+-#include <IOKit/IOLib.h>
+-#include "IOS7LeoTouchObservation.h"
+-
+-extern "C" uint32_t ios7leo_touch_observe(LeoTouchObservation *out)
+-{
+-    (void)out;
+-    return 0;
+-}
+-
+-void ios7leo_register_hid_touch(IOService *platform)
+-{
+-    (void)platform;
+-    IOLog("Rpi3 input: no touch transport yet; booting without input\n");
+-}
+-#endif /* BOARD_CONFIG_RASPBERRYPI3 */
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_touch_transport.c b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_touch_transport.c
+index d384854..cb5210b 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_touch_transport.c
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_touch_transport.c
+@@ -1,3 +1,5 @@
++/* HTC HD2 touch controller; the Raspberry Pi 3 uses rpi3_touch.cpp. */
++#if !defined(BOARD_CONFIG_RASPBERRYPI3)
+ /* Owned Type2A transport. Hardware facts and ordering are crosschecked against
+  * the Leo controller/register observations and HTC Linux/Cotulla board/I2C sources.
+  * No foreign OS ABI, fixed virtual address, firmware, IRQ or button code.
+@@ -278,3 +280,5 @@ int leo_touch_transport_poll(LeoTouchState *s,LeoTouchReport *report)
+  *report=next;
+  return 1;
+ }
++
++#endif
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
+new file mode 100644
+index 0000000..9ea2573
+--- /dev/null
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
+@@ -0,0 +1,147 @@
++/*
++ * Raspberry Pi 3 touch transport: a USB mouse acting as the touchscreen.
++ *
++ * Implements leo_touch_transport_init/poll (IOS7LeoTouchTransport.h), which
++ * the HD2's HID touch service (IOS7LeoHIDTouch.cpp) calls every 20 ms. The
++ * mouse moves an on-screen pointer; holding the left button is a finger on
++ * the glass at the pointer, releasing it lifts the finger. Coordinates are the
++ * same 480x800 portrait pixels the HD2 panel reports.
++ */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include "IOS7LeoTouchTransport.h"
++#include "rpi3_usb.h"
++#include "rpi3_board.h"
++extern "C" {
++#include <mach/mach_time.h>
++#include <kern/task.h>
++extern task_t kernel_task;
++}
++
++#define SCREEN_W 480
++#define SCREEN_H 800
++/* Mouse counts per screen pixel, as 8.8 fixed point: 1.0. */
++#define SPEED_FIXED 256
++
++static struct rpi3_usb usb;
++static IOMemoryDescriptor *regsDescriptor;
++static IOMemoryMap *regsMap;
++static IOBufferMemoryDescriptor *dmaPage;
++static bool controllerUp;
++static int32_t cursorX = SCREEN_W / 2 * 256, cursorY = SCREEN_H / 2 * 256; /* 24.8 */
++static uint8_t lastButtons;
++static uint64_t nextRetryNs;
++
++static uint64_t usbNowNs(void *)
++{
++    uint64_t ns = 0;
++    (absolutetime_to_nanoseconds)(mach_absolute_time(), &ns);
++    return ns;
++}
++
++static void usbSleepMs(void *, uint32_t ms) { IOSleep(ms); }
++
++static bool mapController(void)
++{
++    if (regsMap) return true;
++    regsDescriptor = IOMemoryDescriptor::withPhysicalAddress(RPI3_USB_PA, RPI3_USB_BYTES, kIODirectionInOut);
++    if (!regsDescriptor) return false;
++    regsMap = regsDescriptor->map(kIOMapInhibitCache);
++    if (!regsMap) return false;
++    /* One page for setup packets, control data and reports; uncached, so
++     * the controller's DMA and the CPU always see the same bytes. */
++    dmaPage = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapInhibitCache,
++        4096, 0x3ffff000ULL);
++    return dmaPage != 0;
++}
++
++static int bringUp(void)
++{
++    struct rpi3_usb_io io;
++    io.opaque = 0;
++    io.regs = (volatile uint32_t *)regsMap->getVirtualAddress();
++    io.dma = (volatile uint8_t *)dmaPage->getBytesNoCopy();
++    io.dma_physical = (uint32_t)dmaPage->getPhysicalAddress();
++    io.now_ns = usbNowNs;
++    io.sleep_ms = usbSleepMs;
++    return rpi3_usb_init(&usb, &io);
++}
++
++extern "C" int leo_touch_transport_init(LeoTouchState *s, const LeoTouchIO *io)
++{
++    if (!s || !io) return LEO_TOUCH_ARGUMENT;
++    bzero(s, sizeof(*s));
++    s->io = *io;
++    s->stage = LEO_TOUCH_STAGE_CONFIG;
++    if (!mapController()) return LEO_TOUCH_GPIO_ERROR;
++    s->stage = LEO_TOUCH_STAGE_ID;
++    int r = bringUp();
++    controllerUp = (r == RPI3_USB_OK || r == RPI3_USB_NO_MOUSE || r == RPI3_USB_NO_DEVICE);
++    s->last_result = r;
++    s->id_word = usb.mouse_found ? 0x55534231U /* "USB1" */ : 0;
++    if (!controllerUp) return LEO_TOUCH_BUS_ERROR;
++    /* No mouse yet is fine: poll() keeps looking, so it can be plugged in later. */
++    s->ready = 1;
++    s->stage = LEO_TOUCH_STAGE_READY;
++    rpi3_cursor_move(cursorX >> 8, cursorY >> 8);
++    return LEO_TOUCH_OK;
++}
++
++extern "C" int leo_touch_transport_poll(LeoTouchState *s, LeoTouchReport *report)
++{
++    uint8_t buttons = 0;
++    int8_t dx = 0, dy = 0;
++    int r;
++    if (!s || !report) return LEO_TOUCH_ARGUMENT;
++    if (!s->ready) return LEO_TOUCH_NOT_READY;
++    s->polls++;
++
++    if (!usb.mouse_found) {
++        /* Re-enumerate every 3 s until a mouse shows up. */
++        uint64_t now = usbNowNs(0);
++        if (now < nextRetryNs) return 0;
++        nextRetryNs = now + 3000000000ULL;
++        s->recoveries++;
++        (void)bringUp();
++        return 0;
++    }
++
++    r = rpi3_usb_mouse_poll(&usb, &buttons, &dx, &dy);
++    if (r == RPI3_USB_NAK) { s->not_ready_skips++; return 0; }
++    if (r != RPI3_USB_OK) {
++        s->errors++;
++        if (usb.errors > 50) { usb.mouse_found = 0; usb.errors = 0; }  /* unplugged? look again */
++        return 0;
++    }
++    s->reads++;
++    s->packets++;
++
++    cursorX += dx * SPEED_FIXED;
++    cursorY += dy * SPEED_FIXED;
++    if (cursorX < 0) cursorX = 0;
++    if (cursorY < 0) cursorY = 0;
++    if (cursorX > (SCREEN_W - 1) * 256) cursorX = (SCREEN_W - 1) * 256;
++    if (cursorY > (SCREEN_H - 1) * 256) cursorY = (SCREEN_H - 1) * 256;
++    if (dx || dy) rpi3_cursor_move(cursorX >> 8, cursorY >> 8);
++
++    bool down = (buttons & 1) != 0, wasDown = (lastButtons & 1) != 0;
++    lastButtons = buttons;
++    /* A report while the finger is down (move or press), and one on release. */
++    if (!down && !wasDown) return 0;
++
++    bzero(report, sizeof(*report));
++    report->sequence = ++s->sequence;
++    report->x = (uint16_t)(cursorX >> 8);
++    report->y = (uint16_t)(cursorY >> 8);
++    report->down = down ? 1 : 0;
++    report->contacts = down ? 1 : 0;
++    report->raw[0] = buttons; report->raw[1] = (uint8_t)dx; report->raw[2] = (uint8_t)dy;
++    s->last_x = report->x; s->last_y = report->y; s->last_contacts = report->contacts;
++    if (down && !wasDown) s->presses++;
++    if (!down && wasDown) s->releases++;
++    return 1;
++}
++#endif /* BOARD_CONFIG_RASPBERRYPI3 */
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
+new file mode 100644
+index 0000000..4a42642
+--- /dev/null
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
+@@ -0,0 +1,472 @@
++/*
++ * Minimal polled USB host for the Raspberry Pi's Synopsys DWC2 ("DWC OTG")
++ * controller, buffer-DMA mode, host channel 0 only.
++ *
++ * Scope: enumerate the root port and any hubs below it (the Pi 3B+ has two
++ * hub levels inside its LAN7515), and find the first HID boot-protocol mouse.
++ * Low/full-speed devices behind a high-speed hub are reached with split
++ * transactions through that hub's transaction translator.
++ *
++ * Register usage follows the DWC2 databook names as used by the Linux dwc2
++ * driver; the bring-up order follows what the Linux driver and the
++ * USPi/Circle bare-metal stacks do on BCM283x.
++ */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++#include "rpi3_usb.h"
++
++extern int printf(const char *, ...);
++
++/* Core global registers. */
++#define GAHBCFG     0x008
++#define GUSBCFG     0x00c
++#define GRSTCTL     0x010
++#define GRXFSIZ     0x024
++#define GNPTXFSIZ   0x028
++#define GSNPSID     0x040
++#define HPTXFSIZ    0x100
++/* Host registers. */
++#define HCFG        0x400
++#define HFNUM       0x408
++#define HPRT        0x440
++#define PCGCCTL     0xe00
++/* Host channel 0. */
++#define HCCHAR      0x500
++#define HCSPLT      0x504
++#define HCINT       0x508
++#define HCINTMSK    0x50c
++#define HCTSIZ      0x510
++#define HCDMA       0x514
++
++#define HPRT_CONN       (1u << 0)
++#define HPRT_CONNDET    (1u << 1)
++#define HPRT_ENA        (1u << 2)
++#define HPRT_ENACHG     (1u << 3)
++#define HPRT_OVRCURCHG  (1u << 5)
++#define HPRT_RST        (1u << 8)
++#define HPRT_PWR        (1u << 12)
++#define HPRT_W1C_MASK   (HPRT_CONNDET | HPRT_ENA | HPRT_ENACHG | HPRT_OVRCURCHG)
++
++#define HCINT_XFERCOMPL (1u << 0)
++#define HCINT_CHHLTD    (1u << 1)
++#define HCINT_AHBERR    (1u << 2)
++#define HCINT_STALL     (1u << 3)
++#define HCINT_NAK       (1u << 4)
++#define HCINT_ACK       (1u << 5)
++#define HCINT_NYET      (1u << 6)
++#define HCINT_XACTERR   (1u << 7)
++#define HCINT_BBLERR    (1u << 8)
++#define HCINT_DATATGL   (1u << 10)
++
++#define SPEED_HIGH  0
++#define SPEED_FULL  1
++#define SPEED_LOW   2
++
++#define EP_CONTROL   0
++#define EP_INTERRUPT 3
++
++#define PID_DATA0   0
++#define PID_DATA1   2
++#define PID_SETUP   3
++
++/* Offsets inside the 4 KiB DMA page. */
++#define DMA_SETUP   0
++#define DMA_DATA    64          /* control data, up to 512 bytes */
++#define DMA_REPORT  1024        /* interrupt reports */
++#define DATA_MAX    512
++
++static uint32_t rd(struct rpi3_usb *u, unsigned off)
++{
++    uint32_t v;
++    __asm__ volatile("dsb sy" ::: "memory");
++    v = u->io.regs[off / 4];
++    __asm__ volatile("dsb sy" ::: "memory");
++    return v;
++}
++
++static void wr(struct rpi3_usb *u, unsigned off, uint32_t v)
++{
++    __asm__ volatile("dsb sy" ::: "memory");
++    u->io.regs[off / 4] = v;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
++static uint64_t now_us(struct rpi3_usb *u) { return u->io.now_ns(u->io.opaque) / 1000U; }
++static void msleep(struct rpi3_usb *u, uint32_t ms) { u->io.sleep_ms(u->io.opaque, ms); }
++
++static int wait_bits(struct rpi3_usb *u, unsigned off, uint32_t mask, uint32_t want, uint32_t us)
++{
++    uint64_t start = now_us(u);
++    while ((rd(u, off) & mask) != want)
++        if (now_us(u) - start > us) return RPI3_USB_TIMEOUT;
++    return RPI3_USB_OK;
++}
++
++static int core_reset(struct rpi3_usb *u)
++{
++    if (wait_bits(u, GRSTCTL, 1u << 31, 1u << 31, 100000)) return RPI3_USB_TIMEOUT; /* AHB idle */
++    wr(u, GRSTCTL, rd(u, GRSTCTL) | 1u);
++    if (wait_bits(u, GRSTCTL, 1u, 0, 100000)) return RPI3_USB_TIMEOUT;
++    if (wait_bits(u, GRSTCTL, 1u << 31, 1u << 31, 100000)) return RPI3_USB_TIMEOUT;
++    msleep(u, 100);
++    return RPI3_USB_OK;
++}
++
++/* ---- One transaction on host channel 0 -------------------------------- */
++
++static uint32_t run_channel(struct rpi3_usb *u, uint32_t hcchar, uint32_t hcsplt,
++                            uint32_t hctsiz, uint32_t dma_off, int periodic)
++{
++    uint64_t start;
++    if (periodic) {
++        /* Periodic channels only start in a (micro)frame of matching
++         * parity: aim for the next one. */
++        uint32_t next = (rd(u, HFNUM) + 1) & 1;
++        hcchar = (hcchar & ~(1u << 29)) | (next << 29);
++    }
++    wr(u, HCSPLT, hcsplt);
++    wr(u, HCTSIZ, hctsiz);
++    wr(u, HCDMA, (u->io.dma_physical + dma_off) | 0xc0000000u);
++    wr(u, HCINT, 0xffffffffu);
++    wr(u, HCINTMSK, 0x7ffu);
++    wr(u, HCCHAR, hcchar | (1u << 31));
++    start = now_us(u);
++    while (!(rd(u, HCINT) & HCINT_CHHLTD)) {
++        if (now_us(u) - start > 100000) {
++            /* Abort: request a halt and wait for it. */
++            wr(u, HCCHAR, rd(u, HCCHAR) | (1u << 31) | (1u << 30));
++            (void)wait_bits(u, HCINT, HCINT_CHHLTD, HCINT_CHHLTD, 10000);
++            return 0;  /* no completion bits: treated as timeout */
++        }
++    }
++    return rd(u, HCINT);
++}
++
++/* type: EP_CONTROL / EP_INTERRUPT. *pid is updated to the next toggle. */
++static int transfer(struct rpi3_usb *u, const struct rpi3_usb_endpoint *ep, int type, int in,
++                    uint32_t *pid, uint32_t dma_off, uint32_t len, uint32_t *actual)
++{
++    uint32_t mps = ep->max_packet ? ep->max_packet : 8;
++    uint32_t pkts = len ? (len + mps - 1) / mps : 1;
++    uint32_t hcchar = mps | ((uint32_t)ep->endpoint << 11) | ((uint32_t)(in ? 1 : 0) << 15) |
++                      ((uint32_t)(ep->speed == SPEED_LOW) << 17) | ((uint32_t)type << 18) |
++                      (1u << 20) | ((uint32_t)ep->address << 22);
++    uint32_t hctsiz = len | (pkts << 19) | (*pid << 29);
++    uint32_t hcint, tries, nyets;
++    int periodic = (type == EP_INTERRUPT);
++
++    if (!ep->split) {
++        hcint = run_channel(u, hcchar, 0, hctsiz, dma_off, periodic);
++        if (hcint & HCINT_XFERCOMPL) goto done;
++        if (hcint & HCINT_NAK) { u->naks++; return RPI3_USB_NAK; }
++        if (hcint & HCINT_STALL) return RPI3_USB_STALL;
++        u->errors++;
++        return hcint ? RPI3_USB_ERROR : RPI3_USB_TIMEOUT;
++    }
++
++    /* Split transaction: start-split to the hub's TT, then complete-split
++     * until the TT has the device's answer. Only single-packet transfers
++     * are split here (all we need: setup, small control data, reports). */
++    for (tries = 0; tries < 3; tries++) {
++        uint32_t hcsplt = (1u << 31) | (3u << 14) | ((uint32_t)ep->tt_hub << 7) | ep->tt_port;
++        hcint = run_channel(u, hcchar, hcsplt, hctsiz, dma_off, periodic);
++        if (hcint & HCINT_NAK) { u->naks++; return RPI3_USB_NAK; }
++        if (hcint & HCINT_STALL) return RPI3_USB_STALL;
++        if (!(hcint & HCINT_ACK)) { u->errors++; continue; }
++        for (nyets = 0; nyets < 200; nyets++) {
++            hcint = run_channel(u, hcchar, hcsplt | (1u << 16), hctsiz, dma_off, periodic);
++            if (hcint & HCINT_XFERCOMPL) goto done;
++            if (hcint & HCINT_NYET) continue;          /* TT not finished yet */
++            if (hcint & HCINT_NAK) { u->naks++; return RPI3_USB_NAK; }
++            if (hcint & HCINT_STALL) return RPI3_USB_STALL;
++            break;                                      /* error: redo the start-split */
++        }
++        u->errors++;
++    }
++    return RPI3_USB_ERROR;
++
++done:
++    hctsiz = rd(u, HCTSIZ);
++    *pid = (hctsiz >> 29) & 3;
++    if (actual) *actual = in ? len - (hctsiz & 0x7ffffu) : len;
++    return RPI3_USB_OK;
++}
++
++/* Retry while the device NAKs (control endpoints NAK while busy). */
++static int transfer_retry(struct rpi3_usb *u, const struct rpi3_usb_endpoint *ep, int in,
++                          uint32_t *pid, uint32_t dma_off, uint32_t len, uint32_t *actual)
++{
++    uint64_t start = now_us(u);
++    for (;;) {
++        uint32_t saved = *pid;
++        int r = transfer(u, ep, EP_CONTROL, in, pid, dma_off, len, actual);
++        if (r != RPI3_USB_NAK) return r;
++        *pid = saved;
++        if (now_us(u) - start > 1000000) return RPI3_USB_TIMEOUT;
++    }
++}
++
++static int control(struct rpi3_usb *u, const struct rpi3_usb_endpoint *ep, uint8_t type,
++                   uint8_t request, uint16_t value, uint16_t index, uint16_t length,
++                   uint32_t *actual)
++{
++    volatile uint8_t *s = u->io.dma + DMA_SETUP;
++    uint32_t pid = PID_SETUP, got = 0;
++    int in = (type & 0x80) != 0, r;
++    if (length > DATA_MAX) return RPI3_USB_ERROR;
++    s[0] = type; s[1] = request;
++    s[2] = (uint8_t)value; s[3] = (uint8_t)(value >> 8);
++    s[4] = (uint8_t)index; s[5] = (uint8_t)(index >> 8);
++    s[6] = (uint8_t)length; s[7] = (uint8_t)(length >> 8);
++    if ((r = transfer_retry(u, ep, 0, &pid, DMA_SETUP, 8, 0))) return r;
++    pid = PID_DATA1;
++    if (length) {
++        /* Larger than one packet is fine without splits; with splits our
++         * callers keep data stages within max_packet chunks below. */
++        if ((r = transfer_retry(u, ep, in, &pid, DMA_DATA, length, &got))) return r;
++    }
++    pid = PID_DATA1;
++    if ((r = transfer_retry(u, ep, length ? !in : 1, &pid, DMA_DATA + DATA_MAX - 8, 0, 0))) return r;
++    if (actual) *actual = got;
++    return RPI3_USB_OK;
++}
++
++/* GET_DESCRIPTOR in max_packet-sized reads when splitting (the TT moves one
++ * packet per split transaction), in one go otherwise. */
++static int get_descriptor(struct rpi3_usb *u, const struct rpi3_usb_endpoint *ep, uint8_t reqtype,
++                          uint16_t type_index, uint16_t index, uint16_t length, uint8_t *out)
++{
++    uint32_t got = 0, i;
++    int r;
++    if (length > DATA_MAX) length = DATA_MAX;
++    if (!ep->split || length <= ep->max_packet) {
++        if ((r = control(u, ep, reqtype, 6, type_index, index, length, &got))) return r;
++    } else {
++        /* Ask for the whole descriptor but let the device send it packet by
++         * packet: a multi-packet IN data stage through the TT. */
++        volatile uint8_t *s = u->io.dma + DMA_SETUP;
++        uint32_t pid = PID_SETUP, chunk;
++        s[0] = reqtype; s[1] = 6;
++        s[2] = (uint8_t)type_index; s[3] = (uint8_t)(type_index >> 8);
++        s[4] = (uint8_t)index; s[5] = (uint8_t)(index >> 8);
++        s[6] = (uint8_t)length; s[7] = (uint8_t)(length >> 8);
++        if ((r = transfer_retry(u, ep, 0, &pid, DMA_SETUP, 8, 0))) return r;
++        pid = PID_DATA1;
++        while (got < length) {
++            uint32_t n = 0;
++            chunk = length - got;
++            if (chunk > ep->max_packet) chunk = ep->max_packet;
++            if ((r = transfer_retry(u, ep, 1, &pid, DMA_DATA + got, chunk, &n))) return r;
++            got += n;
++            if (n < chunk) break;   /* short packet ends the data stage */
++        }
++        pid = PID_DATA1;
++        if ((r = transfer_retry(u, ep, 0, &pid, DMA_DATA + DATA_MAX - 8, 0, 0))) return r;
++    }
++    for (i = 0; i < got && i < length; i++) out[i] = u->io.dma[DMA_DATA + i];
++    return got ? RPI3_USB_OK : RPI3_USB_ERROR;
++}
++
++/* ---- Enumeration ------------------------------------------------------ */
++
++static int enumerate(struct rpi3_usb *u, uint8_t speed, uint8_t split, uint8_t tt_hub,
++                     uint8_t tt_port, unsigned depth);
++
++static int hub_ports(struct rpi3_usb *u, const struct rpi3_usb_endpoint *hub, unsigned depth)
++{
++    uint8_t d[16];
++    uint32_t got;
++    unsigned ports, port, wait_ms, i;
++    int r;
++
++    if ((r = get_descriptor(u, hub, 0xa0, 0x2900, 0, 9, d))) return r;
++    ports = d[2];
++    wait_ms = (unsigned)d[5] * 2 + 100;
++    if (ports > 15) ports = 15;
++    u->hubs++;
++    printf("Rpi3 USB: hub at address %u, %u ports\n", hub->address, ports);
++
++    for (port = 1; port <= ports; port++)
++        (void)control(u, hub, 0x23, 3, 8, (uint16_t)port, 0, 0);   /* SET_FEATURE PORT_POWER */
++    msleep(u, wait_ms);
++
++    for (port = 1; port <= ports; port++) {
++        uint16_t status, change;
++        uint8_t child_speed, child_split, child_hub, child_port;
++        if (control(u, hub, 0xa3, 0, 0, (uint16_t)port, 4, &got) || got < 4) continue;
++        status = (uint16_t)(u->io.dma[DMA_DATA] | (u->io.dma[DMA_DATA + 1] << 8));
++        if (!(status & 1)) continue;                                 /* nothing connected */
++        (void)control(u, hub, 0x23, 3, 4, (uint16_t)port, 0, 0);     /* SET_FEATURE PORT_RESET */
++        for (i = 0; i < 50; i++) {
++            msleep(u, 10);
++            if (control(u, hub, 0xa3, 0, 0, (uint16_t)port, 4, &got) || got < 4) continue;
++            change = (uint16_t)(u->io.dma[DMA_DATA + 2] | (u->io.dma[DMA_DATA + 3] << 8));
++            if (change & (1u << 4)) break;                           /* C_PORT_RESET */
++        }
++        status = (uint16_t)(u->io.dma[DMA_DATA] | (u->io.dma[DMA_DATA + 1] << 8));
++        (void)control(u, hub, 0x23, 1, 20, (uint16_t)port, 0, 0);    /* clear C_PORT_RESET */
++        (void)control(u, hub, 0x23, 1, 16, (uint16_t)port, 0, 0);    /* clear C_PORT_CONNECTION */
++        if (!(status & 2)) continue;                                 /* not enabled */
++        msleep(u, 20);
++        child_speed = (status & (1u << 9)) ? SPEED_LOW : (status & (1u << 10)) ? SPEED_HIGH : SPEED_FULL;
++        if (hub->speed == SPEED_HIGH && child_speed != SPEED_HIGH) {
++            child_split = 1; child_hub = hub->address; child_port = (uint8_t)port;
++        } else {
++            child_split = hub->split; child_hub = hub->tt_hub; child_port = hub->tt_port;
++        }
++        (void)enumerate(u, child_speed, child_split, child_hub, child_port, depth + 1);
++    }
++    return RPI3_USB_OK;
++}
++
++static int enumerate(struct rpi3_usb *u, uint8_t speed, uint8_t split, uint8_t tt_hub,
++                     uint8_t tt_port, unsigned depth)
++{
++    struct rpi3_usb_endpoint ep0 = {0};
++    uint8_t d[DATA_MAX];
++    uint32_t total, at;
++    uint8_t address, config_value, dev_class;
++    int r, is_hub = 0, mouse_here = 0;
++    struct rpi3_usb_endpoint mouse = {0};
++    uint32_t mouse_iface = 0;
++
++    if (depth > 4 || u->next_address > 32) return RPI3_USB_ERROR;
++    ep0.speed = speed;
++    ep0.max_packet = (speed == SPEED_LOW) ? 8 : 64;
++    ep0.split = split; ep0.tt_hub = tt_hub; ep0.tt_port = tt_port;
++
++    if ((r = get_descriptor(u, &ep0, 0x80, 0x0100, 0, 8, d))) return r;
++    ep0.max_packet = d[7] ? d[7] : 8;
++    address = u->next_address++;
++    if ((r = control(u, &ep0, 0x00, 5, address, 0, 0, 0))) return r;   /* SET_ADDRESS */
++    msleep(u, 10);
++    ep0.address = address;
++    u->devices++;
++
++    if ((r = get_descriptor(u, &ep0, 0x80, 0x0100, 0, 18, d))) return r;
++    dev_class = d[4];
++    printf("Rpi3 USB: device %u speed=%u vid=%02x%02x pid=%02x%02x class=%u%s\n", address, speed,
++           d[9], d[8], d[11], d[10], dev_class, split ? " (split)" : "");
++    if ((r = get_descriptor(u, &ep0, 0x80, 0x0200, 0, 9, d))) return r;
++    total = d[2] | ((uint32_t)d[3] << 8);
++    if (total > DATA_MAX) total = DATA_MAX;
++    if ((r = get_descriptor(u, &ep0, 0x80, 0x0200, 0, (uint16_t)total, d))) return r;
++    config_value = d[5];
++
++    /* Walk interface and endpoint descriptors. */
++    {
++        uint8_t iface_class = 0, iface_sub = 0, iface_proto = 0, iface_num = 0;
++        for (at = 0; at + 2 <= total && d[at] >= 2; at += d[at]) {
++            if (d[at + 1] == 4 && at + 9 <= total) {
++                iface_num = d[at + 2]; iface_class = d[at + 5];
++                iface_sub = d[at + 6]; iface_proto = d[at + 7];
++                if (iface_class == 9) is_hub = 1;
++            } else if (d[at + 1] == 5 && at + 7 <= total) {
++                if (!mouse_here && iface_class == 3 && iface_sub == 1 && iface_proto == 2 &&
++                    (d[at + 2] & 0x80) && (d[at + 3] & 3) == 3) {
++                    mouse = ep0;
++                    mouse.endpoint = d[at + 2] & 0x0f;
++                    mouse.max_packet = (uint8_t)(d[at + 4] > 64 ? 64 : d[at + 4]);
++                    mouse.interval = d[at + 6];
++                    mouse.toggle = PID_DATA0;
++                    mouse_iface = iface_num;
++                    mouse_here = 1;
++                }
++            }
++        }
++    }
++    if (dev_class == 9) is_hub = 1;
++    if ((r = control(u, &ep0, 0x00, 9, config_value, 0, 0, 0))) return r;  /* SET_CONFIGURATION */
++
++    if (is_hub) {
++        ep0.split = split; ep0.tt_hub = tt_hub; ep0.tt_port = tt_port;
++        return hub_ports(u, &ep0, depth);
++    }
++    if (mouse_here && !u->mouse_found) {
++        (void)control(u, &ep0, 0x21, 0x0b, 0, (uint16_t)mouse_iface, 0, 0);  /* SET_PROTOCOL boot */
++        (void)control(u, &ep0, 0x21, 0x0a, 0, (uint16_t)mouse_iface, 0, 0);  /* SET_IDLE 0 */
++        u->mouse = mouse;
++        u->mouse_interface = mouse_iface;
++        u->mouse_found = 1;
++        printf("Rpi3 USB: mouse at address %u endpoint %u mps %u interval %u\n",
++               mouse.address, mouse.endpoint, mouse.max_packet, mouse.interval);
++    }
++    return RPI3_USB_OK;
++}
++
++/* ---- Public ------------------------------------------------------------ */
++
++int rpi3_usb_init(struct rpi3_usb *u, const struct rpi3_usb_io *io)
++{
++    uint32_t v, hprt, i;
++    int r;
++    for (i = 0; i < sizeof(*u); i++) ((uint8_t *)u)[i] = 0;
++    u->io = *io;
++    u->next_address = 1;
++
++    v = rd(u, GSNPSID);
++    if ((v >> 16) != 0x4f54) { printf("Rpi3 USB: no DWC2 core (id %08x)\n", v); return RPI3_USB_ERROR; }
++
++    wr(u, GAHBCFG, 0);                                   /* no interrupts: polled */
++    if ((r = core_reset(u))) return r;
++    v = rd(u, GUSBCFG);
++    v &= ~((1u << 20) | (1u << 22));                     /* no external VBUS / TermSel */
++    v &= ~((1u << 4) | (1u << 3));                       /* UTMI+, 8-bit (internal HS PHY) */
++    wr(u, GUSBCFG, v);
++    if ((r = core_reset(u))) return r;
++    v = rd(u, GUSBCFG);
++    v = (v & ~(1u << 30)) | (1u << 29);                  /* force host mode */
++    wr(u, GUSBCFG, v);
++    msleep(u, 50);
++
++    wr(u, GAHBCFG, 1u << 5);                             /* buffer DMA */
++    wr(u, PCGCCTL, 0);
++    wr(u, HCFG, rd(u, HCFG) & ~3u);                      /* 30/60 MHz PHY clock */
++    wr(u, GRXFSIZ, 512);
++    wr(u, GNPTXFSIZ, (512u << 16) | 512u);
++    wr(u, HPTXFSIZ, (512u << 16) | 1024u);
++    wr(u, GRSTCTL, (0x10u << 6) | (1u << 5));            /* flush all TX FIFOs */
++    (void)wait_bits(u, GRSTCTL, 1u << 5, 0, 100000);
++    wr(u, GRSTCTL, 1u << 4);                             /* flush RX FIFO */
++    (void)wait_bits(u, GRSTCTL, 1u << 4, 0, 100000);
++
++    hprt = rd(u, HPRT) & ~HPRT_W1C_MASK;
++    if (!(hprt & HPRT_PWR)) wr(u, HPRT, hprt | HPRT_PWR);
++    for (i = 0; i < 100 && !(rd(u, HPRT) & HPRT_CONN); i++) msleep(u, 10);
++    if (!(rd(u, HPRT) & HPRT_CONN)) { printf("Rpi3 USB: nothing on the root port\n"); return RPI3_USB_NO_DEVICE; }
++    msleep(u, 100);
++    hprt = rd(u, HPRT) & ~HPRT_W1C_MASK;
++    wr(u, HPRT, hprt | HPRT_RST);
++    msleep(u, 60);
++    wr(u, HPRT, hprt & ~HPRT_RST);
++    for (i = 0; i < 50 && !(rd(u, HPRT) & HPRT_ENA); i++) msleep(u, 10);
++    hprt = rd(u, HPRT);
++    if (!(hprt & HPRT_ENA)) { printf("Rpi3 USB: root port did not enable (%08x)\n", hprt); return RPI3_USB_ERROR; }
++    wr(u, HPRT, (hprt & ~HPRT_ENA) | HPRT_CONNDET | HPRT_ENACHG | HPRT_OVRCURCHG);
++    u->root_speed = (uint8_t)((hprt >> 17) & 3);
++    printf("Rpi3 USB: root port speed %u\n", u->root_speed);
++    msleep(u, 20);
++
++    r = enumerate(u, u->root_speed, 0, 0, 0, 0);
++    u->last_result = r;
++    printf("Rpi3 USB: %u devices, %u hubs, mouse %s\n", u->devices, u->hubs, u->mouse_found ? "found" : "not found");
++    return u->mouse_found ? RPI3_USB_OK : RPI3_USB_NO_MOUSE;
++}
++
++int rpi3_usb_mouse_poll(struct rpi3_usb *u, uint8_t *buttons, int8_t *dx, int8_t *dy)
++{
++    uint32_t pid, got = 0;
++    int r;
++    if (!u->mouse_found) return RPI3_USB_NO_MOUSE;
++    pid = u->mouse.toggle;
++    r = transfer(u, &u->mouse, EP_INTERRUPT, 1, &pid, DMA_REPORT, u->mouse.max_packet, &got);
++    u->last_result = r;
++    if (r != RPI3_USB_OK) return r;
++    u->mouse.toggle = (uint8_t)pid;
++    if (got < 3) return RPI3_USB_NAK;
++    *buttons = u->io.dma[DMA_REPORT];
++    *dx = (int8_t)u->io.dma[DMA_REPORT + 1];
++    *dy = (int8_t)u->io.dma[DMA_REPORT + 2];
++    u->reports++;
++    return RPI3_USB_OK;
++}
++#endif /* BOARD_CONFIG_RASPBERRYPI3 */
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.h b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.h
+new file mode 100644
+index 0000000..ee101e1
+--- /dev/null
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.h
+@@ -0,0 +1,54 @@
++/*
++ * Minimal USB host for the Raspberry Pi's DWC2 controller: enough to find a
++ * HID boot-protocol mouse through the Pi 3B+'s two built-in hub levels and
++ * read its reports. Polled, one host channel, buffer-DMA mode.
++ */
++#ifndef RPI3_USB_H
++#define RPI3_USB_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define RPI3_USB_PA     0x3f980000U
++#define RPI3_USB_BYTES  0x00011000U   /* core, host and power registers */
++
++struct rpi3_usb_io {
++    void *opaque;
++    volatile uint32_t *regs;          /* mapped RPI3_USB_PA */
++    volatile uint8_t *dma;            /* 4 KiB, uncached, physically contiguous */
++    uint32_t dma_physical;
++    uint64_t (*now_ns)(void *);
++    void (*sleep_ms)(void *, uint32_t);
++};
++
++enum {
++    RPI3_USB_OK = 0, RPI3_USB_NAK = 1,
++    RPI3_USB_ERROR = -1, RPI3_USB_TIMEOUT = -2, RPI3_USB_STALL = -3,
++    RPI3_USB_NO_DEVICE = -4, RPI3_USB_NO_MOUSE = -5
++};
++
++struct rpi3_usb_endpoint {
++    uint8_t address, endpoint, speed, max_packet, interval, toggle;
++    uint8_t split, tt_hub, tt_port;   /* transaction translator, if split */
++};
++
++struct rpi3_usb {
++    struct rpi3_usb_io io;
++    uint8_t next_address, root_speed;
++    int mouse_found;
++    struct rpi3_usb_endpoint mouse;
++    uint32_t mouse_interface;
++    uint32_t devices, hubs, errors, naks, reports;
++    int32_t last_result;
++};
++
++int rpi3_usb_init(struct rpi3_usb *, const struct rpi3_usb_io *);
++/* RPI3_USB_OK with a report (buttons, dx, dy), RPI3_USB_NAK when the mouse
++ * had nothing new, negative on errors. */
++int rpi3_usb_mouse_poll(struct rpi3_usb *, uint8_t *buttons, int8_t *dx, int8_t *dy);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/xnu/iokit/conf/files.arm b/xnu/iokit/conf/files.arm
+index b48b16f..2a937bb 100644
+--- a/xnu/iokit/conf/files.arm
++++ b/xnu/iokit/conf/files.arm
+@@ -58,5 +58,6 @@ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_log_locator.c standard
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_diag_stubs.c standard
+ # Raspberry Pi 3 board drivers
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3SD.cpp optional iokitcpp
+-iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3Input.cpp optional iokitcpp
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp optional iokitcpp
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c standard
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c standard
+diff --git a/xnu/pexpert/arm/pe_rpi3.c b/xnu/pexpert/arm/pe_rpi3.c
+index 014759d..9ae2088 100644
+--- a/xnu/pexpert/arm/pe_rpi3.c
++++ b/xnu/pexpert/arm/pe_rpi3.c
+@@ -351,20 +351,28 @@ void ios7leo_mdp_observe(LeoMDPFaultObservation *out)
+     out->known = LEO_MDP_KNOWN_LIVE;   /* no DMA engine: never pending/latched */
+ }
+ 
+-/* Source column/row for each framebuffer pixel: the iOS surface is
+- * LEO_RENDER_WIDTH x LEO_RENDER_HEIGHT (320x533), shown at 1.5x. */
+-static uint16_t src_x[RPI3_FB_WIDTH], src_y[RPI3_FB_HEIGHT];
++/* Source column/row for each framebuffer pixel. The display driver in the
++ * public tree hands over a 480x800 surface (shown 1:1); the HD2 package's
++ * newer render mode uses LEO_RENDER_WIDTH x LEO_RENDER_HEIGHT (320x533),
++ * shown at 1.5x. Both tables are built once; present picks by geometry. */
++static uint16_t src_x_full[RPI3_FB_WIDTH], src_y_full[RPI3_FB_HEIGHT];
++static uint16_t src_x_render[RPI3_FB_WIDTH], src_y_render[RPI3_FB_HEIGHT];
+ 
+ static void scale_tables_init(void)
+ {
+     unsigned int i;
+-    for (i = 0; i < RPI3_FB_WIDTH; i++)
+-        src_x[i] = (uint16_t)((i * LEO_RENDER_WIDTH) / RPI3_FB_WIDTH);
+-    for (i = 0; i < RPI3_FB_HEIGHT; i++)
+-        src_y[i] = (uint16_t)((i * LEO_RENDER_HEIGHT) / RPI3_FB_HEIGHT);
++    for (i = 0; i < RPI3_FB_WIDTH; i++) {
++        src_x_full[i] = (uint16_t)i;
++        src_x_render[i] = (uint16_t)((i * LEO_RENDER_WIDTH) / RPI3_FB_WIDTH);
++    }
++    for (i = 0; i < RPI3_FB_HEIGHT; i++) {
++        src_y_full[i] = (uint16_t)i;
++        src_y_render[i] = (uint16_t)((i * LEO_RENDER_HEIGHT) / RPI3_FB_HEIGHT);
++    }
+ }
+ 
+-static void copy_row(volatile uint16_t *out, const uint8_t *pixels, uint32_t format)
++static void copy_row(volatile uint16_t *out, const uint8_t *pixels, uint32_t format,
++                     const uint16_t *src_x)
+ {
+     /* 'BGRA' bytes are B,G,R,A; 'RGBA' bytes are R,G,B,A. */
+     const unsigned int r_at = (format == 0x42475241U) ? 2 : 0;
+@@ -376,14 +384,73 @@ static void copy_row(volatile uint16_t *out, const uint8_t *pixels, uint32_t for
+     }
+ }
+ 
++/* ---- Mouse pointer overlay (iOS draws none) ---------------------------- */
++
++#define CURSOR_W 12
++#define CURSOR_H 19
++/* 2 = white fill, 1 = black outline, 0 = transparent. */
++static const char *const cursor_shape[CURSOR_H] = {
++    "1           ", "11          ", "121         ", "1221        ",
++    "12221       ", "122221      ", "1222221     ", "12222221    ",
++    "122222221   ", "1222222221  ", "12222222221 ", "122222111111",
++    "1221221     ", "121 1221    ", "11  1221    ", "1    1221   ",
++    "     1221   ", "      1221  ", "      11    "
++};
++static int cursor_x = -1, cursor_y = -1, cursor_drawn, presenting;
++static uint16_t cursor_under[CURSOR_H][CURSOR_W];
++
++static void cursor_hide_locked(void)
++{
++    int r, c;
++    if (!cursor_drawn || !rpi_pixels) { cursor_drawn = 0; return; }
++    for (r = 0; r < CURSOR_H; r++)
++        for (c = 0; c < CURSOR_W; c++) {
++            int x = cursor_x + c, y = cursor_y + r;
++            if (x < (int)RPI3_FB_WIDTH && y < (int)RPI3_FB_HEIGHT && cursor_shape[r][c] != ' ')
++                rpi_pixels[y * RPI3_FB_WIDTH + x] = cursor_under[r][c];
++        }
++    cursor_drawn = 0;
++}
++
++static void cursor_show_locked(void)
++{
++    int r, c;
++    if (cursor_x < 0 || !rpi_pixels || !rpi_graphics_owner || rpi_fatal_active) return;
++    for (r = 0; r < CURSOR_H; r++)
++        for (c = 0; c < CURSOR_W; c++) {
++            int x = cursor_x + c, y = cursor_y + r;
++            if (x >= (int)RPI3_FB_WIDTH || y >= (int)RPI3_FB_HEIGHT || cursor_shape[r][c] == ' ') continue;
++            cursor_under[r][c] = rpi_pixels[y * RPI3_FB_WIDTH + x];
++            rpi_pixels[y * RPI3_FB_WIDTH + x] = cursor_shape[r][c] == '2' ? 0xffff : 0x0000;
++        }
++    cursor_drawn = 1;
++}
++
++/* Called by the USB mouse transport with screen coordinates (0..479, 0..799). */
++void rpi3_cursor_move(int x, int y)
++{
++    boolean_t enabled = ml_set_interrupts_enabled(FALSE);
++    if (presenting) { cursor_x = x; cursor_y = y; }     /* drawn when the frame lands */
++    else { cursor_hide_locked(); cursor_x = x; cursor_y = y; cursor_show_locked(); }
++    sync_writes();
++    ml_set_interrupts_enabled(enabled);
++}
++
+ int ios7leo_display_present(const uint8_t *pixels, uint32_t bytes, uint32_t row,
+                             uint32_t format, uint64_t *completed_sequence)
+ {
+     unsigned int y;
++    const uint16_t *src_x, *src_y;
+     ++obs_attempts;
+     obs_last_rows = 0;
+     if (!pixels || !completed_sequence || !leo_scanout_geometry(bytes, row, format))
+         return obs_failed(1);
++    if (row >= RPI3_FB_WIDTH * 4U &&
++        (uint64_t)(RPI3_FB_HEIGHT - 1U) * row + RPI3_FB_WIDTH * 4U <= bytes) {
++        src_x = src_x_full; src_y = src_y_full;          /* 480x800 surface */
++    } else {
++        src_x = src_x_render; src_y = src_y_render;      /* 320x533 surface */
++    }
+     if (!ios7leo_display_ready()) return obs_failed(2);
+     if (!rpi_graphics_owner) {
+         boolean_t enabled = ml_set_interrupts_enabled(FALSE);
+@@ -391,15 +458,28 @@ int ios7leo_display_present(const uint8_t *pixels, uint32_t bytes, uint32_t row,
+         rpi_graphics_owner = 1;
+         ml_set_interrupts_enabled(enabled);
+     }
++    {
++        /* The new frame replaces whatever was under the pointer. */
++        boolean_t enabled = ml_set_interrupts_enabled(FALSE);
++        presenting = 1;
++        cursor_drawn = 0;
++        ml_set_interrupts_enabled(enabled);
++    }
+     for (y = 0; y < RPI3_FB_HEIGHT; y++) {
+         /* Rows are short; masking per row keeps a fatal painter from
+          * interleaving with a half-written row, as on the HD2. */
+         boolean_t enabled = ml_set_interrupts_enabled(FALSE);
+-        if (rpi_fatal_active) { ml_set_interrupts_enabled(enabled); return obs_failed(4); }
+-        copy_row(rpi_pixels + y * RPI3_FB_WIDTH, pixels + (uint32_t)src_y[y] * row, format);
++        if (rpi_fatal_active) { presenting = 0; ml_set_interrupts_enabled(enabled); return obs_failed(4); }
++        copy_row(rpi_pixels + y * RPI3_FB_WIDTH, pixels + (uint32_t)src_y[y] * row, format, src_x);
+         ++obs_rows; ++obs_last_rows;
+         ml_set_interrupts_enabled(enabled);
+     }
++    {
++        boolean_t enabled = ml_set_interrupts_enabled(FALSE);
++        presenting = 0;
++        cursor_show_locked();
++        ml_set_interrupts_enabled(enabled);
++    }
+     sync_writes();
+     ++rpi_graphics_sequence;
+     if (!rpi_graphics_sequence) ++rpi_graphics_sequence;
+diff --git a/xnu/pexpert/arm/rpi3_board.h b/xnu/pexpert/arm/rpi3_board.h
+index 8b3b807..694ce73 100644
+--- a/xnu/pexpert/arm/rpi3_board.h
++++ b/xnu/pexpert/arm/rpi3_board.h
+@@ -77,6 +77,7 @@ typedef struct rpi3_handoff {
+ extern "C" {
+ #endif
+ unsigned int rpi3_emmc_clock_hz(void);
++void rpi3_cursor_move(int x, int y);
+ #ifdef __cplusplus
+ }
+ #endif
+-- 
+2.43.0
+
