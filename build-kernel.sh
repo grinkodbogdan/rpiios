@@ -22,6 +22,11 @@ fi
 # Re-apply the patch series whenever it changes (tracked by its hash).
 stamp="$(cat "$here"/patches/xnu/*.patch | sha256sum | cut -c1-16)"
 if [[ "$(cat "$SRC/.rpiios-patches" 2>/dev/null)" != "$stamp" ]]; then
+    if [[ -n "$(git -C "$SRC" status --porcelain --untracked-files=no)" ]]; then
+        echo "error: $SRC has uncommitted changes; commit them (and export them to" >&2
+        echo "patches/xnu/) before the patch series is re-applied over them." >&2
+        exit 1
+    fi
     echo "==> Applying patches on top of $XNU_COMMIT"
     git -C "$SRC" checkout -q -f -B rpiios "$XNU_COMMIT"
     git -C "$SRC" -c user.name=rpiios -c user.email=rpiios@localhost \

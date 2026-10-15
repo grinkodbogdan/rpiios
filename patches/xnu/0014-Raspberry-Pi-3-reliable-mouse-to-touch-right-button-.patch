@@ -1,0 +1,309 @@
+From 753d5ec51dd1ad34237c165d1601af95511fa74f Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 14:19:44 +0000
+Subject: [PATCH] Raspberry Pi 3: reliable mouse-to-touch; right button as Home
+
+On real hardware clicks only registered once or twice and drags lagged.
+The HD2 touch service stops reading its transport while a packet is
+pending (its 4 KB queue to backboardd is full, i.e. backboardd is busy),
+so the mouse went unread: movement during drags was lost and press and
+release edges were delayed or collapsed. QEMU showed the same: the
+pointer froze while the button was held.
+
+- rpi3_touch: pump() reads up to 3 mouse reports, moves the pointer and
+  records every button change with its position in an ordered ring.
+  Each tick hands iOS the oldest change, or else one merged move to the
+  latest position. A held finger is lifted if the mouse disappears.
+- IOS7LeoHIDTouch (Pi only): while the queue is full, keep calling
+  rpi3_touch_track() so the pointer moves and no click is lost.
+- Right mouse button: a keyboard event, consumer page 0x0C usage 0x40
+  (Menu, the Home button), through the same queue (experimental: the
+  keyboard event layout follows IOHIDFamily's IOHIDKeyboardEventData).
+---
+ .../ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp  |  37 +++-
+ .../ARM/AppleARMPlatform/rpi3_touch.cpp       | 181 ++++++++++++------
+ 2 files changed, 156 insertions(+), 62 deletions(-)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp
+index 711073f..83c85f6 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp
+@@ -127,6 +127,9 @@ class IOHIDEventService : public IOService {
+  static int delayMicroseconds(void *,uint32_t);
+  static void tick(OSObject *,IOTimerEventSource *);
+  void poll(void);
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++ void enqueueHome(bool down);
++#endif
+  bool publishProperties(void);
+  void commitPacket(void);
+  void closeReader(void);
+@@ -322,6 +325,29 @@ void IOHIDEventService::commitPacket(void)
+  previousDown=down;lastPacket=pendingPacket;lastValid=true;pending=false;
+  publishSnapshot();
+ }
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++extern "C" void rpi3_touch_track(void);
++/* Right mouse button = Home: a keyboard event, consumer page 0x0C usage
++ * 0x40 (Menu), in the same IOHIDEventCreateWithBytes layout as the touch
++ * packets (28-byte header, then the event: size, type 3, options, depth,
++ * usagePage, usage, down, flags). Best effort: dropped if the queue is full. */
++struct __attribute__((packed)) Rpi3HomePacket {
++ LeoHIDHeader header;
++ struct __attribute__((packed)) {
++  uint32_t size,type,options;uint8_t depth,reserved[3];
++  uint16_t usagePage,usage;uint32_t down,flags;
++ } key;
++};
++void IOHIDEventService::enqueueHome(bool down)
++{
++ Rpi3HomePacket p;bzero(&p,sizeof(p));
++ p.header.timeStamp=mach_absolute_time();p.header.senderID=getRegistryEntryID();
++ p.header.eventCount=1;
++ p.key.size=sizeof(p.key);p.key.type=3;p.key.usagePage=0x0c;p.key.usage=0x40;p.key.down=down?1:0;
++ bool ok=queue->sane() && queue->enqueue(&p,sizeof(p));
++ static unsigned logs;if(logs<8U){++logs;IOLog("IOS7LEO TOUCH home %s %s\n",down?"down":"up",ok?"enqueued":"dropped (queue full)");}
++}
++#endif
+ void IOHIDEventService::poll(void)
+ {
+  IOLockLock(lock);
+@@ -335,7 +361,13 @@ void IOHIDEventService::poll(void)
+   * no new input/read errors. Observation never initiates hardware reads. */
+  publishSnapshot();
+  if(pending && opened){
+-  if(!queue->sane() || !queue->enqueue(&pendingPacket,sizeof(pendingPacket))){leo_touch_inc(&queueFailures);publishSnapshot();IOLockUnlock(lock);return;}
++  if(!queue->sane() || !queue->enqueue(&pendingPacket,sizeof(pendingPacket))){
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++   /* backboardd is behind: keep reading the mouse so the pointer moves and
++    * button changes are recorded for later (rpi3_touch.cpp). */
++   rpi3_touch_track();
++#endif
++   leo_touch_inc(&queueFailures);publishSnapshot();IOLockUnlock(lock);return;}
+   commitPacket();
+  }
+  LeoTouchReport report;int result=leo_touch_transport_poll(&state,&report);
+@@ -352,6 +384,9 @@ void IOHIDEventService::poll(void)
+    report.raw[0],report.raw[1],report.raw[2],report.raw[3],report.raw[4],report.raw[5],report.raw[6],report.raw[7],report.raw[8]);
+  }
+  if(!opened){previousDown=false;IOLockUnlock(lock);return;}
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++ if(report.raw[8]&0x80U){enqueueHome((report.raw[8]&1U)!=0);IOLockUnlock(lock);return;}
++#endif
+  if(!report.down && !previousDown){IOLockUnlock(lock);return;}
+  if(!leo_touch_make_hid_packet(report.x,report.y,report.down,previousDown,
+   mach_absolute_time(),getRegistryEntryID(),&pendingPacket)){IOLockUnlock(lock);return;}
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
+index 1a059bc..f1699af 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
+@@ -33,7 +33,6 @@ static IOMemoryMap *regsMap;
+ static IOBufferMemoryDescriptor *dmaPage;
+ static bool controllerUp;
+ static int32_t cursorX = SCREEN_W / 2 * 256, cursorY = SCREEN_H / 2 * 256; /* 24.8 */
+-static uint8_t lastButtons;
+ static uint64_t nextRetryNs;
+ 
+ /* Mouse diagnostics for the boot watchdog (osfmk/arm/trap.c). */
+@@ -112,78 +111,138 @@ extern "C" int leo_touch_transport_init(LeoTouchState *s, const LeoTouchIO *io)
+     return LEO_TOUCH_OK;
+ }
+ 
+-extern "C" int leo_touch_transport_poll(LeoTouchState *s, LeoTouchReport *report)
++/*
++ * Mouse -> touch.
++ *
++ * pump() reads the mouse (a few queued reports at most) and moves the
++ * pointer; every change of the left button (the finger) or right button
++ * (Home) is recorded, with the pointer position at that moment, in a small
++ * ring. The HID touch service asks for one event per 20 ms tick:
++ * transport_poll hands out the oldest recorded button change, or, when
++ * none is waiting and the finger is down, one move to the latest position
++ * (moves are merged, never queued). When backboardd falls behind and the
++ * service's queue is full it does not ask for events, but still calls
++ * rpi3_touch_track() so the pointer keeps moving and no click is lost.
++ */
++enum { EDGE_DOWN = 0, EDGE_UP = 1, EDGE_HOME_DOWN = 2, EDGE_HOME_UP = 3 };
++struct edge { uint8_t kind; uint16_t x, y; };
++#define EDGE_RING 16
++static struct edge edges[EDGE_RING];
++static unsigned edgeHead, edgeCount;
++static uint8_t mouseButtons;            /* latest state read from the mouse */
++static bool fingerDown;                 /* last finger state handed to iOS */
++static uint16_t sentX = 0xffff, sentY = 0xffff;
++static uint32_t edgeDrops;
++
++static void record_edge(uint8_t kind)
+ {
+-    uint8_t buttons = 0;
+-    int32_t dx = 0, dy = 0;
+-    int r;
+-    if (!s || !report) return LEO_TOUCH_ARGUMENT;
+-    if (!s->ready) return LEO_TOUCH_NOT_READY;
+-    s->polls++;
++    struct edge *e;
++    if (edgeCount == EDGE_RING) {       /* full: drop the oldest, keep order */
++        edgeHead = (edgeHead + 1) % EDGE_RING; edgeCount--; edgeDrops++;
++    }
++    e = &edges[(edgeHead + edgeCount) % EDGE_RING];
++    e->kind = kind; e->x = (uint16_t)(cursorX >> 8); e->y = (uint16_t)(cursorY >> 8);
++    edgeCount++;
++}
+ 
++/* Read up to 3 mouse reports. Returns false while no mouse is usable. */
++static bool pump(LeoTouchState *s)
++{
++    unsigned n;
+     if (!usb.mouse_found) {
+-        /* Re-enumerate every 3 s until a mouse shows up. */
++        /* Lost or never found: lift a held finger, look again every 3 s. */
+         uint64_t now = usbNowNs(0);
+-        if (now < nextRetryNs) return 0;
+-        nextRetryNs = now + 3000000000ULL;
+-        s->recoveries++;
+-        (void)bringUp();
+-        return 0;
+-    }
+-
+-    r = rpi3_usb_mouse_poll(&usb, &buttons, &dx, &dy);
+-    if (r == RPI3_USB_NAK) { s->not_ready_skips++; return 0; }
+-    if (r != RPI3_USB_OK) {
+-        s->errors++;
+-        if (usb.errors > 50) { usb.mouse_found = 0; usb.errors = 0; }  /* unplugged? look again */
+-        return 0;
++        if (mouseButtons & 1) record_edge(EDGE_UP);
++        if (mouseButtons & 2) record_edge(EDGE_HOME_UP);
++        mouseButtons = 0;
++        if (now >= nextRetryNs) {
++            nextRetryNs = now + 3000000000ULL;
++            if (s) s->recoveries++;
++            (void)bringUp();
++        }
++        return false;
+     }
+-    s->reads++;
+-    s->packets++;
+-    dbgReports++;
+-    if (dx || dy) dbgMoves++;
+-    for (unsigned i = 0; i < sizeof(dbgLast); i++) dbgLast[i] = usb.io.dma[1024 + i]  /* DMA_REPORT */;
+-    if (dbgShown < 12) {
+-        dbgShown++;
+-        IOLog("mouse report %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-              dbgLast[0], dbgLast[1], dbgLast[2], dbgLast[3], dbgLast[4], dbgLast[5], dbgLast[6], dbgLast[7]);
++    for (n = 0; n < 3; n++) {
++        uint8_t buttons = 0;
++        int32_t dx = 0, dy = 0;
++        int r = rpi3_usb_mouse_poll(&usb, &buttons, &dx, &dy);
++        if (r == RPI3_USB_NAK) { if (s) s->not_ready_skips++; break; }
++        if (r != RPI3_USB_OK) {
++            if (s) s->errors++;
++            if (usb.errors > 50) { usb.mouse_found = 0; usb.errors = 0; }  /* unplugged? */
++            break;
++        }
++        if (s) { s->reads++; s->packets++; }
++        dbgReports++;
++        if (dx || dy) dbgMoves++;
++        for (unsigned i = 0; i < sizeof(dbgLast); i++) dbgLast[i] = usb.io.dma[1024 + i];  /* DMA_REPORT */
++        if (dbgShown < 12) {
++            dbgShown++;
++            IOLog("mouse report %02x %02x %02x %02x %02x %02x %02x %02x\n",
++                  dbgLast[0], dbgLast[1], dbgLast[2], dbgLast[3], dbgLast[4], dbgLast[5], dbgLast[6], dbgLast[7]);
++        }
++        if (usb.layout.absolute) {
++            int32_t xr = usb.layout.x_max - usb.layout.x_min, yr = usb.layout.y_max - usb.layout.y_min;
++            if (xr > 0) cursorX = (int32_t)(((int64_t)(dx - usb.layout.x_min) * (SCREEN_W - 1) * 256) / xr);
++            if (yr > 0) cursorY = (int32_t)(((int64_t)(dy - usb.layout.y_min) * (SCREEN_H - 1) * 256) / yr);
++        } else {
++            int32_t speed = usb.layout.x_size > 8 ? SPEED_FIXED_WIDE : SPEED_FIXED_8BIT;
++            if (dx > 4096) dx = 4096; if (dx < -4096) dx = -4096;
++            if (dy > 4096) dy = 4096; if (dy < -4096) dy = -4096;
++            cursorX += dx * speed;
++            cursorY += dy * speed;
++        }
++        if (cursorX < 0) cursorX = 0;
++        if (cursorY < 0) cursorY = 0;
++        if (cursorX > (SCREEN_W - 1) * 256) cursorX = (SCREEN_W - 1) * 256;
++        if (cursorY > (SCREEN_H - 1) * 256) cursorY = (SCREEN_H - 1) * 256;
++        if (dx || dy) rpi3_cursor_move(cursorX >> 8, cursorY >> 8);
++        /* Button changes, recorded where they happened. */
++        if ((buttons ^ mouseButtons) & 2) record_edge((buttons & 2) ? EDGE_HOME_DOWN : EDGE_HOME_UP);
++        if ((buttons ^ mouseButtons) & 1) record_edge((buttons & 1) ? EDGE_DOWN : EDGE_UP);
++        mouseButtons = buttons;
+     }
++    return true;
++}
+ 
+-    if (usb.layout.absolute) {
+-        /* Tablet-style pointer: scale its range onto the screen. */
+-        int32_t xr = usb.layout.x_max - usb.layout.x_min, yr = usb.layout.y_max - usb.layout.y_min;
+-        int32_t nx = xr > 0 ? (int32_t)(((int64_t)(dx - usb.layout.x_min) * (SCREEN_W - 1) * 256) / xr) : cursorX;
+-        int32_t ny = yr > 0 ? (int32_t)(((int64_t)(dy - usb.layout.y_min) * (SCREEN_H - 1) * 256) / yr) : cursorY;
+-        dx = (nx != cursorX); dy = (ny != cursorY);   /* "moved" flags for below */
+-        cursorX = nx; cursorY = ny;
+-    } else {
+-        int32_t speed = usb.layout.x_size > 8 ? SPEED_FIXED_WIDE : SPEED_FIXED_8BIT;
+-        if (dx > 4096) dx = 4096; if (dx < -4096) dx = -4096;
+-        if (dy > 4096) dy = 4096; if (dy < -4096) dy = -4096;
+-        cursorX += dx * speed;
+-        cursorY += dy * speed;
+-    }
+-    if (cursorX < 0) cursorX = 0;
+-    if (cursorY < 0) cursorY = 0;
+-    if (cursorX > (SCREEN_W - 1) * 256) cursorX = (SCREEN_W - 1) * 256;
+-    if (cursorY > (SCREEN_H - 1) * 256) cursorY = (SCREEN_H - 1) * 256;
+-    if (dx || dy) rpi3_cursor_move(cursorX >> 8, cursorY >> 8);
++/* Called by the touch service when its queue is full: keep reading. */
++extern "C" void rpi3_touch_track(void) { (void)pump(0); }
+ 
+-    bool down = (buttons & 1) != 0, wasDown = (lastButtons & 1) != 0;
+-    lastButtons = buttons;
+-    /* A report while the finger is down (move or press), and one on release. */
+-    if (!down && !wasDown) return 0;
++extern "C" int leo_touch_transport_poll(LeoTouchState *s, LeoTouchReport *report)
++{
++    if (!s || !report) return LEO_TOUCH_ARGUMENT;
++    if (!s->ready) return LEO_TOUCH_NOT_READY;
++    s->polls++;
++    (void)pump(s);
+ 
+     bzero(report, sizeof(*report));
++    if (edgeCount) {
++        struct edge e = edges[edgeHead];
++        edgeHead = (edgeHead + 1) % EDGE_RING; edgeCount--;
++        report->x = e.x; report->y = e.y;
++        if (e.kind == EDGE_HOME_DOWN || e.kind == EDGE_HOME_UP) {
++            /* Home button: raw[8] bit 7 marks it, bit 0 is pressed. The
++             * finger state is unchanged. */
++            report->raw[8] = (uint8_t)(0x80U | (e.kind == EDGE_HOME_DOWN ? 1U : 0U));
++            report->down = fingerDown ? 1 : 0;
++        } else {
++            if ((e.kind == EDGE_DOWN) == fingerDown) return 0;   /* already in that state */
++            fingerDown = (e.kind == EDGE_DOWN);
++            report->down = fingerDown ? 1 : 0;
++            if (fingerDown) s->presses++; else s->releases++;
++        }
++    } else if (fingerDown && ((uint16_t)(cursorX >> 8) != sentX || (uint16_t)(cursorY >> 8) != sentY)) {
++        report->x = (uint16_t)(cursorX >> 8);
++        report->y = (uint16_t)(cursorY >> 8);
++        report->down = 1;
++    } else {
++        return 0;
++    }
++    sentX = report->x; sentY = report->y;
+     report->sequence = ++s->sequence;
+-    report->x = (uint16_t)(cursorX >> 8);
+-    report->y = (uint16_t)(cursorY >> 8);
+-    report->down = down ? 1 : 0;
+-    report->contacts = down ? 1 : 0;
+-    report->raw[0] = buttons; report->raw[1] = (uint8_t)dx; report->raw[2] = (uint8_t)dy;
++    report->contacts = report->down ? 1 : 0;
++    report->raw[0] = mouseButtons;
+     s->last_x = report->x; s->last_y = report->y; s->last_contacts = report->contacts;
+-    if (down && !wasDown) s->presses++;
+-    if (!down && wasDown) s->releases++;
+     return 1;
+ }
+ #endif /* BOARD_CONFIG_RASPBERRYPI3 */
+-- 
+2.43.0
+
