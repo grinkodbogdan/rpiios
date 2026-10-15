@@ -1,0 +1,132 @@
+From 208ed0227118548ec9463871898416a9b6f0353a Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 12:09:32 +0000
+Subject: [PATCH] Raspberry Pi 3: no strongly-ordered RAM from cache modes;
+ report unfixable user aborts
+
+Second real-hardware boot: the kernel reached launchd and mapped the
+shared cache, then userland stalled with no message (the kernel stayed
+alive; touch reports kept arriving).
+
+pmap_set_cache_attributes() only named write-through and write-back;
+every other mode (default, use-default, inner write-back, and the 0 a
+page is reset to) produced template 0, strongly-ordered memory, applied
+to the page's existing mappings. On the Cortex-A53 ldrex/strex on such a
+page fault with "unsupported exclusive access", and sleh_abort answered
+with vm_fault(), which succeeds because the page is present, so the
+instruction retried forever.
+
+For BOARD_CONFIG_RASPBERRYPI3:
+- pmap_set_cache_attributes: only real I/O modes are uncached; all other
+  modes map RAM write-back (no DMA master shares RAM with the CPU).
+- sleh_abort: a user data abort that vm_fault cannot fix (external abort,
+  unsupported exclusive) is printed (process, FSR, FAR, PC, PTE) and
+  becomes EXC_BAD_ACCESS instead of an endless retry.
+- exec: print every program started, as boot progress on the console.
+---
+ xnu/bsd/kern/kern_exec.c |  4 ++++
+ xnu/osfmk/arm/pmap.c     | 24 ++++++++++++++++++++++++
+ xnu/osfmk/arm/trap.c     | 30 ++++++++++++++++++++++++++++++
+ 3 files changed, 58 insertions(+)
+
+diff --git a/xnu/bsd/kern/kern_exec.c b/xnu/bsd/kern/kern_exec.c
+index fc71733..8adf97e 100644
+--- a/xnu/bsd/kern/kern_exec.c
++++ b/xnu/bsd/kern/kern_exec.c
+@@ -1299,6 +1299,10 @@ exec_activate_image(struct image_params *imgp)
+ 
+ 	/* Use imgp->ip_strings, which contains the copyin-ed exec path */
+ 	DTRACE_PROC1(exec, uintptr_t, imgp->ip_strings);
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++	/* Boot progress on the Pi's console: every program iOS starts. */
++	printf("exec %s\n", imgp->ip_strings);
++#endif
+ 
+ 	NDINIT(&nd, LOOKUP, OP_LOOKUP, FOLLOW | LOCKLEAF | AUDITVNPATH1,
+ 		   UIO_SYSSPACE, CAST_USER_ADDR_T(imgp->ip_strings), imgp->ip_vfs_context);
+diff --git a/xnu/osfmk/arm/pmap.c b/xnu/osfmk/arm/pmap.c
+index 8cf8d75..be1e243 100644
+--- a/xnu/osfmk/arm/pmap.c
++++ b/xnu/osfmk/arm/pmap.c
+@@ -1426,6 +1426,30 @@ void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr)
+     unsigned int current, template = 0;
+     int pai;
+ 
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    /*
++     * The generic code below turns every mode it does not name (the
++     * default, "use default", inner write-back, and the 0 a page is reset
++     * to) into template 0, strongly-ordered memory. On the Cortex-A53 that
++     * breaks every ldrex/strex on the page. The Pi has no DMA master
++     * sharing ordinary RAM with the CPU (the display copies through the
++     * CPU), so only real I/O mappings stay uncached; the rest is RAM.
++     */
++    boolean_t io = (cacheattr != VM_WIMG_USE_DEFAULT) &&
++                   (cacheattr & VM_MEM_NOT_CACHEABLE) && cacheattr != VM_WIMG_WCOMB;
++    template = io ? 0 : ARM_NORMAL_MEMORY_ATTR;
++    if (processor_avail_count > 1 && !ml_get_interrupts_enabled())
++        panic("interrupts must be enabled for pmap_set_cache_attributes");
++    assert((pn != vm_page_fictitious_addr) && (pn != vm_page_guard_addr));
++    LOCK_PVH(pai);
++    pmap_update_cache_attributes_locked(pn, template);
++    if (io)
++        phys_attribute_set(pn, PMAP_OSPTE_TYPE_NOCACHE);
++    else
++        phys_attribute_clear(pn, PMAP_OSPTE_TYPE_NOCACHE);
++    UNLOCK_PVH(pai);
++    return;
++#endif
+     if (cacheattr & VM_MEM_NOT_CACHEABLE) {
+         /*
+          * Template of 0 is non-cacheable, strongly ordered memory.
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index 503e14e..22c2e04 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -276,6 +276,31 @@ ios7leo_installd_fault(thread_t thread, const abort_information_context_t *ctx,
+ #endif
+ 
+ static int __abort_count = 0;
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++/*
++ * A user data abort that is not a translation, access or permission fault
++ * (an external abort, or an exclusive access to memory that cannot take
++ * one, e.g. ldrex on uncached memory on the Cortex-A53). vm_fault() cannot
++ * fix these; retrying would spin forever without a word. Report it and let
++ * the normal EXC_BAD_ACCESS path stop the process.
++ */
++static boolean_t rpi3_unfixable_user_abort(thread_t thread, uint32_t fsr, uint32_t far, uint32_t pc)
++{
++    static unsigned reported;
++    unsigned fs = ((fsr >> 6) & 0x10) | (fsr & 0xf);
++    uint32_t *ptep;
++    if (fs != 0x08 && fs != 0x15 && fs != 0x16 && fs != 0x18 && fs != 0x19)
++        return FALSE;
++    if (reported++ < 16) {
++        ptep = thread->map ? (uint32_t *) pmap_pte(thread->map->pmap, (vm_offset_t) far) : 0;
++        printf("RPI3 user abort %s[%d] FS=%02x FSR=%08x FAR=%08x PC=%08x PTE=%08x\n",
++               proc_name_address(thread->task->bsd_info), proc_pid(thread->task->bsd_info),
++               fs, fsr, far, pc, ptep ? *ptep : 0xffffffffU);
++    }
++    return TRUE;
++}
++#endif
++
+ void sleh_abort(void *context, int reason)
+ {
+ #if BOARD_CONFIG_QSD8250_LEO
+@@ -595,6 +620,11 @@ void sleh_abort(void *context, int reason)
+                  */
+                 assert(get_preemption_level() == 0);
+                 __abort_count--;
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++                if (rpi3_unfixable_user_abort(thread, dfsr, dfar, arm_ctx->pc))
++                    code = KERN_PROTECTION_FAILURE;
++                else
++#endif
+                 code =
+                     vm_fault(map, vm_map_trunc_page(dfar),
+                              (dfsr & 0x800) ? (VM_PROT_READ | VM_PROT_WRITE)
+-- 
+2.43.0
+
