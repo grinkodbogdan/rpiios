@@ -43,8 +43,9 @@ Updating a card you already made (no need to rewrite it):
 2. Copy boot/kernel7.img over kernel7.img on the card.
 3. Apply the iOS settings to the root filesystem on the card:
      python3 rootfs-tweaks.py /media/$USER/RPIIOS/IOS7/ROOTFS.HFS
-   (It is safe to run again. Right now it turns off backboardd's launch
-   watchdog, which otherwise kills apps that take more than ~20 s to open.)
+   (It is safe to run again. It turns off backboardd's launch watchdog,
+   which kills apps that take more than ~20 s to open, and fixes a crash
+   when Settings opens. Use the new kernel7.img with it.)
 4. Eject the card properly before removing it.
 
 What to expect

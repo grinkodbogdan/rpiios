@@ -21,7 +21,7 @@ HEADER_FMT = "<2I9I"           # magic[2], version..segment_count
 SEGMENT_FMT = "<4I"
 HEADER_BYTES = struct.calcsize(HEADER_FMT) + MAX_SEGMENTS * struct.calcsize(SEGMENT_FMT) + 256
 
-DEFAULT_CMDLINE = "ios7lab_leo_first_entry=1 ios7lab_guard_open_error=1"
+DEFAULT_CMDLINE = "ios7lab_leo_first_entry=1 ios7lab_guard_open_error=1 cs_enforcement_disable=1"
 ROOT_MATCHING = ("<dict><key>IOProviderClass</key><string>IOMedia</string>"
                  "<key>IOPropertyMatch</key><dict><key>Content</key><string>Apple_HFS</string>"
                  "<key>IOS7LeoRootFile</key><string>IOS7/ROOTFS.HFS</string></dict></dict>")
