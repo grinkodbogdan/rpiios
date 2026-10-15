@@ -31,8 +31,11 @@ timer, display, SD, input) and reuses the root filesystem unchanged.
 | iOS 7.1.2 userland to SpringBoard / lock screen | done, **real hardware and QEMU** |
 | USB mouse/tablet as touch (DWC2 host, hubs, split transactions, HID report descriptors) | done, real hardware and QEMU |
 | Touches reach backboardd and SpringBoard | verified in QEMU |
-| AppleKeyStore stand-in (no passcode), real mach timebase | done |
-| Slide to unlock / home screen | **not yet**: SpringBoard's main thread spends long stretches blocked in MobileGestalt queries |
+| AppleKeyStore stand-in (no passcode) | done |
+| iOS 7 lock handoff (`thread_switch` options 3-5; contended locks used to spin) | done |
+| Render pacing: CPU rendering gets at most about half the CPU, so input and I/O keep up | done |
+| Slide to unlock, home screen, page swipes | **works in QEMU**; to be confirmed on the Pi |
+| Opening apps | not yet: a tapped icon highlights but the app does not open |
 
 The kernel is built with `-O2` on the Pi (the HD2 kernel stays `-O0`).
 

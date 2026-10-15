@@ -1,0 +1,85 @@
+From 52dc9118f75b13d837421dbe9f9749b7e583d1f6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 20:04:44 +0000
+Subject: [PATCH] Raspberry Pi 3: pace presents by the render thread's CPU time
+
+A fixed frame rate cap could not bound the render load: during a scroll a
+full-screen software composite costs far more than the shimmer alone.
+After each present, sleep as long as the presenting thread used the CPU
+since its previous present (render work gets about half the CPU at most),
+and keep rpi3_fps (now default 30) as an upper bound. Verified in QEMU:
+slide to unlock reaches the home screen.
+---
+ .../ARM/AppleARMPlatform/IOS7LeoDisplay.cpp   | 49 +++++++++++++------
+ 1 file changed, 34 insertions(+), 15 deletions(-)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+index b471170..88c6802 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+@@ -346,28 +346,47 @@ static bool ios7lab_primary_ready(void)
+ 
+ #if defined(BOARD_CONFIG_RASPBERRYPI3)
+ /*
+- * The Pi has no GPU: backboardd renders every frame on the CPU. Left
+- * alone, an animation (the lock screen's "slide to unlock" shimmer) keeps
+- * its render thread busy all the time, and at its priority that starves
+- * touch handling, SpringBoard and file system I/O. Pace presents: when
+- * frames come faster than rpi3_fps (boot-arg, default 15), sleep the
+- * presenting thread for the rest of the frame time.
++ * The Pi has no GPU: backboardd renders every frame on the CPU, at a
++ * priority above touch handling, SpringBoard and file system I/O. Left
++ * alone, an animation (the lock screen's "slide to unlock" shimmer, a
++ * scroll) keeps that thread busy all the time and starves everything else.
++ * Pace presents: after a frame, the presenting thread sleeps as long as it
++ * used the CPU since its previous present (rendering gets at most about
++ * half the CPU), and frames never come faster than rpi3_fps (boot-arg,
++ * default 30).
+  */
++extern "C" void thread_read_times(thread_t, time_value_t *, time_value_t *);
+ static void rpi3_pace_present(void)
+ {
+-    static uint64_t interval, last;
++    static uint64_t interval, last, lastCpuUS;
++    static thread_t lastThread;
++    static unsigned logs;
+     if (!interval) {
+-        uint32_t fps = 15;
+-        if (!PE_parse_boot_argn("rpi3_fps", &fps, sizeof(fps)) || !fps || fps > 60) fps = 15;
++        uint32_t fps = 30;
++        if (!PE_parse_boot_argn("rpi3_fps", &fps, sizeof(fps)) || !fps || fps > 60) fps = 30;
+         (nanoseconds_to_absolutetime)(1000000000ULL / fps, &interval);
+     }
+-    uint64_t now = mach_absolute_time();
+-    if (last && now - last < interval) {
+-        uint64_t ns; (absolutetime_to_nanoseconds)(interval - (now - last), &ns);
+-        IOSleep((unsigned)(ns / 1000000ULL) + 1);
+-        now = mach_absolute_time();
++    thread_t self = current_thread();
++    time_value_t user, sys;
++    thread_read_times(self, &user, &sys);
++    uint64_t cpuUS = ((uint64_t)user.seconds + sys.seconds) * 1000000ULL + user.microseconds + sys.microseconds;
++    uint64_t now = mach_absolute_time(), waitNS = 0;
++    if (last) {
++        uint64_t busyNS; (absolutetime_to_nanoseconds)(now - last, &busyNS);
++        uint64_t frameNS; (absolutetime_to_nanoseconds)(interval, &frameNS);
++        if (self == lastThread && cpuUS > lastCpuUS) waitNS = (cpuUS - lastCpuUS) * 1000ULL;
++        if (busyNS < frameNS && frameNS - busyNS > waitNS) waitNS = frameNS - busyNS;
++        if (waitNS > 500000000ULL) waitNS = 500000000ULL;
++        if (logs < 6) {
++            ++logs;
++            IOLog("Rpi3 pace: wall %llu us, render thread cpu %llu us, sleep %llu ms\n",
++                  busyNS / 1000ULL, self == lastThread ? cpuUS - lastCpuUS : 0ULL, waitNS / 1000000ULL);
++        }
++        if (waitNS >= 1000000ULL) IOSleep((unsigned)(waitNS / 1000000ULL));
+     }
+-    last = now;
++    lastThread = self;
++    lastCpuUS = cpuUS;
++    last = mach_absolute_time();
+ }
+ #endif
+ static IOReturn ios7lab_present_owned_scanout(uint32_t id)
+-- 
+2.43.0
+
