@@ -1,0 +1,52 @@
+From bb1fd18d953ffeb09ec99028bd13785458857854 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 21:53:20 +0000
+Subject: [PATCH 26/27] Raspberry Pi 3: log processes killed by a signal, with
+ the thread's registers
+
+---
+ xnu/bsd/kern/kern_exit.c | 9 +++++++++
+ xnu/osfmk/arm/trap.c     | 7 +++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/xnu/bsd/kern/kern_exit.c b/xnu/bsd/kern/kern_exit.c
+index 595c477..bc070dd 100644
+--- a/xnu/bsd/kern/kern_exit.c
++++ b/xnu/bsd/kern/kern_exit.c
+@@ -382,6 +382,15 @@ exit1_internal(proc_t p, int rv, int *retval, boolean_t thread_can_terminate, bo
+ 
+ 	p->p_lflag |= P_LEXIT;
+ 	p->p_xstat = rv;
++#if BOARD_CONFIG_RASPBERRYPI3
++	/* Nothing on the Pi collects crash reports: say who died and how. */
++	if (WIFSIGNALED(rv)) {
++		extern void rpi3_dump_current_thread(void);
++		printf("rpi3: %s[%d] terminated by signal %d\n", p->p_comm, p->p_pid, WTERMSIG(rv));
++		if (WTERMSIG(rv) != SIGKILL && p == current_proc())
++			rpi3_dump_current_thread();
++	}
++#endif
+ #if BOARD_CONFIG_ARMPBA8
+     ios7lab_preferences_lifecycle_note(lab_preferences_exit_target, lab_preferences_exit_pid,
+         "EXIT-STATUS-PUBLISHED", 1, rv, WIFSIGNALED(rv), WIFSIGNALED(rv) ? WTERMSIG(rv) : 0);
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index ab47280..35d2c70 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -347,6 +347,13 @@ static void rpi3_dump_thread(task_t task, thread_t th)
+     }
+     printf("\n");
+ }
++/* For the exit path: the dying thread's registers and backtrace. */
++void rpi3_dump_current_thread(void)
++{
++    thread_t th = current_thread();
++    if (th && th->task && th->task != kernel_task)
++        rpi3_dump_thread(th->task, th);
++}
+ extern uint32_t rpi3_sd_stat_reads, rpi3_sd_stat_errors, rpi3_sd_stat_commands, rpi3_sd_stat_multi_failures;
+ extern int32_t rpi3_sd_stat_fail_result;
+ extern uint32_t rpi3_sd_stat_fail_block, rpi3_sd_stat_fail_irq, rpi3_sd_stat_fail_status;
+-- 
+2.43.0
+
