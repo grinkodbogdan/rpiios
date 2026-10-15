@@ -1,0 +1,131 @@
+From b8ee76e1534c0180c9a866ae6180d680f7b25123 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 22:39:38 +0000
+Subject: [PATCH] Add iOS 7's guarded fd syscalls (441-444); log unimplemented
+ syscalls on the Pi
+
+libsqlite3 opens its databases with guarded_open_np (441). This kernel
+ended its syscall table at 439, so the call raised SIGSYS: backboardd died
+about a minute after leaving an app with Home, taking SpringBoard with it
+(back to the lock screen). guarded_open_np/guarded_close_np/
+guarded_kqueue_np work as open/close/kqueue without the guard;
+change_fdguard_np succeeds and reports FD_CLOEXEC. 440
+(memorystatus_control) stays unimplemented: launchd ignores SIGSYS and
+handles ENOSYS. On the Pi nosys() now prints the caller and its registers
+(first 12 calls).
+---
+ xnu/bsd/kern/kern_descrip.c  | 49 ++++++++++++++++++++++++++++++++++++
+ xnu/bsd/kern/subr_xxx.c      | 12 +++++++++
+ xnu/bsd/kern/syscalls.master |  5 ++++
+ xnu/bsd/sys/sysent.h         |  2 +-
+ 4 files changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/xnu/bsd/kern/kern_descrip.c b/xnu/bsd/kern/kern_descrip.c
+index 3ab6d51..f4ec2a9 100644
+--- a/xnu/bsd/kern/kern_descrip.c
++++ b/xnu/bsd/kern/kern_descrip.c
+@@ -5372,3 +5372,52 @@ filetype_issendable(file_type_t fdtype)
+ 			return FALSE;
+ 	}
+ }
++
++/*
++ * iOS 7's guarded file descriptors (libsqlite3 opens its databases with
++ * guarded_open_np, libdispatch uses guarded kqueues). This kernel predates
++ * them and answered with SIGSYS, killing backboardd. Provide them without
++ * the guard: a guard only turns misuse of the descriptor into a crash.
++ */
++int
++guarded_open_np(proc_t p, struct guarded_open_np_args *uap, int32_t *retval)
++{
++	struct open_nocancel_args a;
++
++	bzero(&a, sizeof (a));
++	a.path = uap->path;
++	a.flags = uap->flags;
++	a.mode = uap->mode;
++	return (open_nocancel(p, &a, retval));
++}
++
++int
++guarded_close_np(proc_t p, struct guarded_close_np_args *uap, int32_t *retval)
++{
++	struct close_nocancel_args a;
++
++	bzero(&a, sizeof (a));
++	a.fd = uap->fd;
++	return (close_nocancel(p, &a, retval));
++}
++
++int
++guarded_kqueue_np(proc_t p, __unused struct guarded_kqueue_np_args *uap, int32_t *retval)
++{
++	return (kqueue(p, NULL, retval));
++}
++
++int
++change_fdguard_np(proc_t p, struct change_fdguard_np_args *uap, __unused int32_t *retval)
++{
++	struct fileproc *fp;
++	int error, flags;
++
++	if ((error = fp_lookup(p, uap->fd, &fp, 0)) != 0)
++		return (error);
++	flags = (*fdflags(p, uap->fd) & UF_EXCLOSE) ? FD_CLOEXEC : 0;
++	fp_drop(p, uap->fd, fp, 0);
++	if (uap->fdflagsp)
++		error = copyout(&flags, uap->fdflagsp, sizeof (flags));
++	return (error);
++}
+diff --git a/xnu/bsd/kern/subr_xxx.c b/xnu/bsd/kern/subr_xxx.c
+index 5e75712..386d2b2 100644
+--- a/xnu/bsd/kern/subr_xxx.c
++++ b/xnu/bsd/kern/subr_xxx.c
+@@ -181,6 +181,18 @@ nullsys(void)
+ int
+ nosys(struct proc *p, __unused struct nosys_args *args, __unused int32_t *retval)
+ {
++#if BOARD_CONFIG_RASPBERRYPI3
++	{
++		/* Which unimplemented call (r12, or r0 for syscall(0, ...)). */
++		extern void rpi3_dump_current_thread(void);
++		static unsigned logs;
++		if (logs++ < 12) {
++		printf("rpi3: %s[%d] called an unimplemented system call (SIGSYS)\n",
++		       p->p_comm, p->p_pid);
++		rpi3_dump_current_thread();
++		}
++	}
++#endif
+ 	psignal(p, SIGSYS);
+ 	return (ENOSYS);
+ }
+diff --git a/xnu/bsd/kern/syscalls.master b/xnu/bsd/kern/syscalls.master
+index 7337ec5..7c459a1 100644
+--- a/xnu/bsd/kern/syscalls.master
++++ b/xnu/bsd/kern/syscalls.master
+@@ -670,3 +670,8 @@
+ 437	AUE_NULL	ALL	{ int nosys(void); } { old shared_region_slide_np }
+ 438	AUE_NULL	ALL	{ int shared_region_map_and_slide_np(int fd, uint32_t count, const struct shared_file_mapping_np *mappings, uint32_t slide, uint64_t* slide_start, uint32_t slide_size) NO_SYSCALL_STUB; }
+ 439	AUE_NULL	ALL	{ int kas_info(int selector, void *value, size_t *size); }
++440	AUE_NULL	ALL	{ int nosys(void); } { memorystatus_control }
++441	AUE_OPEN_RWTC	ALL	{ int guarded_open_np(user_addr_t path, user_addr_t guard, u_int guardflags, int flags, int mode) NO_SYSCALL_STUB; }
++442	AUE_CLOSE	ALL	{ int guarded_close_np(int fd, user_addr_t guard); }
++443	AUE_KQUEUE	ALL	{ int guarded_kqueue_np(user_addr_t guard, u_int guardflags); }
++444	AUE_NULL	ALL	{ int change_fdguard_np(int fd, user_addr_t guard, u_int guardflags, user_addr_t nguard, u_int nguardflags, user_addr_t fdflagsp); }
+diff --git a/xnu/bsd/sys/sysent.h b/xnu/bsd/sys/sysent.h
+index 0cad5a3..1d2dcc0 100644
+--- a/xnu/bsd/sys/sysent.h
++++ b/xnu/bsd/sys/sysent.h
+@@ -57,7 +57,7 @@ extern struct sysent sysent[];
+ #endif	/* __INIT_SYSENT_C__ */
+ 
+ extern int nsysent;
+-#define NUM_SYSENT	440	/* Current number of defined syscalls */
++#define NUM_SYSENT	445	/* Current number of defined syscalls */
+ 
+ /* sy_funnel flags bits */
+ #define FUNNEL_MASK	0x07f
+-- 
+2.43.0
+
