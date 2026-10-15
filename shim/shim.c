@@ -71,7 +71,8 @@ struct rpi3_handoff {
     uint32_t memory_base, memory_bytes, top_of_kernel_data;
     uint32_t shim_start, shim_end, payload_start, payload_end;
     uint32_t emmc_clock_hz;
-    uint32_t reserved[8];
+    uint32_t arm_clock_hz;       /* measured after the shim's request */
+    uint32_t reserved[7];
 };
 _Static_assert(sizeof(struct rpi3_handoff) == 128, "handoff layout");
 #define HANDOFF_MAGIC   0x33495052u
@@ -305,7 +306,7 @@ void shim_main(uint32_t load_addr, uint32_t firmware_r2, uint32_t entry_cpsr, ui
     struct rpi3_handoff *h;
     uint32_t v[4], i, kernel_end, cursor, top, dt_phys;
     uint32_t revision = 0, arm_base = 0, arm_bytes = 0, emmc_hz = 0;
-    uint32_t disp_w = 0, disp_h = 0, fb = 0, pitch = 0, mem_bytes;
+    uint32_t disp_w = 0, disp_h = 0, fb = 0, pitch = 0, mem_bytes, arm_hz = 0;
     const char *extra;
 
     extra = fdt_bootargs(firmware_r2);
@@ -327,6 +328,22 @@ void shim_main(uint32_t load_addr, uint32_t firmware_r2, uint32_t entry_cpsr, ui
     {   /* Power the USB host controller (device 3: on, wait until stable). */
         uint32_t in[2] = {3, 3};
         if (mbox_tag(0x00028001, in, 2, v, 2)) say("USB power state", v[1]);
+    }
+    {   /*
+         * The firmware starts the ARM cores at their minimum clock (600 MHz
+         * on a 3B+) and leaves raising it to the OS's cpufreq driver. Ask
+         * for the maximum (clock 3 = ARM); the firmware still throttles on
+         * heat or low voltage. rpi3_armclk=0 on the command line skips it.
+         */
+        uint32_t in[3] = {3, 0, 0};
+        int skip = has_word(p->cmdline, "rpi3_armclk=0") || (extra && has_word(extra, "rpi3_armclk=0"));
+        if (!skip && mbox_tag(0x00030004, in, 1, v, 2) && v[1]) {
+            in[1] = v[1];
+            mbox_tag(0x00038002, in, 3, v, 2);
+        }
+        if (mbox_tag(0x00030047, in, 1, v, 2) && v[1]) arm_hz = v[1];
+        else if (mbox_tag(0x00030002, in, 1, v, 2)) arm_hz = v[1];
+        say("ARM clock Hz", arm_hz);
     }
     say("board revision", revision);
     say("ARM memory bytes", arm_bytes);
@@ -391,6 +408,7 @@ void shim_main(uint32_t load_addr, uint32_t firmware_r2, uint32_t entry_cpsr, ui
     h->shim_start = 0x00f00000u; h->shim_end = (uint32_t)(uintptr_t)__stack_top;
     h->payload_start = (uint32_t)(uintptr_t)p; h->payload_end = (uint32_t)(uintptr_t)p + p->total_bytes;
     h->emmc_clock_hz = emmc_hz;
+    h->arm_clock_hz = arm_hz;
 
     memset_(args, 0, sizeof(*args));
     args->Revision = 1;

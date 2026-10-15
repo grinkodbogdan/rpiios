@@ -1,0 +1,39 @@
+From e83482a755bb2d16ece3743a40f6d283bdc24cbf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 20:54:42 +0000
+Subject: [PATCH] Raspberry Pi 3: report the ARM clock the shim set
+
+---
+ xnu/pexpert/arm/pe_rpi3.c    | 1 +
+ xnu/pexpert/arm/rpi3_board.h | 3 ++-
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/xnu/pexpert/arm/pe_rpi3.c b/xnu/pexpert/arm/pe_rpi3.c
+index b4a13df..89dc6c5 100644
+--- a/xnu/pexpert/arm/pe_rpi3.c
++++ b/xnu/pexpert/arm/pe_rpi3.c
+@@ -614,6 +614,7 @@ void PE_init_SocSupport_stub(void)
+         ios7leo_final_boundary(4);
+ 
+     rpi_emmc_clock_hz = h->emmc_clock_hz;
++    printf("rpi3: ARM clock %u MHz\n", h->arm_clock_hz / 1000000);
+     bzero((void *)&rpi_memory_state, sizeof(rpi_memory_state));
+     rpi_memory_state.version = IOS7_LEO_MEMORY_OBS_VERSION;
+     rpi_memory_state.status = LEO_MEMORY_STATUS_OK;
+diff --git a/xnu/pexpert/arm/rpi3_board.h b/xnu/pexpert/arm/rpi3_board.h
+index 694ce73..22e5faf 100644
+--- a/xnu/pexpert/arm/rpi3_board.h
++++ b/xnu/pexpert/arm/rpi3_board.h
+@@ -69,7 +69,8 @@ typedef struct rpi3_handoff {
+     unsigned int memory_base, memory_bytes, top_of_kernel_data;
+     unsigned int shim_start, shim_end, payload_start, payload_end;
+     unsigned int emmc_clock_hz;                 /* SDHCI base clock */
+-    unsigned int reserved[8];
++    unsigned int arm_clock_hz;                  /* ARM clock after the shim raised it */
++    unsigned int reserved[7];
+ } rpi3_handoff;
+ 
+ /* Values from the handoff for drivers (pe_rpi3.c). */
+-- 
+2.43.0
+
