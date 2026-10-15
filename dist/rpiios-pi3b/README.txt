@@ -1,9 +1,9 @@
 rpiios: iOS 7.1.2 natively on a Raspberry Pi 3 Model B+
 ========================================================
 
-EXPERIMENTAL. Boots in QEMU's Raspberry Pi emulation to the iOS lock screen;
-not yet tested on a real Pi. Expect it not to work first time - see "If it
-does not boot" below.
+EXPERIMENTAL. Boots on a real Pi 3B+ to the lock screen; slide to unlock,
+the home screen and Settings work. Expect rough edges - see "If it does not
+boot" below.
 
 You need
 - Raspberry Pi 3 Model B+, power supply, HDMI screen, USB mouse
@@ -13,9 +13,9 @@ You need
 
 Making the SD card (Linux)
 1. Install the tools (Debian/Ubuntu/Mint/Raspberry Pi OS):
-     sudo apt install fdisk dosfstools mtools unar
-   Fedora: sudo dnf install util-linux dosfstools mtools unar
-   Arch:   sudo pacman -S util-linux dosfstools mtools unarchiver
+     sudo apt install fdisk dosfstools mtools unar python3
+   Fedora: sudo dnf install util-linux dosfstools mtools unar python3
+   Arch:   sudo pacman -S util-linux dosfstools mtools unarchiver python
 2. Insert the card and find its name:
      lsblk -o NAME,SIZE,TRAN,MODEL
    It is the disk with your card's size, e.g. sdb (USB reader) or mmcblk0
@@ -37,6 +37,16 @@ and write rpiios.img to the card from any computer with Raspberry Pi Imager
 The script also accepts rootfs.hfs instead of ios7.rar if you already
 extracted it.
 
+Updating a card you already made (no need to rewrite it):
+1. Put the card in the PC; its partition opens (or mount it), e.g. at
+   /media/$USER/RPIIOS.
+2. Copy boot/kernel7.img over kernel7.img on the card.
+3. Apply the iOS settings to the root filesystem on the card:
+     python3 rootfs-tweaks.py /media/$USER/RPIIOS/IOS7/ROOTFS.HFS
+   (It is safe to run again. Right now it turns off backboardd's launch
+   watchdog, which otherwise kills apps that take more than ~20 s to open.)
+4. Eject the card properly before removing it.
+
 What to expect
 - The screen goes black; within a few seconds small numbers appear in the top
   left (boot stages), then white kernel text, then the iOS lock screen.
@@ -44,6 +54,9 @@ What to expect
 - Move the mouse to move the pointer. Hold the left button to touch the screen
   at the pointer, release to lift the finger. Slide to unlock = hold the button
   near "slide to unlock" and drag to the right.
+- Right mouse button = Home button (leave an app, go back to the home screen).
+- The boot shim asks the firmware for the full CPU clock (1.4 GHz on a 3B+;
+  the kernel prints "rpi3: ARM clock ... MHz"). iOS uses one of the 4 cores.
 - iOS drawing is done by the CPU (no GPU driver), so it is slow, as on the HD2.
 - Nothing you do is saved: like the HD2 build, iOS runs on a RAM copy of the
   root filesystem.
@@ -58,6 +71,8 @@ Send the photo back, it shows exactly where it stopped.
 
 Contents
   flash-sdcard.sh   makes the card
+  rootfs-tweaks.py  iOS settings for the Pi (the flash script runs it)
+  hfs_put.py        helper for rootfs-tweaks.py (edits a file in the image)
   boot/             the files the script puts on the card: Raspberry Pi
                     firmware (bootcode.bin, start.elf, fixup.dat,
                     LICENCE.broadcom), kernel7.img (boot shim + iOS 7 XNU

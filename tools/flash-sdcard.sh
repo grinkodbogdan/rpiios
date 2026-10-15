@@ -12,8 +12,8 @@
 # boot/ folder next to this script (override with BOOT_DIR=...). Image size
 # defaults to 2048 MiB (override with IMAGE_MB=...).
 #
-# Needs: sfdisk (fdisk/util-linux), mkfs.vfat (dosfstools), mtools, and for
-# .rar input one of 7z (p7zip-full / 7zip), unar or unrar.
+# Needs: sfdisk (fdisk/util-linux), mkfs.vfat (dosfstools), mtools, python3,
+# and for .rar input one of 7z (p7zip-full / 7zip), unar or unrar.
 # Debian/Ubuntu: sudo apt install fdisk dosfstools mtools unar
 set -euo pipefail
 
@@ -75,6 +75,21 @@ rootfs_bytes=$(stat -Lc %s "$rootfs")
 sig="$(dd if="$rootfs" bs=1 skip=1024 count=2 status=none)"
 [[ "$sig" == "H+" || "$sig" == "HX" ]] || die "$rootfs is not an HFS+ image (expected the rootfs.hfs from ios7.rar)"
 (( rootfs_bytes < 4294967296 )) || die "rootfs.hfs is 4 GiB or larger and cannot go on FAT32"
+
+# --- iOS settings for the Pi (rootfs-tweaks.py, next to this script). -----
+if [[ -f "$here/rootfs-tweaks.py" && -f "$here/hfs_put.py" ]] && command -v python3 >/dev/null; then
+    if [[ "$rootfs" != "$work/rootfs.hfs" ]]; then
+        # Never modify the caller's own file: work on a copy.
+        avail_kb=$(df -Pk "$work" | awk 'NR==2 {print $4}')
+        (( avail_kb > rootfs_bytes / 1024 + 65536 )) || die "need about 1 GiB free in ${TMPDIR:-/tmp} (set TMPDIR to somewhere with space)"
+        echo "==> Copying rootfs.hfs to apply the Pi settings"
+        cp "$rootfs" "$work/rootfs.hfs"
+        rootfs="$work/rootfs.hfs"
+    fi
+    python3 "$here/rootfs-tweaks.py" "$rootfs" || die "rootfs-tweaks.py failed"
+else
+    echo "warning: python3 or rootfs-tweaks.py missing; apps may be killed while launching" >&2
+fi
 need_mb=$(( start_sector / 2048 + rootfs_bytes / 1048576 + 64 ))
 
 # --- Target: a card (block device) or an image file. ----------------------
