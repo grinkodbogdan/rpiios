@@ -1,0 +1,87 @@
+From f5d6d7277010489b383527dab8cdb1ea39118e2b Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 13:15:53 +0000
+Subject: [PATCH] Raspberry Pi 3: drop stale TLB entries after every handled
+ abort
+
+Sixth real-hardware boot (thread dump): launchd's main thread sat in
+dyld's rebase loop on 'str.w r0, [r9], #4' with r9 = 0x81000 (launchd's
+__DATA), counter at its first iteration, no fault reported: the store
+faulted, vm_fault succeeded, the store faulted again, forever.
+
+ARM keeps a translation in the TLB after a permission fault on it; x86
+drops it. This x86-derived pmap does not flush when a page only gains
+permissions (copy-on-write made writable), so the Cortex-A53 retried
+against the stale read-only entry. QEMU re-walks the tables on a
+permission miss and never showed it. pmap_flush_tlbs also issued its
+TLBI without a barrier after the page-table write.
+
+For BOARD_CONFIG_RASPBERRYPI3:
+- sleh_abort: after the handler returns (the faulting instruction is
+  about to be retried), DSB, TLBIALL, BPIALL, DSB, ISB.
+- pmap_flush_tlbs: DSB, then invalidate the whole TLB regardless of
+  which pmap is current (one CPU).
+---
+ xnu/osfmk/arm/pmap.c | 13 +++++++++++++
+ xnu/osfmk/arm/trap.c | 21 +++++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/xnu/osfmk/arm/pmap.c b/xnu/osfmk/arm/pmap.c
+index be1e243..1c62b99 100644
+--- a/xnu/osfmk/arm/pmap.c
++++ b/xnu/osfmk/arm/pmap.c
+@@ -1317,6 +1317,19 @@ pmap_flush_tlbs(pmap_t  pmap, vm_map_offset_t startv, vm_map_offset_t endv)
+     assert((processor_avail_count < 2) ||
+            (ml_get_interrupts_enabled() && get_preemption_level() != 0));
+ 
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    /*
++     * One CPU: invalidate everything, after making the page-table writes
++     * visible to the table walker (the by-ASID path below had no barrier
++     * before the TLBI, and skips pmaps that are not current).
++     */
++    (void)ttb; (void)flush_self; (void)my_cpu; (void)cpu; (void)cpu_bit; (void)pmap_is_shared;
++    __asm__ volatile("dsb sy" ::: "memory");
++    arm_tlb_flushID();
++    __asm__ volatile("mcr p15, 0, %0, c7, c5, 6\n" "dsb sy\n" "isb sy" :: "r"(0) : "memory");
++    return;
++#endif
++
+     if (pmap_asid_ncpus) {
+         pmap_asid_invalidate_all_cpus(pmap);
+         __asm__ volatile("":::"memory");
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index ccecf11..727b21b 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -384,6 +384,27 @@ void rpi3_watchdog_start(void)
+     if (kernel_thread_start(rpi3_watchdog, NULL, &thread) == KERN_SUCCESS)
+         thread_deallocate(thread);
+ }
++
++/*
++ * ARM keeps a translation in the TLB after a permission fault on it (x86
++ * drops it). This pmap, derived from x86's, does not flush the TLB when a
++ * page only gains permissions, e.g. a copy-on-write page made writable.
++ * On the Cortex-A53 the retried store then hits the stale read-only entry
++ * and faults again forever (QEMU re-walks the tables on a permission miss
++ * and hides this). So whenever an abort is handled and the instruction is
++ * about to be retried, drop all cached translations first.
++ */
++static void rpi3_sleh_abort(void *context, int reason);
++void sleh_abort(void *context, int reason)
++{
++    rpi3_sleh_abort(context, reason);
++    __asm__ volatile("dsb sy\n"
++                     "mcr p15, 0, %0, c8, c7, 0\n"   /* TLBIALL */
++                     "mcr p15, 0, %0, c7, c5, 6\n"   /* BPIALL */
++                     "dsb sy\n"
++                     "isb sy\n" :: "r"(0) : "memory");
++}
++#define sleh_abort rpi3_sleh_abort
+ #endif
+ 
+ void sleh_abort(void *context, int reason)
+-- 
+2.43.0
+
