@@ -1,0 +1,181 @@
+From f03822d07cb7883843a19e65423d4d746721f80e Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 15:34:12 +0000
+Subject: [PATCH] Raspberry Pi 3: stack-free copyin/copyout; no app-crash
+ memory dumps
+
+Eighth real-hardware run: pressing buttons quickly ended in a kernel
+prefetch abort. Backtrace: an app's user data abort -> HD2 diagnostics
+ios7leo057_failed_app_data -> leo_appfault057_memory -> copyinmsg, which
+returned (r0 = 0, normal path) with the r4-r9 that .Lcopyin_guts pushed
+still on the stack (sp 24 bytes low; caller frame from sub sp,#0x1c),
+so its final pop loaded the saved r4/r5/r6 as r10/r11/pc. Not
+reproducible in QEMU, including self-tests of the EFAULT recovery and
+the fault-and-retry paths (boot-arg rpi3_copyin_test=1).
+
+For BOARD_CONFIG_RASPBERRYPI3:
+- copyin/copyout use a plain word/byte copy that never touches the
+  stack (r3 stays 0, the fault handlers restore nothing) instead of the
+  unrolled copy with paired conditional pop/return exits.
+- The HD2 app-crash memory dumps (crashed app's stack, dyld info, image
+  list) are skipped: an app crash stays an app crash.
+- rpi3_copyin_test=1: copyin self-tests at the first two execs.
+---
+ xnu/bsd/kern/kern_exec.c   | 39 ++++++++++++++++++++++++++++++++
+ xnu/osfmk/arm/bcopyinout.s | 46 ++++++++++++++++++++++++++++++++++++++
+ xnu/osfmk/arm/trap.c       | 10 +++++++++
+ 3 files changed, 95 insertions(+)
+
+diff --git a/xnu/bsd/kern/kern_exec.c b/xnu/bsd/kern/kern_exec.c
+index 224394a..60539b8 100644
+--- a/xnu/bsd/kern/kern_exec.c
++++ b/xnu/bsd/kern/kern_exec.c
+@@ -1300,12 +1300,51 @@ exec_activate_image(struct image_params *imgp)
+ 	/* Use imgp->ip_strings, which contains the copyin-ed exec path */
+ 	DTRACE_PROC1(exec, uintptr_t, imgp->ip_strings);
+ #if defined(BOARD_CONFIG_RASPBERRYPI3)
++	static int rpi3_copyin_tested;
++	int rpi3_copyin_test_arg = 0;
+ 	/* Boot progress on the Pi's console: every program iOS starts. */
+ 	printf("exec %s\n", imgp->ip_strings);
+ 	{
+ 		extern void rpi3_watchdog_start(void);
+ 		rpi3_watchdog_start();
+ 	}
++	if (PE_parse_boot_argn("rpi3_copyin_test", &rpi3_copyin_test_arg, sizeof(rpi3_copyin_test_arg)) &&
++	    rpi3_copyin_tested == 1) {
++		/* Second exec, in launchd's context: copy from launchd's stack
++		 * pages below its stack pointer (allocated, never touched), so
++		 * each copy takes a fault that vm_fault resolves and is retried. */
++		extern uint32_t rpi3_current_user_sp(void);
++		static uint8_t buf2[640] __attribute__((aligned(8)));
++		uint32_t usp = rpi3_current_user_sp() & ~0xfffU;
++		unsigned n, k;
++		static const unsigned sizes2[] = { 16, 128, 132, 600 };
++		rpi3_copyin_tested = 2;
++		kprintf("copyin retry selftest usp=%x\n", usp);
++		for (n = 1; n <= 24; n++)
++			for (k = 0; k < 4; k++) {
++				user_addr_t src = (user_addr_t)(usp - n * 0x1000U - 0x100U * k);
++				int r = copyin(src, buf2, sizes2[k]);
++				kprintf("copyin retry src=%x size=%u -> %d\n", (unsigned)src, sizes2[k], r);
++			}
++		kprintf("copyin retry selftest done\n");
++	}
++	if (PE_parse_boot_argn("rpi3_copyin_test", &rpi3_copyin_test_arg, sizeof(rpi3_copyin_test_arg)) &&
++	    !rpi3_copyin_tested) {
++		/* Self-test: copyin from unmapped user addresses must fail
++		 * with EFAULT and leave the stack balanced. */
++		static uint8_t buf[640] __attribute__((aligned(8)));
++		static const unsigned sizes[] = { 4, 8, 12, 16, 24, 40, 64, 100, 128, 132, 200, 300, 600 };
++		unsigned i, a;
++		rpi3_copyin_tested = 1;
++		for (a = 0; a < 3; a++) {
++			user_addr_t src = (user_addr_t)(0x10 + a);
++			for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
++				int r = copyin(src, buf + (a == 2 ? 4 : 0), sizes[i]);
++				kprintf("copyin selftest src=%x size=%u -> %d\n", (unsigned)src, sizes[i], r);
++			}
++		}
++		kprintf("copyin selftest done\n");
++	}
+ #endif
+ 
+ 	NDINIT(&nd, LOOKUP, OP_LOOKUP, FOLLOW | LOCKLEAF | AUDITVNPATH1,
+diff --git a/xnu/osfmk/arm/bcopyinout.s b/xnu/osfmk/arm/bcopyinout.s
+index 5fe1df3..704c047 100644
+--- a/xnu/osfmk/arm/bcopyinout.s
++++ b/xnu/osfmk/arm/bcopyinout.s
+@@ -81,6 +81,32 @@ EnterARM(copyinmsg)
+ 	ldmfd	sp!, {r10-r11, pc}
+ 
+ .Lcopyin_guts:
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++	/*
++	 * Raspberry Pi 3: a plain copy that never touches the stack (r3 stays
++	 * 0, so .Lcopyin_fault restores nothing). The unrolled version below
++	 * pushes r4-r9 and leaves through paired conditional pop/return
++	 * instructions; on the Pi it was seen returning with them still
++	 * pushed, which sends copyin's caller to a garbage address.
++	 */
++	orr	ip, r0, r1
++	tst	ip, #3
++	bne	.Lcopyin_pi_bytes
++.Lcopyin_pi_words:
++	cmp	r2, #4
++	blt	.Lcopyin_pi_bytes
++	ldrt	ip, [r0], #4
++	str	ip, [r1], #4
++	sub	r2, r2, #4
++	b	.Lcopyin_pi_words
++.Lcopyin_pi_bytes:
++	cmp	r2, #0
++	moveq	pc, lr
++	ldrbt	ip, [r0], #1
++	strb	ip, [r1], #1
++	sub	r2, r2, #1
++	b	.Lcopyin_pi_bytes
++#endif
+ 	pld	[r0]
+ 	/* Word-align the destination buffer */
+ 	ands	ip, r1, #0x03		/* Already word aligned? */
+@@ -501,6 +527,26 @@ EnterARM(copyoutmsg)
+ 	ldmfd	sp!, {r10-r11, pc}
+ 
+ .Lcopyout_guts:
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++	/* Plain copy without stack use, as for copyin above. */
++	orr	ip, r0, r1
++	tst	ip, #3
++	bne	.Lcopyout_pi_bytes
++.Lcopyout_pi_words:
++	cmp	r2, #4
++	blt	.Lcopyout_pi_bytes
++	ldr	ip, [r0], #4
++	strt	ip, [r1], #4
++	sub	r2, r2, #4
++	b	.Lcopyout_pi_words
++.Lcopyout_pi_bytes:
++	cmp	r2, #0
++	moveq	pc, lr
++	ldrb	ip, [r0], #1
++	strbt	ip, [r1], #1
++	sub	r2, r2, #1
++	b	.Lcopyout_pi_bytes
++#endif
+ 	pld	[r0]
+ 	/* Word-align the destination buffer */
+ 	ands	ip, r1, #0x03		/* Already word aligned? */
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index d668a89..84c640f 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -375,6 +375,11 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+     }
+ }
+ 
++uint32_t rpi3_current_user_sp(void)
++{
++    return current_thread()->machine.user_regs.sp;
++}
++
+ void rpi3_watchdog_start(void)
+ {
+     static int started;
+@@ -900,8 +905,13 @@ void sleh_abort(void *context, int reason)
+              * repairs delivery metadata, not the initial data access. */
+             ios7leo037_failed_data_witness(thread,&leo037_data_snapshot,
+                 leo037_data_error,leo037_data_bad_address);
++#if !defined(BOARD_CONFIG_RASPBERRYPI3)
++            /* HD2 debug logging: copies the crashed app's stack, dyld
++             * info and image list. Not on the Pi: an app crash there must
++             * stay an app crash. */
+             ios7leo057_failed_app_data(thread,&leo037_data_snapshot,
+                 leo037_data_error,leo037_data_bad_address);
++#endif
+             ios7leo037_publish_exception_state(thread,arm_ctx,
+                 SLEH_ABORT_TYPE_DATA_ABORT,
+                 leo037_data_snapshot.entry.fsr,leo037_data_bad_address);
+-- 
+2.43.0
+
