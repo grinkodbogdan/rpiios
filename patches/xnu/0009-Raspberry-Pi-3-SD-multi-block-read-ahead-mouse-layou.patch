@@ -1,0 +1,466 @@
+From e9baa2f730d3f274ce3eacec3c34e187490dd647 Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 12:47:24 +0000
+Subject: [PATCH] Raspberry Pi 3: SD multi-block read-ahead; mouse layout from
+ HID report descriptor
+
+Fourth real-hardware boot (watchdog): not hung but slow. The SD driver
+was busy ~98% of the time at about 0.85 MB/s, one CMD17 per 512-byte
+sector, while dyld reads the ~300 MB shared cache. And the mouse
+ignored SET_PROTOCOL(boot): its reports carry 16-bit X/Y in bytes 4-7,
+so reading boot-layout bytes 1-2 never moved the cursor.
+
+- rpi3_sd: on a miss, read a run of sectors with one CMD18 (auto CMD12)
+  into a 128 KB buffer; the run doubles from 16 to 256 sectors while
+  reads stay sequential. Writes invalidate it; after three CMD18
+  failures fall back to single blocks for good.
+- rpi3_usb: fetch the mouse interface's HID report descriptor and find
+  buttons, X and Y (offset, size, report id, relative/absolute); keep
+  report protocol. Boot protocol only if the descriptor cannot be used.
+- rpi3_touch: 16-bit deltas scaled to 0.25 px per count; absolute
+  pointers mapped onto the screen.
+---
+ .../ARM/AppleARMPlatform/rpi3_sd.c            |  96 ++++++++++++-
+ .../ARM/AppleARMPlatform/rpi3_touch.cpp       |  28 +++-
+ .../ARM/AppleARMPlatform/rpi3_usb.c           | 131 +++++++++++++++++-
+ .../ARM/AppleARMPlatform/rpi3_usb.h           |  17 ++-
+ xnu/osfmk/arm/trap.c                          |   7 +-
+ 5 files changed, 260 insertions(+), 19 deletions(-)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c
+index 2d38030..1b411ef 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c
+@@ -33,7 +33,9 @@
+ 
+ /* CMDTM: transfer mode (low half) and command (high half). */
+ #define TM_BLKCNT_EN    (1U << 1)
++#define TM_AUTO_CMD12   (1U << 2)
+ #define TM_DAT_READ     (1U << 4)
++#define TM_MULTI_BLOCK  (1U << 5)
+ #define CMD_RSP_NONE    (0U << 16)
+ #define CMD_RSP_136     (1U << 16)
+ #define CMD_RSP_48      (2U << 16)
+@@ -322,19 +324,106 @@ static uint32_t card_address(struct rpi3_sd_card *c, uint64_t sector)
+ }
+ 
+ /* Read statistics for the boot watchdog. */
+-uint32_t rpi3_sd_stat_reads, rpi3_sd_stat_errors;
++uint32_t rpi3_sd_stat_reads, rpi3_sd_stat_errors, rpi3_sd_stat_commands, rpi3_sd_stat_multi_failures;
+ uint64_t rpi3_sd_stat_us;
++/* First CMD18 failure: result, block reached, INTERRUPT, STATUS. */
++int32_t rpi3_sd_stat_fail_result;
++uint32_t rpi3_sd_stat_fail_block, rpi3_sd_stat_fail_irq, rpi3_sd_stat_fail_status;
++
++/*
++ * Read-ahead. Everything above this driver (IOStorage, the HFS image file,
++ * the copy-on-write layer) asks for one 512-byte sector at a time, and one
++ * SD command per sector costs the card's access latency every time: about
++ * 0.85 MB/s on a real Pi 3B+. On a miss, read a run of sectors with one
++ * CMD18 (multi-block, auto CMD12) and serve the following requests from
++ * it. The run (4 sectors at first) doubles while reads stay sequential (the ~300 MB shared cache
++ * is read front to back) and drops back on a random read. Writes (only the
++ * boot log) invalidate it.
++ */
++#define RA_MIN      4U
++#define RA_MAX      256U
++static uint8_t ra_buffer[RA_MAX * 512];
++static uint64_t ra_start;
++static uint32_t ra_count, ra_window = RA_MIN;
++static int ra_disabled;
+ 
+ static int read_sector(struct rpi3_sd_card *c, uint64_t sector, uint8_t data[512]);
++static int read_run(struct rpi3_sd_card *c, uint64_t sector, uint32_t count);
++
+ int rpi3_sd_read_sector(struct rpi3_sd_card *c, uint64_t sector, uint8_t data[512])
+ {
+-    uint64_t start = now_us(c);
+-    int r = read_sector(c, sector, data);
++    uint64_t start;
++    unsigned i;
++    int r;
++    if (ra_count && sector >= ra_start && sector - ra_start < ra_count) {
++        const uint8_t *src = ra_buffer + (uint32_t)(sector - ra_start) * 512U;
++        for (i = 0; i < 512; i++) data[i] = src[i];
++        rpi3_sd_stat_reads++;
++        return LEO_SD_OK;
++    }
++    start = now_us(c);
++    r = LEO_SD_ARGUMENT;
++    if (!ra_disabled && !c->faulted && sector < c->sectors) {
++        uint32_t count;
++        ra_window = (ra_count && sector == ra_start + ra_count) ?
++                    (ra_window * 2 > RA_MAX ? RA_MAX : ra_window * 2) : RA_MIN;
++        count = ra_window;
++        if (c->sectors - sector < count) count = (uint32_t)(c->sectors - sector);
++        ra_count = 0;
++        r = read_run(c, sector, count);
++        if (r != LEO_SD_OK && !rpi3_sd_stat_multi_failures) {
++            rpi3_sd_stat_fail_result = r; rpi3_sd_stat_fail_irq = c->interrupt;
++            rpi3_sd_stat_fail_status = rd(c, STATUS);
++        }
++        if (r == LEO_SD_OK) {
++            ra_start = sector; ra_count = count;
++            for (i = 0; i < 512; i++) data[i] = ra_buffer[i];
++        } else if (++rpi3_sd_stat_multi_failures >= 3) {
++            ra_disabled = 1;   /* card or controller dislikes CMD18: single blocks only */
++        }
++    }
++    if (r != LEO_SD_OK) r = read_sector(c, sector, data);
+     rpi3_sd_stat_us += now_us(c) - start;
+     if (r) rpi3_sd_stat_errors++; else rpi3_sd_stat_reads++;
+     return r;
+ }
+ 
++/* CMD18 for 'count' sectors into ra_buffer, PIO, auto CMD12 at the end. */
++static int read_run(struct rpi3_sd_card *c, uint64_t sector, uint32_t count)
++{
++    uint32_t block, i;
++    int r;
++    rpi3_sd_stat_commands++;
++    wr(c, BLKSIZECNT, (count << 16) | 512U);
++    r = command(c, 18, card_address(c, sector),
++                CMD_RSP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA | TM_DAT_READ |
++                TM_BLKCNT_EN | TM_MULTI_BLOCK | TM_AUTO_CMD12);
++    if (r) return r;
++    for (block = 0; block < count; block++) {
++        uint8_t *out = ra_buffer + block * 512U;
++        rpi3_sd_stat_fail_block = block;
++        uint64_t start = now_us(c);
++        for (;;) {
++            uint32_t irq = rd(c, INTERRUPT);
++            if (irq & INT_ERROR_MASK) { c->interrupt = irq; wr(c, INTERRUPT, irq);
++                                        reset_lines(c, C1_SRST_CMD | C1_SRST_DATA); return LEO_SD_DATA; }
++            if (irq & INT_READ_RDY) { wr(c, INTERRUPT, INT_READ_RDY); break; }
++            if (now_us(c) - start > c->io.timeout_us) {
++                c->interrupt = irq; reset_lines(c, C1_SRST_CMD | C1_SRST_DATA); return LEO_SD_TIMEOUT;
++            }
++        }
++        for (i = 0; i < 512; i += 4) {
++            uint32_t w = rd(c, DATA);
++            out[i] = (uint8_t)w; out[i + 1] = (uint8_t)(w >> 8);
++            out[i + 2] = (uint8_t)(w >> 16); out[i + 3] = (uint8_t)(w >> 24);
++        }
++    }
++    rpi3_sd_stat_fail_block = count;
++    r = wait_data_done(c);
++    if (r) reset_lines(c, C1_SRST_CMD | C1_SRST_DATA);
++    return r;
++}
++
+ static int read_sector(struct rpi3_sd_card *c, uint64_t sector, uint8_t data[512])
+ {
+     int r;
+@@ -365,6 +454,7 @@ static int read_sector(struct rpi3_sd_card *c, uint64_t sector, uint8_t data[512
+ 
+ int rpi3_sd_write_sector(struct rpi3_sd_card *c, uint64_t sector, const uint8_t data[512])
+ {
++    ra_count = 0;   /* never serve stale read-ahead data */
+     int r;
+     unsigned i;
+     c->write_attempts++;
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
+index 4ff8438..1a059bc 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
+@@ -22,8 +22,10 @@ extern task_t kernel_task;
+ 
+ #define SCREEN_W 480
+ #define SCREEN_H 800
+-/* Mouse counts per screen pixel, as 8.8 fixed point: 1.0. */
+-#define SPEED_FIXED 256
++/* Screen pixels per mouse count, as 8.8 fixed point: 1.0 for 8-bit (boot
++ * style) mice, 0.25 for mice reporting 16-bit deltas (high resolution). */
++#define SPEED_FIXED_8BIT  256
++#define SPEED_FIXED_WIDE  64
+ 
+ static struct rpi3_usb usb;
+ static IOMemoryDescriptor *regsDescriptor;
+@@ -48,6 +50,10 @@ extern "C" void rpi3_mouse_debug_print(void)
+           usb.mouse.speed, usb.mouse.split, dbgReports, dbgMoves, usb.naks, usb.errors,
+           dbgLast[0], dbgLast[1], dbgLast[2], dbgLast[3], dbgLast[4], dbgLast[5], dbgLast[6], dbgLast[7],
+           (int)(cursorX >> 8), (int)(cursorY >> 8));
++    IOLog(" mouse layout: %s id=%u btn@%u/%u x@%u/%u y@%u/%u %s\n",
++          usb.layout.boot ? "boot" : "descriptor", usb.layout.report_id,
++          usb.layout.btn_bit, usb.layout.btn_count, usb.layout.x_bit, usb.layout.x_size,
++          usb.layout.y_bit, usb.layout.y_size, usb.layout.absolute ? "absolute" : "relative");
+ }
+ 
+ static uint64_t usbNowNs(void *)
+@@ -109,7 +115,7 @@ extern "C" int leo_touch_transport_init(LeoTouchState *s, const LeoTouchIO *io)
+ extern "C" int leo_touch_transport_poll(LeoTouchState *s, LeoTouchReport *report)
+ {
+     uint8_t buttons = 0;
+-    int8_t dx = 0, dy = 0;
++    int32_t dx = 0, dy = 0;
+     int r;
+     if (!s || !report) return LEO_TOUCH_ARGUMENT;
+     if (!s->ready) return LEO_TOUCH_NOT_READY;
+@@ -143,8 +149,20 @@ extern "C" int leo_touch_transport_poll(LeoTouchState *s, LeoTouchReport *report
+               dbgLast[0], dbgLast[1], dbgLast[2], dbgLast[3], dbgLast[4], dbgLast[5], dbgLast[6], dbgLast[7]);
+     }
+ 
+-    cursorX += dx * SPEED_FIXED;
+-    cursorY += dy * SPEED_FIXED;
++    if (usb.layout.absolute) {
++        /* Tablet-style pointer: scale its range onto the screen. */
++        int32_t xr = usb.layout.x_max - usb.layout.x_min, yr = usb.layout.y_max - usb.layout.y_min;
++        int32_t nx = xr > 0 ? (int32_t)(((int64_t)(dx - usb.layout.x_min) * (SCREEN_W - 1) * 256) / xr) : cursorX;
++        int32_t ny = yr > 0 ? (int32_t)(((int64_t)(dy - usb.layout.y_min) * (SCREEN_H - 1) * 256) / yr) : cursorY;
++        dx = (nx != cursorX); dy = (ny != cursorY);   /* "moved" flags for below */
++        cursorX = nx; cursorY = ny;
++    } else {
++        int32_t speed = usb.layout.x_size > 8 ? SPEED_FIXED_WIDE : SPEED_FIXED_8BIT;
++        if (dx > 4096) dx = 4096; if (dx < -4096) dx = -4096;
++        if (dy > 4096) dy = 4096; if (dy < -4096) dy = -4096;
++        cursorX += dx * speed;
++        cursorY += dy * speed;
++    }
+     if (cursorX < 0) cursorX = 0;
+     if (cursorY < 0) cursorY = 0;
+     if (cursorX > (SCREEN_W - 1) * 256) cursorX = (SCREEN_W - 1) * 256;
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
+index 8a989db..195b1c6 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c
+@@ -284,6 +284,95 @@ static int get_descriptor(struct rpi3_usb *u, const struct rpi3_usb_endpoint *ep
+     return got ? RPI3_USB_OK : RPI3_USB_ERROR;
+ }
+ 
++/* ---- HID report descriptor ------------------------------------------- */
++
++/* Find buttons, X and Y in input report 'want_id' (-1: whichever report
++ * declares X first). */
++static void parse_pass(const uint8_t *d, uint32_t len, int want_id, struct rpi3_hid_layout *out)
++{
++    uint32_t at = 0, page = 0, size = 0, count = 0, id = 0, usages[16], nusages = 0;
++    uint32_t umin = 0, umax = 0, have_range = 0, bit[256];
++    int32_t lmin = 0, lmax = 0;
++    struct rpi3_hid_layout l = {0};
++    unsigned i;
++    for (i = 0; i < 256; i++) bit[i] = 0;
++    while (at < len) {
++        uint8_t prefix = d[at++];
++        uint32_t n = prefix & 3, v = 0, tag = prefix & 0xfc;
++        int32_t sv;
++        if (prefix == 0xfe) {                       /* long item: skip */
++            if (at + 1 >= len) break;
++            at += 2 + d[at];
++            continue;
++        }
++        if (n == 3) n = 4;
++        if (at + n > len) break;
++        for (i = 0; i < n; i++) v |= (uint32_t)d[at + i] << (8 * i);
++        at += n;
++        sv = (n == 1) ? (int8_t)v : (n == 2) ? (int16_t)v : (int32_t)v;
++        switch (tag) {
++        case 0x04: page = v; break;                 /* usage page */
++        case 0x14: lmin = sv; break;                /* logical minimum */
++        case 0x24: lmax = (n && lmin >= 0) ? (int32_t)v : sv; break;
++        case 0x74: size = v; break;                 /* report size */
++        case 0x84: id = v & 0xff; break;            /* report id */
++        case 0x94: count = v; break;                /* report count */
++        case 0x08: if (nusages < 16) usages[nusages++] = (n == 4) ? v : (page << 16) | v; break;
++        case 0x18: umin = (n == 4) ? v : (page << 16) | v; have_range |= 1; break;
++        case 0x28: umax = (n == 4) ? v : (page << 16) | v; have_range |= 2; break;
++        case 0x80: {                                /* input */
++            uint32_t k;
++            for (k = 0; k < count; k++) {
++                uint32_t usage = 0, pos = bit[id] + k * size;
++                if (!(v & 1) && (want_id < 0 || (uint32_t)want_id == id)) {   /* data, not constant */
++                    if (k < nusages) usage = usages[k];
++                    else if (nusages) usage = usages[nusages - 1];
++                    else if (have_range == 3) usage = umin + k <= umax ? umin + k : umax;
++                    if ((usage >> 16) == 9 && !l.btn_count && want_id >= 0) {
++                        l.btn_bit = (uint16_t)pos; l.btn_count = (uint8_t)(count - k > 8 ? 8 : count - k);
++                    } else if (usage == 0x10030 && !l.x_size && size <= 32) {
++                        l.x_bit = (uint16_t)pos; l.x_size = (uint8_t)size;
++                        l.x_min = lmin; l.x_max = lmax; l.absolute = !(v & 4);
++                        l.report_id = (uint8_t)id; l.valid = 1;
++                    } else if (usage == 0x10031 && !l.y_size && size <= 32 && want_id >= 0) {
++                        l.y_bit = (uint16_t)pos; l.y_size = (uint8_t)size;
++                        l.y_min = lmin; l.y_max = lmax;
++                    }
++                }
++            }
++            bit[id] += size * count;
++        }   /* fall through: main items clear the local state */
++        case 0x90: case 0xb0: case 0xa0: case 0xc0:
++            nusages = 0; have_range = 0;
++            break;
++        default: break;
++        }
++    }
++    l.valid = l.valid && l.x_size && l.y_size;
++    *out = l;
++}
++
++static void parse_report_descriptor(const uint8_t *d, uint32_t len, struct rpi3_hid_layout *out)
++{
++    struct rpi3_hid_layout first;
++    parse_pass(d, len, -1, &first);                 /* which report carries X */
++    if (!first.x_size) { out->valid = 0; return; }
++    parse_pass(d, len, first.report_id, out);       /* buttons, X, Y of that report */
++}
++
++/* Signed or unsigned field of 'size' bits at bit offset 'pos'. */
++static int32_t report_field(const volatile uint8_t *r, uint32_t len, uint32_t pos, uint32_t size, int is_signed)
++{
++    uint32_t v = 0, i;
++    for (i = 0; i < size; i++) {
++        uint32_t b = pos + i;
++        if (b / 8 >= len) break;
++        v |= (uint32_t)((r[b / 8] >> (b % 8)) & 1) << i;
++    }
++    if (is_signed && size < 32 && (v >> (size - 1)) & 1) v |= ~0U << size;
++    return (int32_t)v;
++}
++
+ /* ---- Enumeration ------------------------------------------------------ */
+ 
+ static int enumerate(struct rpi3_usb *u, uint8_t speed, uint8_t split, uint8_t tt_hub,
+@@ -345,7 +434,7 @@ static int enumerate(struct rpi3_usb *u, uint8_t speed, uint8_t split, uint8_t t
+     uint8_t address, config_value, dev_class;
+     int r, is_hub = 0, mouse_here = 0;
+     struct rpi3_usb_endpoint mouse = {0};
+-    uint32_t mouse_iface = 0;
++    uint32_t mouse_iface = 0, mouse_report_len = 0;
+ 
+     if (depth > 4 || u->next_address > 32) return RPI3_USB_ERROR;
+     ep0.speed = speed;
+@@ -378,6 +467,9 @@ static int enumerate(struct rpi3_usb *u, uint8_t speed, uint8_t split, uint8_t t
+                 iface_num = d[at + 2]; iface_class = d[at + 5];
+                 iface_sub = d[at + 6]; iface_proto = d[at + 7];
+                 if (iface_class == 9) is_hub = 1;
++            } else if (d[at + 1] == 0x21 && at + 9 <= total && !mouse_here &&
++                       iface_class == 3 && iface_sub == 1 && iface_proto == 2 && d[at + 6] == 0x22) {
++                mouse_report_len = d[at + 7] | ((uint32_t)d[at + 8] << 8);  /* HID descriptor */
+             } else if (d[at + 1] == 5 && at + 7 <= total) {
+                 if (!mouse_here && iface_class == 3 && iface_sub == 1 && iface_proto == 2 &&
+                     (d[at + 2] & 0x80) && (d[at + 3] & 3) == 3) {
+@@ -400,7 +492,26 @@ static int enumerate(struct rpi3_usb *u, uint8_t speed, uint8_t split, uint8_t t
+         return hub_ports(u, &ep0, depth);
+     }
+     if (mouse_here && !u->mouse_found) {
+-        (void)control(u, &ep0, 0x21, 0x0b, 0, (uint16_t)mouse_iface, 0, 0);  /* SET_PROTOCOL boot */
++        /* Report protocol with the layout from the report descriptor: many
++         * mice ignore SET_PROTOCOL(boot). Boot protocol only as a fallback. */
++        struct rpi3_hid_layout l = {0};
++        if (mouse_report_len) {
++            uint32_t n = mouse_report_len > DATA_MAX ? DATA_MAX : mouse_report_len;
++            for (at = 0; at < DATA_MAX; at++) d[at] = 0;
++            if (get_descriptor(u, &ep0, 0x81, 0x2200, (uint16_t)mouse_iface, (uint16_t)n, d) == RPI3_USB_OK)
++                parse_report_descriptor(d, n, &l);
++        }
++        if (l.valid) {
++            (void)control(u, &ep0, 0x21, 0x0b, 1, (uint16_t)mouse_iface, 0, 0);  /* SET_PROTOCOL report */
++        } else {
++            (void)control(u, &ep0, 0x21, 0x0b, 0, (uint16_t)mouse_iface, 0, 0);  /* SET_PROTOCOL boot */
++            l.valid = 1; l.boot = 1; l.btn_bit = 0; l.btn_count = 8;
++            l.x_bit = 8; l.x_size = 8; l.y_bit = 16; l.y_size = 8;
++        }
++        printf("Rpi3 USB: mouse report %s id=%u btn@%u/%u x@%u/%u y@%u/%u %s\n",
++               l.boot ? "boot" : "descriptor", l.report_id, l.btn_bit, l.btn_count,
++               l.x_bit, l.x_size, l.y_bit, l.y_size, l.absolute ? "absolute" : "relative");
++        u->layout = l;
+         (void)control(u, &ep0, 0x21, 0x0a, 0, (uint16_t)mouse_iface, 0, 0);  /* SET_IDLE 0 */
+         u->mouse = mouse;
+         u->mouse_interface = mouse_iface;
+@@ -470,8 +581,10 @@ int rpi3_usb_init(struct rpi3_usb *u, const struct rpi3_usb_io *io)
+     return u->mouse_found ? RPI3_USB_OK : RPI3_USB_NO_MOUSE;
+ }
+ 
+-int rpi3_usb_mouse_poll(struct rpi3_usb *u, uint8_t *buttons, int8_t *dx, int8_t *dy)
++int rpi3_usb_mouse_poll(struct rpi3_usb *u, uint8_t *buttons, int32_t *x, int32_t *y)
+ {
++    const struct rpi3_hid_layout *l = &u->layout;
++    const volatile uint8_t *rep = u->io.dma + DMA_REPORT;
+     uint32_t pid, got = 0;
+     int r;
+     if (!u->mouse_found) return RPI3_USB_NO_MOUSE;
+@@ -480,10 +593,14 @@ int rpi3_usb_mouse_poll(struct rpi3_usb *u, uint8_t *buttons, int8_t *dx, int8_t
+     u->last_result = r;
+     if (r != RPI3_USB_OK) return r;
+     u->mouse.toggle = (uint8_t)pid;
+-    if (got < 3) return RPI3_USB_NAK;
+-    *buttons = u->io.dma[DMA_REPORT];
+-    *dx = (int8_t)u->io.dma[DMA_REPORT + 1];
+-    *dy = (int8_t)u->io.dma[DMA_REPORT + 2];
++    if (got < 1) return RPI3_USB_NAK;
++    if (l->report_id) {                 /* other reports (keys, wheel...) are not ours */
++        if (rep[0] != l->report_id) return RPI3_USB_NAK;
++        rep++; got--;
++    }
++    *buttons = (uint8_t)report_field(rep, got, l->btn_bit, l->btn_count, 0);
++    *x = report_field(rep, got, l->x_bit, l->x_size, !l->absolute);
++    *y = report_field(rep, got, l->y_bit, l->y_size, !l->absolute);
+     u->reports++;
+     return RPI3_USB_OK;
+ }
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.h b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.h
+index ee101e1..e872097 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.h
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.h
+@@ -33,20 +33,31 @@ struct rpi3_usb_endpoint {
+     uint8_t split, tt_hub, tt_port;   /* transaction translator, if split */
+ };
+ 
++/* Where buttons and X/Y sit in the mouse's input report, from its HID
++ * report descriptor (report protocol), or the boot layout as a fallback. */
++struct rpi3_hid_layout {
++    uint8_t valid, report_id, absolute, boot;
++    uint16_t btn_bit, x_bit, y_bit;
++    uint8_t btn_count, x_size, y_size;
++    int32_t x_min, x_max, y_min, y_max;
++};
++
+ struct rpi3_usb {
+     struct rpi3_usb_io io;
+     uint8_t next_address, root_speed;
+     int mouse_found;
+     struct rpi3_usb_endpoint mouse;
+     uint32_t mouse_interface;
++    struct rpi3_hid_layout layout;
+     uint32_t devices, hubs, errors, naks, reports;
+     int32_t last_result;
+ };
+ 
+ int rpi3_usb_init(struct rpi3_usb *, const struct rpi3_usb_io *);
+-/* RPI3_USB_OK with a report (buttons, dx, dy), RPI3_USB_NAK when the mouse
+- * had nothing new, negative on errors. */
+-int rpi3_usb_mouse_poll(struct rpi3_usb *, uint8_t *buttons, int8_t *dx, int8_t *dy);
++/* RPI3_USB_OK with a report (buttons, x, y: deltas, or positions when
++ * layout.absolute), RPI3_USB_NAK when the mouse had nothing new, negative
++ * on errors. */
++int rpi3_usb_mouse_poll(struct rpi3_usb *, uint8_t *buttons, int32_t *x, int32_t *y);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index 7021396..2abd8fe 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -307,7 +307,9 @@ static boolean_t rpi3_unfixable_user_abort(thread_t thread, uint32_t fsr, uint32
+  * number on swi). Plus the USB mouse's raw reports. Stops after 10 minutes.
+  */
+ extern void rpi3_mouse_debug_print(void);
+-extern uint32_t rpi3_sd_stat_reads, rpi3_sd_stat_errors;
++extern uint32_t rpi3_sd_stat_reads, rpi3_sd_stat_errors, rpi3_sd_stat_commands, rpi3_sd_stat_multi_failures;
++extern int32_t rpi3_sd_stat_fail_result;
++extern uint32_t rpi3_sd_stat_fail_block, rpi3_sd_stat_fail_irq, rpi3_sd_stat_fail_status;
+ extern uint64_t rpi3_sd_stat_us;
+ static int rpi3_watchdog_event;
+ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+@@ -319,6 +321,9 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+         thread_block(THREAD_CONTINUE_NULL);
+         printf("WD %u: sd reads=%u (%u KB) errors=%u busy=%u ms\n", round, rpi3_sd_stat_reads,
+                rpi3_sd_stat_reads / 2, rpi3_sd_stat_errors, (uint32_t) (rpi3_sd_stat_us / 1000));
++        printf(" sd cmd18=%u fail=%u (r=%d blk=%u irq=%08x st=%08x)\n", rpi3_sd_stat_commands,
++               rpi3_sd_stat_multi_failures, rpi3_sd_stat_fail_result, rpi3_sd_stat_fail_block,
++               rpi3_sd_stat_fail_irq, rpi3_sd_stat_fail_status);
+         lck_mtx_lock(&tasks_threads_lock);
+         queue_iterate(&tasks, task, task_t, tasks) {
+             thread_t th;
+-- 
+2.43.0
+
