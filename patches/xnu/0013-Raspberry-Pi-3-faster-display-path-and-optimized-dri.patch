@@ -1,0 +1,135 @@
+From d6c44a4680c727cc72f54e5ab5ad748cb9a7e307 Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 14:06:01 +0000
+Subject: [PATCH] Raspberry Pi 3: faster display path and optimized drivers
+
+Real hardware reaches SpringBoard and responds to touch, but slowly:
+every frame (480x800) was converted pixel by pixel through an index
+table in -O0 code and stored one halfword at a time into
+strongly-ordered memory.
+
+- The framebuffer mapping becomes Normal non-cacheable (TEX=001, C=B=0)
+  so the write buffer merges stores; presents still end with a DSB.
+- Full-size frames convert two pixels per 32-bit store without the
+  index table (BGRA and RGBA).
+- pe_rpi3.c, rpi3_sd.c and rpi3_usb.c are built with -O2 through
+  per-file CFLAGS (the rest of the ARM kernel stays -O0, as for the HD2).
+---
+ xnu/iokit/conf/Makefile.arm   |  7 +++++
+ xnu/pexpert/arm/pe_rpi3.c     | 50 ++++++++++++++++++++++++++++++++++-
+ xnu/pexpert/conf/Makefile.arm | 12 +++++++++
+ 3 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/xnu/iokit/conf/Makefile.arm b/xnu/iokit/conf/Makefile.arm
+index 8d99acd..0d81cfb 100644
+--- a/xnu/iokit/conf/Makefile.arm
++++ b/xnu/iokit/conf/Makefile.arm
+@@ -2,6 +2,13 @@
+ #BEGIN  Machine dependent Makefile fragment for arm
+ ######################################################################
+ 
++######################################################################
++# Raspberry Pi 3: SD and USB drivers run polled loops; build them optimized.
++rpi3_sd.o_CFLAGS_RM = -O0
++rpi3_sd.o_CFLAGS_ADD = -O2
++rpi3_usb.o_CFLAGS_RM = -O0
++rpi3_usb.o_CFLAGS_ADD = -O2
++
+ ######################################################################
+ #END    Machine dependent Makefile fragment for arm
+ ######################################################################
+diff --git a/xnu/pexpert/arm/pe_rpi3.c b/xnu/pexpert/arm/pe_rpi3.c
+index 15d7811..b4a13df 100644
+--- a/xnu/pexpert/arm/pe_rpi3.c
++++ b/xnu/pexpert/arm/pe_rpi3.c
+@@ -371,6 +371,30 @@ static void scale_tables_init(void)
+     }
+ }
+ 
++/*
++ * Full-size (480-pixel) rows: two pixels per 32-bit store, no index table.
++ * The source rows are word aligned (surface rows are multiples of 4 bytes).
++ */
++static void copy_row_full(volatile uint32_t *out, const uint32_t *in, uint32_t format)
++{
++    unsigned int x;
++    if (format == 0x42475241U) {                /* 'BGRA': R in bits 16-23 */
++        for (x = 0; x < RPI3_FB_WIDTH; x += 2) {
++            uint32_t a = in[x], b = in[x + 1];
++            uint32_t pa = ((a >> 8) & 0xf800U) | ((a >> 5) & 0x07e0U) | ((a >> 3) & 0x001fU);
++            uint32_t pb = ((b >> 8) & 0xf800U) | ((b >> 5) & 0x07e0U) | ((b >> 3) & 0x001fU);
++            out[x / 2] = pa | (pb << 16);
++        }
++    } else {                                    /* 'RGBA': R in bits 0-7 */
++        for (x = 0; x < RPI3_FB_WIDTH; x += 2) {
++            uint32_t a = in[x], b = in[x + 1];
++            uint32_t pa = ((a << 8) & 0xf800U) | ((a >> 5) & 0x07e0U) | ((a >> 19) & 0x001fU);
++            uint32_t pb = ((b << 8) & 0xf800U) | ((b >> 5) & 0x07e0U) | ((b >> 19) & 0x001fU);
++            out[x / 2] = pa | (pb << 16);
++        }
++    }
++}
++
+ static void copy_row(volatile uint16_t *out, const uint8_t *pixels, uint32_t format,
+                      const uint16_t *src_x)
+ {
+@@ -470,7 +494,11 @@ int ios7leo_display_present(const uint8_t *pixels, uint32_t bytes, uint32_t row,
+          * interleaving with a half-written row, as on the HD2. */
+         boolean_t enabled = ml_set_interrupts_enabled(FALSE);
+         if (rpi_fatal_active) { presenting = 0; ml_set_interrupts_enabled(enabled); return obs_failed(4); }
+-        copy_row(rpi_pixels + y * RPI3_FB_WIDTH, pixels + (uint32_t)src_y[y] * row, format, src_x);
++        if (src_x == src_x_full && !(row & 3U) && !((uintptr_t)pixels & 3U))
++            copy_row_full((volatile uint32_t *)(rpi_pixels + y * RPI3_FB_WIDTH),
++                          (const uint32_t *)(pixels + (uint32_t)src_y[y] * row), format);
++        else
++            copy_row(rpi_pixels + y * RPI3_FB_WIDTH, pixels + (uint32_t)src_y[y] * row, format, src_x);
+         ++obs_rows; ++obs_last_rows;
+         ml_set_interrupts_enabled(enabled);
+     }
+@@ -599,6 +627,26 @@ void PE_init_SocSupport_stub(void)
+ 
+     fb = ml_io_map(rpi_fb_physical, RPI3_FB_BYTES);
+     if (!fb) ios7leo_final_boundary(5);
++    {
++        /*
++         * ml_io_map gives strongly-ordered memory: every framebuffer store
++         * goes to RAM on its own. The display only needs the writes to
++         * land eventually (presents end with a DSB), so make it Normal
++         * non-cacheable (TEX=001, C=0, B=0) and let the write buffer merge
++         * stores. Page-mapped by pmap_map_bd, so the PTEs are small pages.
++         */
++        extern vm_offset_t pmap_pte(pmap_t, vm_offset_t);
++        extern pmap_t kernel_pmap;
++        vm_offset_t va;
++        for (va = fb; va < fb + RPI3_FB_BYTES; va += PAGE_SIZE) {
++            volatile uint32_t *pte = (volatile uint32_t *)pmap_pte(kernel_pmap, va);
++            if (pte && (*pte & 2U)) *pte = (*pte & ~0x1ccU) | 0x40U;
++        }
++        __asm__ volatile("dsb sy\n"
++                         "mcr p15, 0, %0, c8, c7, 0\n"   /* TLBIALL */
++                         "dsb sy\n"
++                         "isb sy" :: "r"(0) : "memory");
++    }
+     rpi_pixels = (volatile unsigned short *)fb;
+     if (rpi_uart_wanted) rpi_uart = (volatile unsigned int *)ml_io_map(RPI3_UART0_PA, PAGE_SIZE);
+     scale_tables_init();
+diff --git a/xnu/pexpert/conf/Makefile.arm b/xnu/pexpert/conf/Makefile.arm
+index e69de29..dfb0e8d 100644
+--- a/xnu/pexpert/conf/Makefile.arm
++++ b/xnu/pexpert/conf/Makefile.arm
+@@ -0,0 +1,12 @@
++######################################################################
++#BEGIN  Machine dependent Makefile fragment for arm
++######################################################################
++
++# Raspberry Pi 3: the display path copies 768 KB per frame; build it
++# optimized (the rest of the ARM kernel stays -O0, as for the HD2).
++pe_rpi3.o_CFLAGS_RM = -O0
++pe_rpi3.o_CFLAGS_ADD = -O2
++
++######################################################################
++#END    Machine dependent Makefile fragment for arm
++######################################################################
+-- 
+2.43.0
+
