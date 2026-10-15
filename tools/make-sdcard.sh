@@ -51,6 +51,8 @@ gpu_mem=64
 # Prefer HDMI even without a monitor detected at power-on.
 hdmi_force_hotplug=1
 disable_splash=1
+# No Linux device tree: the firmware passes ATAGs (with cmdline.txt) instead.
+device_tree=
 EOF
 # Extra boot-args for XNU go here (appended to the built-in ones).
 printf '\n' > "$tmp/cmdline.txt"

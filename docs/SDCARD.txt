@@ -1,0 +1,41 @@
+rpiios: iOS 7.1.2 natively on a Raspberry Pi 3 Model B+
+========================================================
+
+EXPERIMENTAL. Boots in QEMU's Raspberry Pi emulation to the iOS lock screen;
+not yet tested on a real Pi. Expect it not to work first time - see "If it
+does not boot" below.
+
+You need
+- Raspberry Pi 3 Model B+, power supply, HDMI screen, USB mouse
+- microSD card, 2 GB or larger (its contents will be replaced)
+- the HD2 iOS 7 package (ios7.rar), for its rootfs.hfs
+
+Making the SD card
+1. Format the card as FAT32 (one partition; MBR / "Master Boot Record").
+   On Windows use "SD Card Formatter" or Disk Management; on a Mac, Disk
+   Utility: MS-DOS (FAT), Master Boot Record.
+2. Copy everything in this folder to the root of the card:
+     bootcode.bin  start.elf  fixup.dat  config.txt  cmdline.txt  kernel7.img
+3. Make a folder named IOS7 on the card.
+4. From ios7.rar, take ios7/rootfs.hfs, put it in IOS7 and rename it to
+   ROOTFS.HFS  (so the card has IOS7/ROOTFS.HFS, about 940 MB).
+5. Eject the card, put it in the Pi, connect HDMI and the mouse, power on.
+
+What to expect
+- The screen goes black; within a few seconds small numbers appear in the top
+  left (boot stages), then white kernel text, then the iOS lock screen.
+  On a wide monitor the picture is a tall strip in the middle.
+- Move the mouse to move the pointer. Hold the left button to touch the screen
+  at the pointer, release to lift the finger. Slide to unlock = hold the button
+  near "slide to unlock" and drag to the right.
+- iOS drawing is done by the CPU (no GPU driver), so it is slow, as on the HD2.
+- Nothing you do is saved: like the HD2 build, iOS runs on a RAM copy of the
+  root filesystem.
+
+If it does not boot
+- A full red screen with "XNU FATAL" and numbers: take a photo of it.
+- Stuck on white text: take a photo of the last lines.
+- Black screen and nothing ever appears: the firmware did not start the
+  kernel, or HDMI is not detected. Check that all six files are at the top
+  level of the card, and try another HDMI input or cable.
+Send the photo back, it shows exactly where it stopped.

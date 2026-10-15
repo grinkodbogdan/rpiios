@@ -1,0 +1,33 @@
+From 340176e935dcb573929be740aff9960514c4fc59 Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 07:07:29 +0000
+Subject: [PATCH] OSSpinLockTry: ldrex/strex instead of swp (undefined on
+ ARMv8)
+
+---
+ xnu/iokit/Kernel/arm/IOSharedLock.s | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/xnu/iokit/Kernel/arm/IOSharedLock.s b/xnu/iokit/Kernel/arm/IOSharedLock.s
+index 476324a..e0ffd5e 100644
+--- a/xnu/iokit/Kernel/arm/IOSharedLock.s
++++ b/xnu/iokit/Kernel/arm/IOSharedLock.s
+@@ -50,8 +50,13 @@ EnterARM_NoAlign(_ev_unlock)
+ EnterARM(_OSSpinLockTry)
+ EnterARM_NoAlign(_IOTrySpinLock)
+ EnterARM_NoAlign(_ev_try_lock)
+-    mov    r1, #0
+-    swp    r1, r1, [r0]
++    /* Atomic exchange with 0 via ldrex/strex: SWP is undefined on ARMv8
++     * (the Raspberry Pi 3 Cortex-A53). Same result as the swp it replaces. */
++    mov    r2, #0
++1:  ldrex  r1, [r0]
++    strex  r3, r2, [r0]
++    cmp    r3, #0
++    bne    1b
+     cmp    r1, #0
+     moveq  r0, #1
+     movne  r0, #0
+-- 
+2.43.0
+

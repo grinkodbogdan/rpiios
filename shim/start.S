@@ -30,6 +30,17 @@ core0:
     and     r0, r7, #0x1f
     cmp     r0, #0x1a                   @ HYP mode?
     bne     in_svc
+    /* Leaving HYP for good: make sure nothing PL1 does traps to it.
+     * HCPTR: no FP/NEON/trace traps. HSTR: no CP15 traps. HCR: all off. */
+    mrc     p15, 4, r0, c1, c1, 2
+    bic     r0, r0, #0xc00              @ TCP10, TCP11
+    bic     r0, r0, #(1 << 15)          @ TASE
+    bic     r0, r0, #(1 << 20)          @ TTA
+    mcr     p15, 4, r0, c1, c1, 2
+    mov     r0, #0
+    mcr     p15, 4, r0, c1, c1, 3       @ HSTR
+    mcr     p15, 4, r0, c1, c1, 0       @ HCR
+    isb
     mrs     r0, cpsr
     bic     r0, r0, #0x1f
     orr     r0, r0, #0x13               @ SVC
@@ -47,6 +58,13 @@ in_svc:
     bic     r0, r0, #(1 << 0)           @ M
     bic     r0, r0, #(1 << 2)           @ C
     bic     r0, r0, #(1 << 1)           @ A
+    /* ARMv8 AArch32 (Cortex-A53) compatibility for 2013-era ARMv7 code:
+     * CP15BEN enables the CP15 barrier operations the kernel uses;
+     * ITD and SED clear keep all Thumb IT forms and SETEND legal.
+     * Harmless on ARMv7 cores. The kernel only read-modify-writes SCTLR. */
+    orr     r0, r0, #(1 << 5)           @ CP15BEN
+    bic     r0, r0, #(1 << 7)           @ ITD
+    bic     r0, r0, #(1 << 8)           @ SED
     mcr     p15, 0, r0, c1, c0, 0
     isb
 
