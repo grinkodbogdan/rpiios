@@ -1,0 +1,59 @@
+From e822171fb98c782c2f8ad7c647d5af2f34ca9b3f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 19:31:29 +0000
+Subject: [PATCH] Raspberry Pi 3: pace presents (rpi3_fps, default 15)
+
+backboardd renders every frame on the CPU. An endless animation such as
+the lock screen's 'slide to unlock' shimmer kept its render thread busy
+all the time, starving touch handling, SpringBoard and file system I/O
+(SpringBoard sat in lstat64 for minutes). Sleep the presenting thread for
+the rest of the frame time when frames come faster than rpi3_fps.
+---
+ .../ARM/AppleARMPlatform/IOS7LeoDisplay.cpp   | 29 +++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+index a51839d..b471170 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+@@ -344,8 +344,37 @@ static bool ios7lab_primary_ready(void)
+     return true;
+ }
+ 
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++/*
++ * The Pi has no GPU: backboardd renders every frame on the CPU. Left
++ * alone, an animation (the lock screen's "slide to unlock" shimmer) keeps
++ * its render thread busy all the time, and at its priority that starves
++ * touch handling, SpringBoard and file system I/O. Pace presents: when
++ * frames come faster than rpi3_fps (boot-arg, default 15), sleep the
++ * presenting thread for the rest of the frame time.
++ */
++static void rpi3_pace_present(void)
++{
++    static uint64_t interval, last;
++    if (!interval) {
++        uint32_t fps = 15;
++        if (!PE_parse_boot_argn("rpi3_fps", &fps, sizeof(fps)) || !fps || fps > 60) fps = 15;
++        (nanoseconds_to_absolutetime)(1000000000ULL / fps, &interval);
++    }
++    uint64_t now = mach_absolute_time();
++    if (last && now - last < interval) {
++        uint64_t ns; (absolutetime_to_nanoseconds)(interval - (now - last), &ns);
++        IOSleep((unsigned)(ns / 1000000ULL) + 1);
++        now = mach_absolute_time();
++    }
++    last = now;
++}
++#endif
+ static IOReturn ios7lab_present_owned_scanout(uint32_t id)
+ {
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    rpi3_pace_present();
++#endif
+     IOReturn result=kIOReturnNotFound;
+     IOS7LabOffscreenSurface retired;bzero(&retired,sizeof(retired));
+     IOLockLock(primaryLock);
+-- 
+2.43.0
+
