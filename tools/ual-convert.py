@@ -57,12 +57,13 @@ def convert_line(line):
 def main(paths):
     total = 0
     for path in paths:
-        with open(path) as f:
+        # newline="" keeps CRLF files byte-identical outside rewritten lines.
+        with open(path, newline="") as f:
             lines = f.read().split("\n")
         out = [convert_line(l) for l in lines]
         changed = sum(a != b for a, b in zip(lines, out))
         if changed:
-            with open(path, "w") as f:
+            with open(path, "w", newline="") as f:
                 f.write("\n".join(out))
         total += changed
         print(f"{changed:5d}  {path}")

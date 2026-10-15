@@ -1,0 +1,1926 @@
+From ac9a5973e8eec0929030820a177eb37859344efb Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 06:33:15 +0000
+Subject: [PATCH] Add Raspberry Pi 3 Model B+ board (RASPBERRYPI3)
+
+The Pi target is the HD2 iOS 7 kernel with a different board layer: it
+builds with BOARD_CONFIG_QSD8250_LEO so every iOS 7 compatibility change
+stays on, and HD2 hardware files are excluded with BOARD_CONFIG_RASPBERRYPI3.
+
+- pexpert/arm/pe_rpi3.c: platform expert with the HD2 PE's exported API
+  (stages, fatal/panic screens, display present into the firmware
+  framebuffer, 320x533 -> 480x800 scaling), optional PL011 output.
+- pexpert/arm/rpi3_timer.c: armctrl IRQ + 1 MHz system timer compare 3.
+- osfmk/arm/locore.s: early identity maps for the framebuffer and UART.
+- IOS7Rpi3SD.cpp + rpi3_sd.c: SDHCI (Arasan) SD card, GPIO48-53 -> ALT3;
+  class keeps the IOS7LeoSDCC2 name the root-file/logger drivers match.
+- IOS7Rpi3Input.cpp: placeholder until the USB mouse transport.
+- Cortex-A53 CPU id; 'brcm,bcm2837' platform match.
+---
+ .../ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp  |   3 +-
+ .../ARM/AppleARMPlatform/IOS7LeoSDCC2.cpp     |   3 +-
+ .../ARM/AppleARMPlatform/IOS7Rpi3Input.cpp    |  24 +
+ .../ARM/AppleARMPlatform/IOS7Rpi3SD.cpp       | 342 +++++++++++
+ .../ARM/AppleARMPlatform/rpi3_sd.c            | 382 ++++++++++++
+ .../ARM/AppleARMPlatform/rpi3_sd.h            |  46 ++
+ xnu/iokit/KernelConfigTables.cpp              |   4 +-
+ xnu/iokit/conf/files.arm                      |   4 +
+ xnu/makedefs/MakeInc.def                      |   8 +-
+ xnu/osfmk/arm/cpu.c                           |   2 +
+ xnu/osfmk/arm/locore.s                        |  23 +-
+ xnu/osfmk/arm/proc_reg.h                      |   1 +
+ xnu/pexpert/arm/leo_qsd8250_timer.c           |   3 +-
+ xnu/pexpert/arm/leo_scanout_row.c             |   3 +-
+ xnu/pexpert/arm/pe_qsd8250_leo.c              |   3 +-
+ xnu/pexpert/arm/pe_rpi3.c                     | 555 ++++++++++++++++++
+ xnu/pexpert/arm/rpi3_board.h                  |  84 +++
+ xnu/pexpert/arm/rpi3_timer.c                  | 192 ++++++
+ xnu/pexpert/arm/rpi3_timer.h                  |  14 +
+ xnu/pexpert/conf/files.arm                    |   2 +
+ 20 files changed, 1690 insertions(+), 8 deletions(-)
+ create mode 100644 xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3Input.cpp
+ create mode 100644 xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3SD.cpp
+ create mode 100644 xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c
+ create mode 100644 xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.h
+ create mode 100644 xnu/pexpert/arm/pe_rpi3.c
+ create mode 100644 xnu/pexpert/arm/rpi3_board.h
+ create mode 100644 xnu/pexpert/arm/rpi3_timer.c
+ create mode 100644 xnu/pexpert/arm/rpi3_timer.h
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp
+index 2bd8e01..69d9c26 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp
+@@ -1,5 +1,6 @@
+ /* HTC HD2 integration/publication changes: Garysss123, 2026-10-04. Original license notices are preserved. */
+-#if defined(BOARD_CONFIG_QSD8250_LEO)
++/* HTC HD2 hardware; the Raspberry Pi 3 board supplies its own. */
++#if defined(BOARD_CONFIG_QSD8250_LEO) && !defined(BOARD_CONFIG_RASPBERRYPI3)
+ /* Real Type2A controller reports through the original iOS7 IOHIDLib queue.
+  * PL050, synthetic contacts, buttons and userland routing helpers are absent. */
+ #include <IOKit/IOService.h>
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoSDCC2.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoSDCC2.cpp
+index 11670a6..13cebda 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoSDCC2.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoSDCC2.cpp
+@@ -1,4 +1,5 @@
+-#if defined(BOARD_CONFIG_QSD8250_LEO)
++/* HTC HD2 hardware; the Raspberry Pi 3 board supplies its own. */
++#if defined(BOARD_CONFIG_QSD8250_LEO) && !defined(BOARD_CONFIG_RASPBERRYPI3)
+ /* Genuine Leo SDCC2: ordinary raw media read-only; private owned-log writes only.
+  * No DMA or SDCC IRQ registration. */
+ #include <IOKit/storage/IOBlockStorageDevice.h>
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3Input.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3Input.cpp
+new file mode 100644
+index 0000000..0f14855
+--- /dev/null
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3Input.cpp
+@@ -0,0 +1,24 @@
++/*
++ * Raspberry Pi 3 input for the iOS 7 kernel.
++ *
++ * Placeholder until the USB mouse transport lands: no touch service is
++ * published, so iOS boots without input. The observation hook reports
++ * "unknown" as the HD2 driver does before its controller is ready.
++ */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include "IOS7LeoTouchObservation.h"
++
++extern "C" uint32_t ios7leo_touch_observe(LeoTouchObservation *out)
++{
++    (void)out;
++    return 0;
++}
++
++void ios7leo_register_hid_touch(IOService *platform)
++{
++    (void)platform;
++    IOLog("Rpi3 input: no touch transport yet; booting without input\n");
++}
++#endif /* BOARD_CONFIG_RASPBERRYPI3 */
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3SD.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3SD.cpp
+new file mode 100644
+index 0000000..9ffe8b2
+--- /dev/null
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3SD.cpp
+@@ -0,0 +1,342 @@
++/*
++ * Raspberry Pi 3 SD card block device for the iOS 7 kernel.
++ *
++ * Port of IOS7LeoSDCC2.cpp (HTC HD2) to the Pi's SDHCI controller (rpi3_sd.c).
++ * Same contract: ordinary raw media is read-only (the root image is a file on
++ * the FAT partition with a RAM copy-on-write overlay above it), and the only
++ * writes are the owned boot log, through the ios7leo_sd_log_* interface.
++ *
++ * The class keeps the HD2 name IOS7LeoSDCC2: the root-file and boot-log
++ * drivers find their SD device with metaCast("IOS7LeoSDCC2").
++ */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++#include <IOKit/storage/IOBlockStorageDevice.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOCatalogue.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSUnserialize.h>
++#include <kern/debug.h>
++#include "rpi3_sd.h"
++#include "rpi3_board.h"
++#include "IOS7LeoSDLog.h"
++#include "IOS7LabSDProtocol.h"
++#include "IOS7LabStoragePersonalities.h"
++extern "C" {
++#include <mach/mach_time.h>
++}
++
++class IOS7LeoSDCC2;
++struct ios7leo_sd_log_capability {
++    IOS7LeoSDCC2 *owner;
++    struct ios7leo_sd_log_extent extents[IOS7LEO_SD_LOG_MAX_EXTENTS];
++    uint32_t extent_count, next_sector, first_verified;
++    uint8_t nonce[16];
++};
++static ios7leo_sd_log_capability *boundLogCapability;
++
++class IOS7LeoSDCC2 : public IOBlockStorageDevice {
++    OSDeclareDefaultStructors(IOS7LeoSDCC2)
++    IOMemoryDescriptor *mmio[2]; IOMemoryMap *maps[2];
++    IOLock *mutex; struct rpi3_sd_card card; bool initialized;
++    static uint64_t nowNS(void *);
++    static IOReturn convert(int);
++public:
++    virtual bool init(OSDictionary *properties = 0);
++    virtual bool start(IOService *provider);
++    void failurePanic(const char *reason);
++    virtual void free();
++    virtual IOReturn doAsyncReadWrite(IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *);
++    virtual IOReturn doEjectMedia() { return kIOReturnUnsupported; }
++    virtual IOReturn doFormatMedia(UInt64) { return kIOReturnUnsupported; }
++    virtual UInt32 doGetFormatCapacities(UInt64 *, UInt32) const { return 0; }
++    virtual IOReturn doLockUnlockMedia(bool) { return kIOReturnUnsupported; }
++    virtual IOReturn doSynchronizeCache() { return kIOReturnUnsupported; }
++    virtual char *getVendorString();
++    virtual char *getProductString();
++    virtual char *getRevisionString();
++    virtual char *getAdditionalDeviceInfoString();
++    virtual IOReturn reportBlockSize(UInt64 *);
++    virtual IOReturn reportMaxValidBlock(UInt64 *);
++    virtual IOReturn reportEjectability(bool *);
++    virtual IOReturn reportLockability(bool *);
++    virtual IOReturn reportRemovability(bool *);
++    virtual IOReturn reportMediaState(bool *, bool *);
++    virtual IOReturn reportPollRequirements(bool *, bool *);
++    virtual IOReturn reportWriteProtection(bool *);
++    int describeLog(struct ios7leo_sd_log_info *);
++    int bindLog(const struct ios7leo_sd_log_extent *, uint32_t, uint32_t, const uint8_t [16], ios7leo_sd_log_capability **);
++    int writeLog(ios7leo_sd_log_capability *, uint32_t, const uint8_t [512]);
++};
++OSDefineMetaClassAndStructors(IOS7LeoSDCC2, IOBlockStorageDevice)
++
++uint64_t IOS7LeoSDCC2::nowNS(void *) { return mach_absolute_time(); }
++
++IOReturn IOS7LeoSDCC2::convert(int result)
++{
++    if (result == LEO_SD_OK) return kIOReturnSuccess;
++    if (result == LEO_SD_TIMEOUT) return kIOReturnTimeout;
++    if (result == LEO_SD_ARGUMENT) return kIOReturnBadArgument;
++    if (result == LEO_SD_FAULTED) return kIOReturnNotReady;
++    return kIOReturnIOError;
++}
++
++bool IOS7LeoSDCC2::init(OSDictionary *properties)
++{
++    for (unsigned i = 0; i < 2; ++i) { mmio[i] = 0; maps[i] = 0; }
++    mutex = 0; initialized = false;
++    return IOBlockStorageDevice::init(properties);
++}
++
++bool IOS7LeoSDCC2::start(IOService *provider)
++{
++    if (!IOBlockStorageDevice::start(provider)) return false;
++    const UInt32 physical[2] = {RPI3_EMMC_PA, RPI3_GPIO_PA};
++    volatile uint32_t *regs[2];
++    mutex = IOLockAlloc();
++    if (!mutex) return false;
++    for (unsigned i = 0; i < 2; ++i) {
++        mmio[i] = IOMemoryDescriptor::withPhysicalAddress(physical[i], 4096, kIODirectionInOut);
++        if (!mmio[i]) return false;
++        maps[i] = mmio[i]->map(kIOMapInhibitCache);
++        if (!maps[i]) return false;
++        regs[i] = (volatile uint32_t *)maps[i]->getVirtualAddress();
++        if (!regs[i]) return false;
++    }
++    struct rpi3_sd_io io = {this, regs[0], regs[1], nowNS, rpi3_emmc_clock_hz(), 1000000U};
++    if (!io.base_clock_hz) {
++        IOLog("Rpi3 SD: firmware gave no EMMC clock\n");
++        return false;
++    }
++    rpi3_sd_init(&card, &io);
++
++    IOLog("Rpi3 SD: base clock %u Hz, init begin\n", (unsigned)io.base_clock_hz);
++    IOLockLock(mutex);
++    UInt8 sector[512];
++    int result = rpi3_sd_start(&card);
++    if (result == LEO_SD_OK) result = rpi3_sd_read_sector(&card, 0, sector);
++    IOLockUnlock(mutex);
++    if (result != LEO_SD_OK) {
++        IOLog("Rpi3 SD: error=%d stage=%u cmd=%u interrupt=%08x status=%08x\n",
++              result, card.stage, card.command, card.interrupt, card.status);
++        panic("Rpi3 SD init/read0 error=%d stage=%u cmd=%u interrupt=%08x status=%08x",
++              result, card.stage, card.command, card.interrupt, card.status);
++        return false;
++    }
++    IOLog("Rpi3 SD: CID=%08x:%08x:%08x:%08x sectors=%llu SDHC=%u clock=%u Hz width=%u MBRsig=%02x%02x\n",
++          card.cid[0], card.cid[1], card.cid[2], card.cid[3], (unsigned long long)card.sectors,
++          (unsigned)card.high_capacity, (unsigned)card.clock_hz, (unsigned)card.bus_width,
++          (unsigned)sector[510], (unsigned)sector[511]);
++    initialized = true;
++    return true;
++}
++
++void IOS7LeoSDCC2::failurePanic(const char *reason)
++{
++    panic("Rpi3 SD mandatory startup %s stage=%u cmd=%u interrupt=%08x status=%08x",
++          reason, card.stage, card.command, card.interrupt, card.status);
++}
++
++void IOS7LeoSDCC2::free()
++{
++    for (unsigned i = 0; i < 2; ++i) {
++        if (maps[i]) maps[i]->release();
++        if (mmio[i]) mmio[i]->release();
++    }
++    if (mutex) IOLockFree(mutex);
++    IOBlockStorageDevice::free();
++}
++
++IOReturn IOS7LeoSDCC2::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
++                                      IOStorageAttributes *attributes, IOStorageCompletion *completion)
++{
++    UInt64 bytes = 0;
++    if (!buffer || !completion || !completion->action || !initialized ||
++        !ios7lab_sd_request_range(card.sectors, block, count, buffer->getLength(), &bytes))
++        return kIOReturnBadArgument;
++    if (buffer->getDirection() != kIODirectionIn) return kIOReturnNotWritable;
++    if (attributes && (attributes->options || attributes->reserved0032 || attributes->reserved0064))
++        return kIOReturnUnsupported;
++    IOStorageCompletion saved = *completion;
++    UInt64 completed = 0;
++    IOReturn result = kIOReturnSuccess;
++    UInt8 data[512];
++    IOLockLock(mutex);
++    if (card.faulted) { IOLockUnlock(mutex); return kIOReturnNotReady; }
++    for (UInt64 i = 0; i < count; ++i) {
++        result = convert(rpi3_sd_read_sector(&card, block + i, data));
++        if (result != kIOReturnSuccess) break;
++        if (buffer->writeBytes((IOByteCount)completed, data, 512) != 512) { result = kIOReturnUnderrun; break; }
++        completed += 512;
++    }
++    IOLockUnlock(mutex);
++    IOStorage::complete(&saved, result, completed);
++    return kIOReturnSuccess;
++}
++
++char *IOS7LeoSDCC2::getVendorString() { static char t[] = "Raspberry Pi"; return t; }
++char *IOS7LeoSDCC2::getProductString() { static char t[] = "Pi 3 SDHCI SD"; return t; }
++char *IOS7LeoSDCC2::getRevisionString() { static char t[] = "PIO RO"; return t; }
++char *IOS7LeoSDCC2::getAdditionalDeviceInfoString() { static char t[] = "BCM2837 EMMC GPIO48-53"; return t; }
++IOReturn IOS7LeoSDCC2::reportBlockSize(UInt64 *v) { if (!v) return kIOReturnBadArgument; *v = 512; return kIOReturnSuccess; }
++IOReturn IOS7LeoSDCC2::reportMaxValidBlock(UInt64 *v) { if (!v || !initialized) return kIOReturnNotReady; *v = card.sectors - 1; return kIOReturnSuccess; }
++IOReturn IOS7LeoSDCC2::reportEjectability(bool *v) { if (!v) return kIOReturnBadArgument; *v = false; return kIOReturnSuccess; }
++IOReturn IOS7LeoSDCC2::reportLockability(bool *v) { if (!v) return kIOReturnBadArgument; *v = false; return kIOReturnSuccess; }
++IOReturn IOS7LeoSDCC2::reportRemovability(bool *v) { if (!v) return kIOReturnBadArgument; *v = true; return kIOReturnSuccess; }
++IOReturn IOS7LeoSDCC2::reportMediaState(bool *present, bool *changed)
++{
++    if (!present || !changed) return kIOReturnBadArgument;
++    IOLockLock(mutex);
++    *present = initialized && !card.faulted;
++    *changed = false;
++    IOLockUnlock(mutex);
++    return kIOReturnSuccess;
++}
++IOReturn IOS7LeoSDCC2::reportPollRequirements(bool *required, bool *expensive)
++{
++    if (!required || !expensive) return kIOReturnBadArgument;
++    *required = false; *expensive = false;
++    return kIOReturnSuccess;
++}
++IOReturn IOS7LeoSDCC2::reportWriteProtection(bool *v) { if (!v) return kIOReturnBadArgument; *v = true; return kIOReturnSuccess; }
++
++int IOS7LeoSDCC2::describeLog(struct ios7leo_sd_log_info *info)
++{
++    if (!info || !mutex) return LEO_SD_ARGUMENT;
++    IOLockLock(mutex);
++    info->card_sectors = card.sectors;
++    for (unsigned i = 0; i < 4; ++i) info->cid[i] = card.cid[i];
++    info->csd_write_protected = (uint32_t)card.csd_write_protected;
++    info->initialized = initialized;
++    info->faulted = (uint32_t)card.faulted;
++    info->stage = card.stage; info->command = card.command; info->status = card.status;
++    info->write_attempts = card.write_attempts; info->write_words = card.write_words;
++    info->write_completed = card.write_completed; info->write_result = card.write_result;
++    info->first_write_verified = 0; info->next_file_sector = 0;
++    if (boundLogCapability && boundLogCapability->owner == this) {
++        info->first_write_verified = boundLogCapability->first_verified;
++        info->next_file_sector = boundLogCapability->next_sector;
++    }
++    IOLockUnlock(mutex);
++    return LEO_SD_OK;
++}
++
++int IOS7LeoSDCC2::bindLog(const struct ios7leo_sd_log_extent *extents, uint32_t count,
++                        uint32_t first, const uint8_t nonce[16], ios7leo_sd_log_capability **out)
++{
++    if (!out) return LEO_SD_ARGUMENT;
++    *out = 0;
++    if (!mutex || !extents || !nonce || !count || count > IOS7LEO_SD_LOG_MAX_EXTENTS ||
++        !first || first > IOS7LEO_SD_LOG_FILE_SECTORS) return LEO_SD_ARGUMENT;
++    unsigned nonzero = 0;
++    for (unsigned i = 0; i < 16; ++i) nonzero |= nonce[i];
++    if (!nonzero) return LEO_SD_ARGUMENT;
++    ios7leo_sd_log_capability *cap = (ios7leo_sd_log_capability *)IOMalloc(sizeof(*cap));
++    if (!cap) return LEO_SD_NO_MEMORY;
++    bzero(cap, sizeof(*cap));
++    int result = LEO_SD_OK;
++    uint64_t cursor = 0;
++    IOLockLock(mutex);
++    if (!initialized || card.faulted) result = LEO_SD_FAULTED;
++    else if (card.csd_write_protected) result = LEO_SD_WRITE_PROTECTED;
++    else if (boundLogCapability) result = LEO_SD_ARGUMENT;
++    for (unsigned i = 0; result == LEO_SD_OK && i < count; ++i) {
++        const struct ios7leo_sd_log_extent *e = extents + i;
++        if (!e->sectors || e->file_sector != cursor || cursor > IOS7LEO_SD_LOG_FILE_SECTORS ||
++            e->sectors > IOS7LEO_SD_LOG_FILE_SECTORS - cursor ||
++            !e->card_sector || e->card_sector >= card.sectors || e->sectors > card.sectors - e->card_sector) {
++            result = LEO_SD_ARGUMENT; break;
++        }
++        for (unsigned j = 0; j < i; ++j) {
++            const struct ios7leo_sd_log_extent *p = extents + j;
++            if (e->card_sector < p->card_sector + p->sectors && p->card_sector < e->card_sector + e->sectors) {
++                result = LEO_SD_ARGUMENT; break;
++            }
++        }
++        cap->extents[i] = *e;
++        cursor += e->sectors;
++    }
++    if (result == LEO_SD_OK && cursor != IOS7LEO_SD_LOG_FILE_SECTORS) result = LEO_SD_ARGUMENT;
++    if (result == LEO_SD_OK) {
++        cap->owner = this; cap->extent_count = count; cap->next_sector = first;
++        for (unsigned i = 0; i < 16; ++i) cap->nonce[i] = nonce[i];
++        retain();
++        boundLogCapability = cap;
++        *out = cap;
++    }
++    IOLockUnlock(mutex);
++    if (result != LEO_SD_OK) IOFree(cap, sizeof(*cap));
++    return result;
++}
++
++int IOS7LeoSDCC2::writeLog(ios7leo_sd_log_capability *cap, uint32_t logical, const uint8_t bytes[512])
++{
++    if (!mutex || !cap || !bytes || !logical || logical >= IOS7LEO_SD_LOG_FILE_SECTORS || cap != boundLogCapability)
++        return LEO_SD_ARGUMENT;
++    uint64_t physical = 0;
++    int result = LEO_SD_ARGUMENT;
++    uint8_t verified[512];
++    IOLockLock(mutex);
++    if (cap != boundLogCapability || cap->owner != this || logical != cap->next_sector) {
++        IOLockUnlock(mutex); return LEO_SD_ARGUMENT;
++    }
++    if (!initialized || card.faulted) { IOLockUnlock(mutex); return LEO_SD_FAULTED; }
++    for (unsigned i = 0; i < cap->extent_count; ++i) {
++        const struct ios7leo_sd_log_extent *e = cap->extents + i;
++        if (logical >= e->file_sector && (uint64_t)logical - e->file_sector < e->sectors) {
++            physical = e->card_sector + ((uint64_t)logical - e->file_sector);
++            result = LEO_SD_OK; break;
++        }
++    }
++    if (result == LEO_SD_OK) result = rpi3_sd_write_sector(&card, physical, bytes);
++    if (result == LEO_SD_OK && !cap->first_verified) {
++        result = rpi3_sd_read_sector(&card, physical, verified);
++        if (result == LEO_SD_OK)
++            for (unsigned i = 0; i < 512; ++i)
++                if (verified[i] != bytes[i]) { result = LEO_SD_PROTOCOL; card.faulted = 1; break; }
++        if (result == LEO_SD_OK) cap->first_verified = 1;
++    }
++    card.write_result = result;
++    if (result == LEO_SD_OK) ++cap->next_sector;
++    IOLockUnlock(mutex);
++    return result;
++}
++
++extern "C" int ios7leo_sd_log_describe(void *service, struct ios7leo_sd_log_info *info)
++{
++    IOS7LeoSDCC2 *device = service ? OSDynamicCast(IOS7LeoSDCC2, (OSObject *)service) : 0;
++    return device ? device->describeLog(info) : LEO_SD_ARGUMENT;
++}
++
++extern "C" int ios7leo_sd_log_bind(void *service, const struct ios7leo_sd_log_extent *extents,
++                                   uint32_t count, uint32_t first, const uint8_t nonce[16],
++                                   ios7leo_sd_log_capability **out)
++{
++    if (out) *out = 0;
++    IOS7LeoSDCC2 *device = service ? OSDynamicCast(IOS7LeoSDCC2, (OSObject *)service) : 0;
++    return device ? device->bindLog(extents, count, first, nonce, out) : LEO_SD_ARGUMENT;
++}
++
++extern "C" int ios7leo_sd_log_write(ios7leo_sd_log_capability *cap, uint32_t logical, const uint8_t bytes[512])
++{
++    if (!cap || cap != boundLogCapability) return LEO_SD_ARGUMENT;
++    return cap->owner->writeLog(cap, logical, bytes);
++}
++
++void ios7leo_register_sd(IOService *platform)
++{
++    IOS7LeoSDCC2 *device = new IOS7LeoSDCC2;
++    if (!device) { panic("Rpi3 SD object allocation failed"); return; }
++    bool attached = false, success = false;
++    if (device->init()) attached = device->attach(platform);
++    if (attached && device->start(platform)) {
++        OSObject *decoded = OSUnserializeXML(ios7labStoragePersonalities);
++        OSArray *drivers = OSDynamicCast(OSArray, decoded);
++        if (drivers && gIOCatalogue->addDrivers(drivers, false)) { device->registerService(); success = true; }
++        else IOLog("Rpi3 SD: storage catalogue registration failed\n");
++        if (decoded) decoded->release();
++    }
++    if (!success) device->failurePanic("object init/attach/map/start/catalogue failed");
++    if (attached && !success) device->detach(platform);
++    device->release();
++}
++#endif /* BOARD_CONFIG_RASPBERRYPI3 */
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c
+new file mode 100644
+index 0000000..2592224
+--- /dev/null
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c
+@@ -0,0 +1,382 @@
++/*
++ * SD card protocol over the Raspberry Pi's Arasan SDHCI ("EMMC") controller.
++ *
++ * Register layout and bit names follow the SD Host Controller Simplified
++ * Specification v3 and the BCM2835 ARM Peripherals manual (section 5).
++ * Pi-specific rules honoured here:
++ *   - registers are accessed as 32-bit words only (the Arasan block drops
++ *     8/16-bit writes), so 8/16-bit SDHCI fields are composed by hand;
++ *   - the base clock is not in the capability registers; the boot shim asks
++ *     the firmware for it;
++ *   - after boot the firmware leaves the SD card on its own SDHOST block, so
++ *     GPIO 48-53 are switched to ALT3 to put the card on this controller.
++ * Single-block programmed I/O, no interrupts, no DMA - like the HD2 driver.
++ */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++#include "rpi3_sd.h"
++
++/* SDHCI register offsets (32-bit words). */
++#define BLKSIZECNT  0x04
++#define ARG1        0x08
++#define CMDTM       0x0c
++#define RESP0       0x10
++#define RESP1       0x14
++#define RESP2       0x18
++#define RESP3       0x1c
++#define DATA        0x20
++#define STATUS      0x24
++#define CONTROL0    0x28
++#define CONTROL1    0x2c
++#define INTERRUPT   0x30
++#define IRPT_MASK   0x34
++#define IRPT_EN     0x38
++
++/* CMDTM: transfer mode (low half) and command (high half). */
++#define TM_BLKCNT_EN    (1U << 1)
++#define TM_DAT_READ     (1U << 4)
++#define CMD_RSP_NONE    (0U << 16)
++#define CMD_RSP_136     (1U << 16)
++#define CMD_RSP_48      (2U << 16)
++#define CMD_RSP_48_BUSY (3U << 16)
++#define CMD_CRCCHK      (1U << 19)
++#define CMD_IXCHK       (1U << 20)
++#define CMD_ISDATA      (1U << 21)
++#define CMD_INDEX(n)    ((uint32_t)(n) << 24)
++
++/* STATUS (present state). */
++#define ST_CMD_INHIBIT  (1U << 0)
++#define ST_DAT_INHIBIT  (1U << 1)
++
++/* INTERRUPT. */
++#define INT_CMD_DONE    (1U << 0)
++#define INT_DATA_DONE   (1U << 1)
++#define INT_WRITE_RDY   (1U << 4)
++#define INT_READ_RDY    (1U << 5)
++#define INT_ERROR_MASK  0xffff8000U
++
++/* CONTROL0: host control (7:0) and power control (15:8). */
++#define C0_DWIDTH4      (1U << 1)
++#define C0_POWER_33V    ((7U << 9) | (1U << 8))
++
++/* CONTROL1: clock control (15:0), timeout (19:16), resets (26:24). */
++#define C1_CLK_INTLEN   (1U << 0)
++#define C1_CLK_STABLE   (1U << 1)
++#define C1_CLK_EN       (1U << 2)
++#define C1_TOUNIT_MAX   (0xeU << 16)
++#define C1_SRST_HC      (1U << 24)
++#define C1_SRST_CMD     (1U << 25)
++#define C1_SRST_DATA    (1U << 26)
++
++/* GPIO function select / pulls (BCM2835 manual section 6). */
++#define GPFSEL4     0x10
++#define GPFSEL5     0x14
++#define GPPUD       0x94
++#define GPPUDCLK1   0x9c
++#define FSEL_ALT3   7U
++
++static uint32_t rd(struct rpi3_sd_card *c, unsigned off)
++{
++    uint32_t v;
++    __asm__ volatile("dsb sy" ::: "memory");
++    v = c->io.emmc[off / 4];
++    __asm__ volatile("dsb sy" ::: "memory");
++    return v;
++}
++
++static void wr(struct rpi3_sd_card *c, unsigned off, uint32_t v)
++{
++    __asm__ volatile("dsb sy" ::: "memory");
++    c->io.emmc[off / 4] = v;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
++static uint64_t now_us(struct rpi3_sd_card *c) { return c->io.now_ns(c->io.opaque) / 1000U; }
++
++static void delay_us(struct rpi3_sd_card *c, uint32_t us)
++{
++    uint64_t start = now_us(c);
++    while (now_us(c) - start < us) {}
++}
++
++/* Wait until (reg & mask) == want, or time out. */
++static int wait_reg(struct rpi3_sd_card *c, unsigned off, uint32_t mask, uint32_t want,
++                    uint32_t timeout_us)
++{
++    uint64_t start = now_us(c);
++    for (;;) {
++        if ((rd(c, off) & mask) == want) return LEO_SD_OK;
++        if (now_us(c) - start > timeout_us) return LEO_SD_TIMEOUT;
++    }
++}
++
++static void route_card_to_emmc(struct rpi3_sd_card *c)
++{
++    volatile uint32_t *g = c->io.gpio;
++    uint32_t v, pin;
++    /* GPIO48 (CLK), 49 (CMD), 50-53 (DAT0-3) -> ALT3 (Arasan). */
++    v = g[GPFSEL4 / 4];
++    for (pin = 48; pin <= 49; pin++) {
++        unsigned shift = (pin - 40) * 3;
++        v = (v & ~(7U << shift)) | (FSEL_ALT3 << shift);
++    }
++    g[GPFSEL4 / 4] = v;
++    v = g[GPFSEL5 / 4];
++    for (pin = 50; pin <= 53; pin++) {
++        unsigned shift = (pin - 50) * 3;
++        v = (v & ~(7U << shift)) | (FSEL_ALT3 << shift);
++    }
++    g[GPFSEL5 / 4] = v;
++    /* Pull-ups on CMD and DAT0-3 (GPIO 49-53), per the manual's sequence. */
++    g[GPPUD / 4] = 2;
++    delay_us(c, 5);
++    g[GPPUDCLK1 / 4] = 0x1fU << (49 - 32);
++    delay_us(c, 5);
++    g[GPPUD / 4] = 0;
++    g[GPPUDCLK1 / 4] = 0;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int set_clock(struct rpi3_sd_card *c, uint32_t hz)
++{
++    uint32_t base = c->io.base_clock_hz, div, v;
++    int r;
++    /* Gate the SD clock while the divider changes. */
++    wr(c, CONTROL1, rd(c, CONTROL1) & ~C1_CLK_EN);
++    /* SDHCI v3 10-bit divided mode: f = base / (2 * div), div = 0 means base. */
++    if (hz >= base) div = 0;
++    else {
++        div = (base + 2 * hz - 1) / (2 * hz);
++        if (div > 0x3ff) div = 0x3ff;
++    }
++    v = rd(c, CONTROL1) & ~0xffe0U & ~(0xfU << 16);
++    v |= ((div & 0xff) << 8) | (((div >> 8) & 3) << 6) | C1_TOUNIT_MAX | C1_CLK_INTLEN;
++    wr(c, CONTROL1, v);
++    r = wait_reg(c, CONTROL1, C1_CLK_STABLE, C1_CLK_STABLE, 100000);
++    if (r) return LEO_SD_CLOCK;
++    wr(c, CONTROL1, rd(c, CONTROL1) | C1_CLK_EN);
++    delay_us(c, 2000);
++    c->clock_hz = div ? base / (2 * div) : base;
++    return LEO_SD_OK;
++}
++
++static void reset_lines(struct rpi3_sd_card *c, uint32_t which)
++{
++    wr(c, CONTROL1, rd(c, CONTROL1) | which);
++    (void)wait_reg(c, CONTROL1, which, 0, 100000);
++}
++
++/* Issue a command and wait for completion; data phase handled by callers. */
++static int command(struct rpi3_sd_card *c, uint32_t index, uint32_t arg, uint32_t flags)
++{
++    uint32_t irq;
++    uint64_t start;
++    c->command = index;
++    if (wait_reg(c, STATUS, ST_CMD_INHIBIT, 0, c->io.timeout_us)) return LEO_SD_TIMEOUT;
++    if ((flags & (CMD_ISDATA | CMD_RSP_48_BUSY)) &&
++        wait_reg(c, STATUS, ST_DAT_INHIBIT, 0, c->io.timeout_us)) return LEO_SD_TIMEOUT;
++    wr(c, INTERRUPT, 0xffffffffU);
++    wr(c, ARG1, arg);
++    wr(c, CMDTM, CMD_INDEX(index) | flags);
++    start = now_us(c);
++    for (;;) {
++        irq = rd(c, INTERRUPT);
++        if (irq & INT_ERROR_MASK) {
++            c->interrupt = irq;
++            c->status = rd(c, STATUS);
++            wr(c, INTERRUPT, irq);
++            reset_lines(c, C1_SRST_CMD | C1_SRST_DATA);
++            return (irq & (1U << 16)) ? LEO_SD_TIMEOUT : LEO_SD_COMMAND;
++        }
++        if (irq & INT_CMD_DONE) break;
++        if (now_us(c) - start > c->io.timeout_us) { c->interrupt = irq; return LEO_SD_TIMEOUT; }
++    }
++    wr(c, INTERRUPT, INT_CMD_DONE);
++    return LEO_SD_OK;
++}
++
++/* R1b and data commands also finish with DATA_DONE. */
++static int wait_data_done(struct rpi3_sd_card *c)
++{
++    uint64_t start = now_us(c);
++    for (;;) {
++        uint32_t irq = rd(c, INTERRUPT);
++        if (irq & INT_ERROR_MASK) {
++            c->interrupt = irq;
++            wr(c, INTERRUPT, irq);
++            reset_lines(c, C1_SRST_CMD | C1_SRST_DATA);
++            return LEO_SD_DATA;
++        }
++        if (irq & INT_DATA_DONE) { wr(c, INTERRUPT, INT_DATA_DONE); return LEO_SD_OK; }
++        if (now_us(c) - start > c->io.timeout_us) { c->interrupt = irq; return LEO_SD_TIMEOUT; }
++    }
++}
++
++static int app_command(struct rpi3_sd_card *c, uint32_t index, uint32_t arg, uint32_t flags)
++{
++    int r = command(c, 55, c->rca << 16, CMD_RSP_48 | CMD_CRCCHK | CMD_IXCHK);
++    if (r) return r;
++    return command(c, index, arg, flags);
++}
++
++/* R2 (CID/CSD): the controller drops the CRC byte and right-aligns bits
++ * 127:8 in RESP3..RESP0. Rebuild the 128-bit register, MSW first. */
++static void read_r2(struct rpi3_sd_card *c, uint32_t out[4])
++{
++    uint32_t r0 = rd(c, RESP0), r1 = rd(c, RESP1), r2 = rd(c, RESP2), r3 = rd(c, RESP3);
++    out[0] = (r3 << 8) | (r2 >> 24);
++    out[1] = (r2 << 8) | (r1 >> 24);
++    out[2] = (r1 << 8) | (r0 >> 24);
++    out[3] = r0 << 8;
++}
++
++void rpi3_sd_init(struct rpi3_sd_card *c, const struct rpi3_sd_io *io)
++{
++    unsigned i;
++    unsigned char *p = (unsigned char *)c;
++    for (i = 0; i < sizeof(*c); i++) p[i] = 0;
++    c->io = *io;
++}
++
++#include "IOS7LabSDProtocol.h"
++
++int rpi3_sd_start(struct rpi3_sd_card *c)
++{
++    int r, tries;
++    uint32_t resp;
++
++    c->stage = 1;
++    route_card_to_emmc(c);
++
++    c->stage = 2;
++    wr(c, CONTROL1, C1_SRST_HC);
++    if (wait_reg(c, CONTROL1, C1_SRST_HC | C1_SRST_CMD | C1_SRST_DATA, 0, 100000))
++        return LEO_SD_TIMEOUT;
++    wr(c, CONTROL0, C0_POWER_33V);
++    delay_us(c, 2000);
++
++    c->stage = 3;
++    if ((r = set_clock(c, 400000))) return r;
++    wr(c, IRPT_EN, 0);                  /* no interrupt signalling: polled */
++    wr(c, IRPT_MASK, 0xffffffffU);      /* but latch every status bit */
++    wr(c, INTERRUPT, 0xffffffffU);
++
++    c->stage = 4;                       /* CMD0: GO_IDLE_STATE */
++    if ((r = command(c, 0, 0, CMD_RSP_NONE))) return r;
++    delay_us(c, 1000);
++
++    c->stage = 5;                       /* CMD8: SEND_IF_COND, 2.7-3.6V, pattern AA */
++    r = command(c, 8, 0x1aa, CMD_RSP_48 | CMD_CRCCHK | CMD_IXCHK);
++    if (r == LEO_SD_OK && (rd(c, RESP0) & 0xfff) != 0x1aa) return LEO_SD_PROTOCOL;
++    {
++        int v2 = (r == LEO_SD_OK);
++        uint32_t hcs = v2 ? (1U << 30) : 0;
++        c->stage = 6;                   /* ACMD41 until the card leaves busy */
++        for (tries = 0; tries < 1000; tries++) {
++            /* R3 has no CRC or index. */
++            if ((r = app_command(c, 41, hcs | 0x00ff8000U, CMD_RSP_48))) return r;
++            resp = rd(c, RESP0);
++            if (resp & (1U << 31)) break;
++            delay_us(c, 1000);
++        }
++        if (!(resp & (1U << 31))) return LEO_SD_TIMEOUT;
++        c->ocr = resp;
++        c->high_capacity = v2 && (resp & (1U << 30));
++    }
++
++    c->stage = 7;                       /* CMD2: ALL_SEND_CID */
++    if ((r = command(c, 2, 0, CMD_RSP_136 | CMD_CRCCHK))) return r;
++    read_r2(c, c->cid);
++
++    c->stage = 8;                       /* CMD3: SEND_RELATIVE_ADDR */
++    if ((r = command(c, 3, 0, CMD_RSP_48 | CMD_CRCCHK | CMD_IXCHK))) return r;
++    c->rca = rd(c, RESP0) >> 16;
++
++    c->stage = 9;                       /* CMD9: SEND_CSD */
++    if ((r = command(c, 9, c->rca << 16, CMD_RSP_136 | CMD_CRCCHK))) return r;
++    read_r2(c, c->csd);
++    if (!ios7lab_sd_capacity(c->csd, c->high_capacity, &c->sectors, &c->csd_write_protected))
++        return LEO_SD_PROTOCOL;
++
++    c->stage = 10;                      /* CMD7: SELECT_CARD (R1b) */
++    if ((r = command(c, 7, c->rca << 16, CMD_RSP_48_BUSY | CMD_CRCCHK | CMD_IXCHK))) return r;
++    if ((r = wait_data_done(c)) && r != LEO_SD_TIMEOUT) return r;
++
++    c->stage = 11;                      /* CMD16: 512-byte blocks (SDSC) */
++    if (!c->high_capacity &&
++        (r = command(c, 16, 512, CMD_RSP_48 | CMD_CRCCHK | CMD_IXCHK))) return r;
++
++    c->stage = 12;                      /* ACMD6: 4-bit bus */
++    if ((r = app_command(c, 6, 2, CMD_RSP_48 | CMD_CRCCHK | CMD_IXCHK))) return r;
++    wr(c, CONTROL0, rd(c, CONTROL0) | C0_DWIDTH4);
++    c->bus_width = 4;
++
++    c->stage = 13;                      /* default-speed transfer clock */
++    if ((r = set_clock(c, 25000000))) return r;
++    c->stage = 14;
++    return LEO_SD_OK;
++}
++
++static uint32_t card_address(struct rpi3_sd_card *c, uint64_t sector)
++{
++    return c->high_capacity ? (uint32_t)sector : (uint32_t)(sector * 512U);
++}
++
++int rpi3_sd_read_sector(struct rpi3_sd_card *c, uint64_t sector, uint8_t data[512])
++{
++    int r;
++    unsigned i;
++    if (c->faulted) return LEO_SD_FAULTED;
++    if (sector >= c->sectors) return LEO_SD_ARGUMENT;
++    wr(c, BLKSIZECNT, (1U << 16) | 512U);
++    r = command(c, 17, card_address(c, sector),
++                CMD_RSP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA | TM_DAT_READ | TM_BLKCNT_EN);
++    if (r) return r;
++    {
++        uint64_t start = now_us(c);
++        for (;;) {
++            uint32_t irq = rd(c, INTERRUPT);
++            if (irq & INT_ERROR_MASK) { c->interrupt = irq; wr(c, INTERRUPT, irq);
++                                        reset_lines(c, C1_SRST_CMD | C1_SRST_DATA); return LEO_SD_DATA; }
++            if (irq & INT_READ_RDY) { wr(c, INTERRUPT, INT_READ_RDY); break; }
++            if (now_us(c) - start > c->io.timeout_us) return LEO_SD_TIMEOUT;
++        }
++    }
++    for (i = 0; i < 512; i += 4) {
++        uint32_t w = rd(c, DATA);
++        data[i] = (uint8_t)w; data[i + 1] = (uint8_t)(w >> 8);
++        data[i + 2] = (uint8_t)(w >> 16); data[i + 3] = (uint8_t)(w >> 24);
++    }
++    return wait_data_done(c);
++}
++
++int rpi3_sd_write_sector(struct rpi3_sd_card *c, uint64_t sector, const uint8_t data[512])
++{
++    int r;
++    unsigned i;
++    c->write_attempts++;
++    if (c->faulted) return LEO_SD_FAULTED;
++    if (sector >= c->sectors) return LEO_SD_ARGUMENT;
++    wr(c, BLKSIZECNT, (1U << 16) | 512U);
++    r = command(c, 24, card_address(c, sector),
++                CMD_RSP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA | TM_BLKCNT_EN);
++    if (r) return r;
++    {
++        uint64_t start = now_us(c);
++        for (;;) {
++            uint32_t irq = rd(c, INTERRUPT);
++            if (irq & INT_ERROR_MASK) { c->interrupt = irq; wr(c, INTERRUPT, irq);
++                                        reset_lines(c, C1_SRST_CMD | C1_SRST_DATA); return LEO_SD_DATA; }
++            if (irq & INT_WRITE_RDY) { wr(c, INTERRUPT, INT_WRITE_RDY); break; }
++            if (now_us(c) - start > c->io.timeout_us) return LEO_SD_TIMEOUT;
++        }
++    }
++    for (i = 0; i < 512; i += 4) {
++        wr(c, DATA, (uint32_t)data[i] | ((uint32_t)data[i + 1] << 8) |
++                    ((uint32_t)data[i + 2] << 16) | ((uint32_t)data[i + 3] << 24));
++        c->write_words++;
++    }
++    r = wait_data_done(c);
++    if (r == LEO_SD_OK) c->write_completed++;
++    return r;
++}
++#endif /* BOARD_CONFIG_RASPBERRYPI3 */
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.h b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.h
+new file mode 100644
+index 0000000..0281682
+--- /dev/null
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.h
+@@ -0,0 +1,46 @@
++/*
++ * SD card over the Raspberry Pi's Arasan SDHCI controller ("EMMC", at
++ * 0x3f300000), programmed I/O only. Mirrors leo_sdcc.h for the HD2: the
++ * caller supplies register access and timing, results use the LEO_SD_* codes.
++ */
++#ifndef RPI3_SD_H
++#define RPI3_SD_H
++#include <stdint.h>
++#include "leo_sdcc.h"   /* enum leo_sd_result */
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define RPI3_EMMC_PA    0x3f300000U
++#define RPI3_GPIO_PA    0x3f200000U
++
++struct rpi3_sd_io {
++    void *opaque;
++    volatile uint32_t *emmc;            /* mapped controller registers */
++    volatile uint32_t *gpio;            /* mapped GPIO block */
++    uint64_t (*now_ns)(void *);
++    uint32_t base_clock_hz;             /* EMMC clock from the firmware */
++    uint32_t timeout_us;
++};
++
++struct rpi3_sd_card {
++    struct rpi3_sd_io io;
++    uint32_t rca, ocr, cid[4], csd[4];  /* cid/csd: MSW first */
++    uint64_t sectors;
++    int high_capacity, csd_write_protected, faulted;
++    uint32_t clock_hz, bus_width;
++    /* Last failure, for logs and panics. */
++    uint32_t stage, command, status, interrupt;
++    uint32_t write_attempts, write_words, write_completed;
++    int32_t write_result;
++};
++
++void rpi3_sd_init(struct rpi3_sd_card *, const struct rpi3_sd_io *);
++int rpi3_sd_start(struct rpi3_sd_card *);
++int rpi3_sd_read_sector(struct rpi3_sd_card *, uint64_t sector, uint8_t data[512]);
++int rpi3_sd_write_sector(struct rpi3_sd_card *, uint64_t sector, const uint8_t data[512]);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/xnu/iokit/KernelConfigTables.cpp b/xnu/iokit/KernelConfigTables.cpp
+index 733be3a..d49a096 100644
+--- a/xnu/iokit/KernelConfigTables.cpp
++++ b/xnu/iokit/KernelConfigTables.cpp
+@@ -43,7 +43,9 @@ const char * gIOKernelConfigTables =
+ #ifdef __arm__
+ "   {"
+ "     'IOClass'         = AppleARMPE;"
+-#ifdef BOARD_CONFIG_QSD8250_LEO
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++"     'IONameMatch'     = 'brcm,bcm2837';"
++#elif defined(BOARD_CONFIG_QSD8250_LEO)
+ "     'IONameMatch'     = 'qsd8250,htcleo';"
+ #else
+ "     'IONameMatch'     = 'AppleARM';"
+diff --git a/xnu/iokit/conf/files.arm b/xnu/iokit/conf/files.arm
+index 4692a25..b48b16f 100644
+--- a/xnu/iokit/conf/files.arm
++++ b/xnu/iokit/conf/files.arm
+@@ -56,3 +56,7 @@ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_cow.c standard
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_log_format.c standard
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_log_locator.c standard
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_diag_stubs.c standard
++# Raspberry Pi 3 board drivers
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3SD.cpp optional iokitcpp
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3Input.cpp optional iokitcpp
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c standard
+diff --git a/xnu/makedefs/MakeInc.def b/xnu/makedefs/MakeInc.def
+index d083793..f05792e 100644
+--- a/xnu/makedefs/MakeInc.def
++++ b/xnu/makedefs/MakeInc.def
+@@ -121,7 +121,8 @@ endif
+ export SUPPORTED_I386_MACHINE_CONFIGS := DEFAULT
+ export SUPPORTED_X86_64_MACHINE_CONFIGS := DEFAULT
+ export SUPPORTED_ARM_MACHINE_CONFIGS := S5L8920X S5L8922X S5L8930X ARMPBA8 SUN4I OMAP3530 OMAP335X RASPBERRYPI \
+-					OMAP3430_RX51 ARM_RVEB_V6 S5L8720X S5L8900XRB MSM8960_TOUCHPAD IMX53 QSD8250_LEO
++					OMAP3430_RX51 ARM_RVEB_V6 S5L8720X S5L8900XRB MSM8960_TOUCHPAD IMX53 QSD8250_LEO \
++					RASPBERRYPI3
+ export SUPPORTED_ARM64_MACHINE_CONFIGS := DEFAULT VEXPRESS 
+ 
+ #
+@@ -321,6 +322,11 @@ ARCH_FLAGS_ARM_OMAP3430_RX51 = -arch armv7
+ ARCH_FLAGS_ARM_OMAP335X	= -arch armv7
+ ARCH_FLAGS_ARM_ARMPBA8	= -arch armv7
+ ARCH_FLAGS_ARM_QSD8250_LEO = -arch armv7
++ARCH_FLAGS_ARM_RASPBERRYPI3 = -arch armv7
++# The Pi 3B+ target is the HD2 iOS 7 kernel with a different board layer:
++# everything gated on BOARD_CONFIG_QSD8250_LEO (the iOS 7 userland fixes)
++# stays on, and board files check BOARD_CONFIG_RASPBERRYPI3 to swap hardware.
++MACHINE_FLAGS_RASPBERRYPI3 = -DBOARD_CONFIG_QSD8250_LEO=1
+ ARCH_FLAGS_ARM_MSM8960_TOUCHPAD	= -arch armv7
+ ARCH_FLAGS_ARM_RASPBERRYPI	= -arch armv6
+ ARCH_FLAGS_ARM_ARM_RVEB_V6	= -arch armv6
+diff --git a/xnu/osfmk/arm/cpu.c b/xnu/osfmk/arm/cpu.c
+index 1218b40..c4a4666 100644
+--- a/xnu/osfmk/arm/cpu.c
++++ b/xnu/osfmk/arm/cpu.c
+@@ -313,6 +313,8 @@ const struct cpuidtab cpuids[] = {
+      generic_steppings},
+     {CPU_ID_CORTEXA15, CPU_CLASS_CORTEXA, "Cortex A15",
+      generic_steppings},
++    {CPU_ID_CORTEXA53, CPU_CLASS_CORTEXA, "Cortex A53",
++     generic_steppings},
+     {CPU_ID_SCORPION, CPU_CLASS_SCORPION, "Qualcomm Scorpion",
+      generic_steppings},
+ 
+diff --git a/xnu/osfmk/arm/locore.s b/xnu/osfmk/arm/locore.s
+index 73afd65..a78b44e 100644
+--- a/xnu/osfmk/arm/locore.s
++++ b/xnu/osfmk/arm/locore.s
+@@ -140,7 +140,28 @@ map:
+     subs    r12, r12, #_1MB
+     bne     map
+ 
+-#ifdef BOARD_CONFIG_QSD8250_LEO
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    /* Entry-only identity maps for the Raspberry Pi 3: the two sections
++     * that can hold the 768000-byte firmware framebuffer (its address comes
++     * from boot_args) and the section holding the PL011 UART. Same
++     * attributes as the HD2 maps: section, AP=RW, strongly ordered. */
++    LoadConstantToReg(0x402, r8)
++    ldr r7, [r0, BOOT_ARGS_VIDEO_BASE]
++    mov r7, r7, lsr#20
++    mov r7, r7, lsl#20
++    mov r9, #2
++rpi3_identity_fb:
++    add r5, r4, r7, lsr#18
++    orr r2, r7, r8
++    str r2, [r5]
++    add r7, r7, #_1MB
++    subs r9, r9, #1
++    bne rpi3_identity_fb
++    LoadConstantToReg(0x3f200000, r7)
++    add r5, r4, r7, lsr#18
++    orr r2, r7, r8
++    str r2, [r5]
++#elif defined(BOARD_CONFIG_QSD8250_LEO)
+     /* Entry-only device identity maps: validated SMI aperture and MDP.
+      * Type=section/AP=RW; C/B/TEX=0. No inherited TRE remapping is accepted.
+      * Loader zeros all4096 TTB words and checks managedVA disjointness. */
+diff --git a/xnu/osfmk/arm/proc_reg.h b/xnu/osfmk/arm/proc_reg.h
+index 28583cc..9f8a4ae 100644
+--- a/xnu/osfmk/arm/proc_reg.h
++++ b/xnu/osfmk/arm/proc_reg.h
+@@ -157,6 +157,7 @@
+ #define CPU_ID_CORTEXA9R2	0x412fc090
+ #define CPU_ID_CORTEXA9R3	0x413fc090
+ #define CPU_ID_CORTEXA15	0x410fc0f0
++#define CPU_ID_CORTEXA53	0x410fd030 /* Raspberry Pi 3 (BCM2837), in AArch32 */
+ #define CPU_ID_SCORPION	0x510f00f0 /* MIDR revision masked; physical004 rev2 */
+ #define CPU_ID_SA110		0x4401a100
+ #define CPU_ID_SA1100		0x4401a110
+diff --git a/xnu/pexpert/arm/leo_qsd8250_timer.c b/xnu/pexpert/arm/leo_qsd8250_timer.c
+index bd39491..d007c5b 100644
+--- a/xnu/pexpert/arm/leo_qsd8250_timer.c
++++ b/xnu/pexpert/arm/leo_qsd8250_timer.c
+@@ -10,7 +10,8 @@
+ #include <kern/debug.h>
+ #include "leo_qsd8250_timer.h"
+ 
+-#if defined(BOARD_CONFIG_QSD8250_LEO)
++/* HTC HD2 hardware; the Raspberry Pi 3 board supplies its own. */
++#if defined(BOARD_CONFIG_QSD8250_LEO) && !defined(BOARD_CONFIG_RASPBERRYPI3)
+ #define VIC_PA 0xac000000U
+ #define CSR_PA 0xac100000U
+ #define IO_BYTES 4096U
+diff --git a/xnu/pexpert/arm/leo_scanout_row.c b/xnu/pexpert/arm/leo_scanout_row.c
+index b1d62e4..241ccc0 100644
+--- a/xnu/pexpert/arm/leo_scanout_row.c
++++ b/xnu/pexpert/arm/leo_scanout_row.c
+@@ -6,7 +6,8 @@
+  * Contract (IOS7LeoScanoutRow.h): one 320-pixel 32bpp input row becomes
+  * 480 RGB565 output pixels (1.5x horizontal, nearest neighbour).
+  */
+-#if defined(BOARD_CONFIG_QSD8250_LEO)
++/* HTC HD2 hardware; the Raspberry Pi 3 board supplies its own. */
++#if defined(BOARD_CONFIG_QSD8250_LEO) && !defined(BOARD_CONFIG_RASPBERRYPI3)
+ #include <stdint.h>
+ #include "IOS7LeoScanoutRow.h"
+ 
+diff --git a/xnu/pexpert/arm/pe_qsd8250_leo.c b/xnu/pexpert/arm/pe_qsd8250_leo.c
+index 747d6ff..f29ee03 100644
+--- a/xnu/pexpert/arm/pe_qsd8250_leo.c
++++ b/xnu/pexpert/arm/pe_qsd8250_leo.c
+@@ -1,7 +1,8 @@
+ /* iOS-lab owned first-entry-only HTC Leo PE.
+  * Genuine XNU early control flow; no UART, interrupt, timer, SD or UI success
+  * is fabricated. Loader state is revalidated before native RGB565 writes. */
+-#if defined(BOARD_CONFIG_QSD8250_LEO)
++/* HTC HD2 hardware; the Raspberry Pi 3 board supplies its own. */
++#if defined(BOARD_CONFIG_QSD8250_LEO) && !defined(BOARD_CONFIG_RASPBERRYPI3)
+ #include <mach/mach_types.h>
+ #include <mach/host_info.h>
+ #include <pexpert/pexpert.h>
+diff --git a/xnu/pexpert/arm/pe_rpi3.c b/xnu/pexpert/arm/pe_rpi3.c
+new file mode 100644
+index 0000000..014759d
+--- /dev/null
++++ b/xnu/pexpert/arm/pe_rpi3.c
+@@ -0,0 +1,555 @@
++/*
++ * Raspberry Pi 3 Model B+ platform expert for the iOS 7 kernel.
++ *
++ * Drop-in for the HTC HD2's pe_qsd8250_leo.c: same exported functions, same
++ * 480x800 RGB565 screen contract, same staged boot/fatal reporting. What
++ * differs is the hardware behind it:
++ *   - the framebuffer is allocated by the VideoCore firmware (via the boot
++ *     shim) and scanned out continuously, so there is no display controller
++ *     to kick or acknowledge; a write to the framebuffer is on screen;
++ *   - interrupts and the timebase come from rpi3_timer.c;
++ *   - console text also goes to the PL011 UART when "rpi3_uart=1" is given.
++ * The GPU scales the 480x800 framebuffer up to the HDMI mode.
++ */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++#include <mach/mach_types.h>
++#include <mach/host_info.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <pexpert/arm/boot.h>
++#include <pexpert/arm/protos.h>
++#include <pexpert/arm/leo_entry.h>
++#include <machine/machine_routines.h>
++#include <kern/debug.h>
++#include <kern/clock.h>
++#include <mach/vm_param.h>
++#include "rpi3_board.h"
++#include "rpi3_timer.h"
++#include "IOS7LeoDisplayBackend.h"
++#include "leo_scanout.h"
++#include "IOS7LeoDisplayObservation.h"
++#include "IOS7LeoMDPFault.h"
++#include "IOS7LeoMemoryObservation.h"
++
++extern int switch_to_serial_console(void);
++extern host_t host_self(void);
++extern kern_return_t host_statistics64(host_t host, host_flavor_t flavor,
++                                       host_info64_t info,
++                                       mach_msg_type_number_t *count);
++extern uint64_t sane_size;
++extern unsigned int vm_page_free_count, vm_page_free_reserved, vm_page_free_target;
++
++typedef char rpi3_handoff_size[(sizeof(rpi3_handoff) == 128) ? 1 : -1];
++
++static volatile unsigned short *rpi_pixels;   /* 480x800 RGB565 */
++static unsigned int rpi_fb_physical;
++static volatile unsigned int *rpi_uart;       /* PL011, NULL when disabled */
++static unsigned int rpi_uart_wanted;
++
++static unsigned int rpi_stage;
++static volatile unsigned int rpi_final_reason;
++static volatile unsigned int rpi_console_count;
++static volatile char rpi_console[1024];
++static volatile unsigned int rpi_fatal_active;
++static unsigned int rpi_fatal_category;
++static volatile unsigned int rpi_fatal_state[8];
++static volatile unsigned int rpi_graphics_owner;
++static uint64_t rpi_graphics_sequence;
++static volatile LeoMemoryObservation rpi_memory_state;
++static volatile unsigned int rpi_memory_sequence;
++
++/* Presentation counters, reported through the same observation structs the
++ * HD2 logger reads. */
++static volatile uint32_t obs_attempts, obs_rows, obs_last_rows, obs_completed;
++static volatile uint32_t obs_failures, obs_failure_phase;
++static int obs_failed(uint32_t phase)
++{ ++obs_failures; obs_failure_phase = phase; return 0; }
++
++static void sync_writes(void) { __asm__ volatile("dsb sy" ::: "memory"); }
++
++/* ---- UART ------------------------------------------------------------- */
++
++static void rpi_uart_putc(char c)
++{
++    volatile unsigned int *u = rpi_uart;
++    unsigned int spins;
++    if (!u) return;
++    if (c == '\n') rpi_uart_putc('\r');
++    for (spins = 0; spins < 100000U; spins++)
++        if (!(u[RPI3_UART_FR / 4] & RPI3_UART_FR_TXFF)) break;
++    u[RPI3_UART_DR / 4] = (unsigned char)c;
++}
++
++/* ---- Text and digits, as on the HD2 (2x scaled 4x7 / 5x7 glyphs) ------ */
++
++static const unsigned char rpi_hex[16][7] = {
++ {6,9,9,9,9,9,6},{2,6,2,2,2,2,7},{6,9,1,2,4,8,15},{14,1,1,6,1,1,14},
++ {2,6,10,10,15,2,2},{15,8,8,14,1,1,14},{6,8,8,14,9,9,6},{15,1,2,2,4,4,4},
++ {6,9,9,6,9,9,6},{6,9,9,7,1,1,6},{6,9,9,15,9,9,9},{14,9,9,14,9,9,14},
++ {7,8,8,8,8,8,7},{14,9,9,9,9,9,14},{15,8,8,14,8,8,15},{15,8,8,14,8,8,8}
++};
++static const unsigned char rpi_alpha[26][7] = {
++ {14,17,17,31,17,17,17},{30,17,17,30,17,17,30},{15,16,16,16,16,16,15},
++ {30,17,17,17,17,17,30},{31,16,16,30,16,16,31},{31,16,16,30,16,16,16},
++ {15,16,16,19,17,17,15},{17,17,17,31,17,17,17},{14,4,4,4,4,4,14},
++ {1,1,1,1,17,17,14},{17,18,20,24,20,18,17},{16,16,16,16,16,16,31},
++ {17,27,21,21,17,17,17},{17,25,21,19,17,17,17},{14,17,17,17,17,17,14},
++ {30,17,17,30,16,16,16},{14,17,17,17,21,18,13},{30,17,17,30,20,18,17},
++ {15,16,16,14,1,1,30},{31,4,4,4,4,4,4},{17,17,17,17,17,17,14},
++ {17,17,17,17,17,10,4},{17,17,17,21,21,27,17},{17,17,10,4,10,17,17},
++ {17,17,10,4,4,4,4},{31,1,2,4,8,16,31}
++};
++
++static void plot2x(unsigned int x, unsigned int y, unsigned short color)
++{
++    if (x + 1 >= RPI3_FB_WIDTH || y + 1 >= RPI3_FB_HEIGHT) return;
++    rpi_pixels[y * RPI3_FB_WIDTH + x] = color;
++    rpi_pixels[y * RPI3_FB_WIDTH + x + 1] = color;
++    rpi_pixels[(y + 1) * RPI3_FB_WIDTH + x] = color;
++    rpi_pixels[(y + 1) * RPI3_FB_WIDTH + x + 1] = color;
++}
++
++static void draw_digit(unsigned int digit, unsigned int x, unsigned int y,
++                       unsigned short color)
++{
++    unsigned int row, bit;
++    for (row = 0; row < 7; row++)
++        for (bit = 0; bit < 4; bit++)
++            if (rpi_hex[digit & 15][row] & (8U >> bit))
++                plot2x(x + bit * 2, y + row * 2, color);
++}
++
++static void draw_number(unsigned int value, unsigned int digits, unsigned int y,
++                        unsigned short color)
++{
++    unsigned int i;
++    for (i = 0; i < digits; i++)
++        draw_digit((value >> ((digits - i - 1) * 4)) & 15, 8 + i * 10, y, color);
++}
++
++static void draw_text(const char *s, unsigned int limit, unsigned int x,
++                      unsigned int y)
++{
++    static const unsigned char dot[7] = {0,0,0,0,0,12,12};
++    static const unsigned char colon[7] = {0,12,12,0,12,12,0};
++    static const unsigned char dash[7] = {0,0,0,31,0,0,0};
++    static const unsigned char slash[7] = {1,2,2,4,8,8,16};
++    static const unsigned char under[7] = {0,0,0,0,0,0,31};
++    static const unsigned char left[7] = {2,4,8,8,8,4,2};
++    static const unsigned char right[7] = {8,4,2,2,2,4,8};
++    static const unsigned char question[7] = {14,17,1,2,4,0,4};
++    unsigned int n, row, bit;
++    for (n = 0; n < limit; n++) {
++        unsigned char c = (unsigned char)s[n];
++        const unsigned char *glyph;
++        if (!c) break;
++        if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 'a' + 'A');
++        if (c == ' ') continue;
++        if (c >= '0' && c <= '9') { draw_digit(c - '0', x + n * 12, y, 0xffff); continue; }
++        glyph = (c >= 'A' && c <= 'Z') ? rpi_alpha[c - 'A'] :
++                c == '.' ? dot : c == ':' ? colon : c == '-' ? dash : c == '/' ? slash :
++                c == '_' ? under : c == '(' ? left : c == ')' ? right : question;
++        for (row = 0; row < 7; row++)
++            for (bit = 0; bit < 5; bit++)
++                if (glyph[row] & (16U >> bit))
++                    plot2x(x + n * 12 + bit * 2, y + row * 2, 0xffff);
++    }
++}
++
++static void render_stage(unsigned int address, unsigned int stage)
++{
++    unsigned int x, y;
++    if (!rpi_pixels) return;
++    for (y = 8; y < 48; y++)
++        for (x = 8; x < 88; x++)
++            rpi_pixels[y * RPI3_FB_WIDTH + x] = 0;
++    draw_number(address, 8, 8, 0x07ff);
++    draw_number(stage, 4, 28, 0xffff);
++    sync_writes();
++}
++
++static unsigned int callsite(void *returned)
++{ return (((unsigned int)returned) & ~1U) - 4U; }
++
++/* ---- Fatal reporting (same layout as the HD2's red screen) ------------ */
++
++int ios7leo_fatal_report(unsigned int category, unsigned int site,
++                         unsigned int pc, unsigned int lr, unsigned int far,
++                         unsigned int fsr, unsigned int valid_mask,
++                         const char *message)
++{
++    unsigned int x, y, n, hash = 2166136261U;
++    const char *labels[4] = {"PC", "LR", "FAR", "FSR"};
++    unsigned int values[4] = {pc, lr, far, fsr};
++    if (rpi_fatal_active) return 0;
++    rpi_fatal_active = 1;
++    if (gPESocDispatch.uart_putc == ios7leo_debug_putc)
++        (void)switch_to_serial_console();
++    rpi_fatal_category = category;
++    rpi_fatal_state[0] = category; rpi_fatal_state[1] = rpi_stage;
++    rpi_fatal_state[2] = valid_mask & 15U; rpi_fatal_state[3] = pc;
++    rpi_fatal_state[4] = lr; rpi_fatal_state[5] = far; rpi_fatal_state[6] = fsr;
++    if (!rpi_pixels) return 1;
++    for (y = 0; y < RPI3_FB_HEIGHT; y++)
++        for (x = 0; x < RPI3_FB_WIDTH; x++)
++            rpi_pixels[y * RPI3_FB_WIDTH + x] = 0xf800;
++    render_stage(site, category);
++    draw_text("RETURN", 6, 120, 8);
++    draw_text("XNU FATAL", 9, 8, 60);
++    draw_number(rpi_stage, 8, 90, 0xffff);
++    draw_text("STAGE", 5, 120, 90);
++    draw_number(valid_mask & 15U, 8, 120, 0xffff);
++    draw_text("VALID MASK", 10, 120, 120);
++    for (n = 0; n < 4; n++) {
++        draw_number((valid_mask & (1U << n)) ? values[n] : 0xffffffffU, 8, 150 + n * 30, 0xffff);
++        draw_text(labels[n], 3, 120, 150 + n * 30);
++    }
++    if (message) {
++        for (n = 0; n < 64 && message[n]; n++)
++            hash = (hash ^ (unsigned char)message[n]) * 16777619U;
++        draw_text("FORMAT", 6, 120, 290);
++        draw_number(hash, 8, 290, 0xffff);
++        rpi_fatal_state[7] = hash;
++        draw_text(message, 38, 8, 320);
++    }
++    sync_writes();
++    return 1;
++}
++
++static volatile unsigned int panic_text_mode, panic_text_len, panic_text_truncated;
++static char panic_text[384];
++static unsigned int panic_reason, panic_reason_known;
++
++int ios7leo_panic_text_begin(unsigned int reason, unsigned int reason_known,
++                             unsigned int primary)
++{
++    if (!primary || !rpi_fatal_active || panic_text_mode ||
++        (rpi_fatal_category != 0xf101U && rpi_fatal_category != 0xf103U))
++        return 0;
++    panic_text_mode = 1;
++    panic_reason = reason;
++    panic_reason_known = reason_known;
++    return 1;
++}
++
++void ios7leo_panic_text_putc(char c)
++{
++    extern void ios7leo_log_putc(char);
++    if (panic_text_mode != 1) return;
++    ios7leo_log_putc(c);
++    rpi_uart_putc(c);
++    if (panic_text_len < sizeof(panic_text)) panic_text[panic_text_len++] = c;
++    else panic_text_truncated = 1;
++}
++
++void ios7leo_panic_text_end(void)
++{
++    unsigned int x, y, line, n, at = 0;
++    char part[39];
++    if (panic_text_mode != 1) return;
++    panic_text_mode = 2;
++    if (!rpi_pixels) return;
++    for (y = 280; y < 620; y++)
++        for (x = 0; x < RPI3_FB_WIDTH; x++)
++            rpi_pixels[y * RPI3_FB_WIDTH + x] = 0xf800;
++    draw_text("FORMATTED PANIC", 15, 8, 280);
++    draw_number(panic_reason_known ? panic_reason : 0xffffffffU, 8, 310, 0xffff);
++    draw_text("CONTEXT REASON", 14, 120, 310);
++    for (line = 0; line < 12 && at < panic_text_len; line++) {
++        for (n = 0; n < 38 && at < panic_text_len && panic_text[at] != '\n'; at++) {
++            char c = panic_text[at];
++            if (c != '\r') part[n++] = c;
++        }
++        part[n] = 0;
++        draw_text(part, n, 8, 340 + line * 20);
++        if (at < panic_text_len && panic_text[at] == '\n') at++;
++    }
++    if (at < panic_text_len || panic_text_truncated)
++        draw_text("TEXT TRUNCATED", 14, 8, 600);
++    sync_writes();
++}
++
++/* ---- Boot progress ---------------------------------------------------- */
++
++void ios7leo_kernel_continuing(void) {}
++
++void ios7leo_timer_observe(unsigned int ticks, unsigned int irq_count)
++{
++    (void)ticks; (void)irq_count; /* scanout is continuous; nothing to refresh */
++}
++
++void __attribute__((noreturn)) ios7leo_final_boundary(unsigned int reason)
++{
++    rpi_final_reason = reason;
++    if (reason)
++        ios7leo_fatal_report(0xf000U | (reason & 0xfffU),
++                             callsite(__builtin_return_address(0)),
++                             0, 0, 0, 0, 0, "ENTRY GUARD");
++    __asm__ volatile("cpsid if" ::: "memory");
++    for (;;) __asm__ volatile("dsb sy\n\twfi" ::: "memory");
++}
++
++/* ---- Memory observation ----------------------------------------------- */
++
++void ios7leo_memory_observe(LeoMemoryObservation *out)
++{
++    boolean_t enabled;
++    vm_statistics64_data_t stat;
++    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++    if (!out || out->version != IOS7_LEO_MEMORY_OBS_VERSION) return;
++    *out = *(const LeoMemoryObservation *)&rpi_memory_state;
++    enabled = ml_set_interrupts_enabled(FALSE);
++    out->managed_bytes = sane_size;
++    out->free_pages = vm_page_free_count;
++    out->free_reserved = vm_page_free_reserved;
++    out->free_target = vm_page_free_target;
++    if (host_statistics64(host_self(), HOST_VM_INFO64, (host_info64_t)&stat, &count) == KERN_SUCCESS &&
++        count >= HOST_VM_INFO64_COUNT) {
++        out->pageins = stat.pageins;
++        out->pageouts = stat.pageouts;
++        out->faults = stat.faults;
++        out->known |= LEO_MEMORY_KNOWN_VM_COUNTERS;
++    }
++    ml_set_interrupts_enabled(enabled);
++}
++
++/* ---- Display ---------------------------------------------------------- */
++
++static int video_ok(const boot_args *args)
++{
++    unsigned long long ramend = (unsigned long long)args->physBase + args->memSize;
++    unsigned long long fbend = (unsigned long long)args->Video.v_baseAddr + RPI3_FB_BYTES;
++    return args->Revision == 1 && args->Version == 2 && args->virtBase == 0x80000000U &&
++        args->memSize && !(args->physBase & 0xfffffU) && !(args->memSize & 0xfffffU) &&
++        args->memSize <= 0x40000000U && ramend <= RPI3_PERIPHERAL_BASE &&
++        args->topOfKernelData >= args->physBase && !(args->topOfKernelData & 0x3fffU) &&
++        args->machineType == RPI3_MACHINE_TYPE &&
++        args->Video.v_width == RPI3_FB_WIDTH && args->Video.v_height == RPI3_FB_HEIGHT &&
++        args->Video.v_rowBytes == RPI3_FB_ROW_BYTES && args->Video.v_depth == 16 &&
++        !(args->Video.v_baseAddr & 3U) &&
++        /* The framebuffer is VideoCore memory: above ARM RAM, below MMIO. */
++        args->Video.v_baseAddr >= ramend && fbend <= RPI3_PERIPHERAL_BASE;
++}
++
++int ios7leo_display_ready(void)
++{
++    return rpi_pixels && !rpi_fatal_active &&
++        PE_state.video.v_width == RPI3_FB_WIDTH && PE_state.video.v_height == RPI3_FB_HEIGHT &&
++        PE_state.video.v_rowBytes == RPI3_FB_ROW_BYTES && PE_state.video.v_depth == 16;
++}
++
++int ios7leo_display_completed(uint64_t sequence)
++{
++    return sequence && sequence <= rpi_graphics_sequence && !rpi_fatal_active;
++}
++
++void ios7leo_mdp_observe(LeoMDPFaultObservation *out)
++{
++    if (!out || out->version != IOS7_LEO_MDP_OBS_VERSION) return;
++    bzero(out, sizeof(*out));
++    out->version = IOS7_LEO_MDP_OBS_VERSION;
++    out->known = LEO_MDP_KNOWN_LIVE;   /* no DMA engine: never pending/latched */
++}
++
++/* Source column/row for each framebuffer pixel: the iOS surface is
++ * LEO_RENDER_WIDTH x LEO_RENDER_HEIGHT (320x533), shown at 1.5x. */
++static uint16_t src_x[RPI3_FB_WIDTH], src_y[RPI3_FB_HEIGHT];
++
++static void scale_tables_init(void)
++{
++    unsigned int i;
++    for (i = 0; i < RPI3_FB_WIDTH; i++)
++        src_x[i] = (uint16_t)((i * LEO_RENDER_WIDTH) / RPI3_FB_WIDTH);
++    for (i = 0; i < RPI3_FB_HEIGHT; i++)
++        src_y[i] = (uint16_t)((i * LEO_RENDER_HEIGHT) / RPI3_FB_HEIGHT);
++}
++
++static void copy_row(volatile uint16_t *out, const uint8_t *pixels, uint32_t format)
++{
++    /* 'BGRA' bytes are B,G,R,A; 'RGBA' bytes are R,G,B,A. */
++    const unsigned int r_at = (format == 0x42475241U) ? 2 : 0;
++    const unsigned int b_at = 2 - r_at;
++    unsigned int x;
++    for (x = 0; x < RPI3_FB_WIDTH; x++) {
++        const uint8_t *p = pixels + (uint32_t)src_x[x] * 4U;
++        out[x] = (uint16_t)(((p[r_at] >> 3) << 11) | ((p[1] >> 2) << 5) | (p[b_at] >> 3));
++    }
++}
++
++int ios7leo_display_present(const uint8_t *pixels, uint32_t bytes, uint32_t row,
++                            uint32_t format, uint64_t *completed_sequence)
++{
++    unsigned int y;
++    ++obs_attempts;
++    obs_last_rows = 0;
++    if (!pixels || !completed_sequence || !leo_scanout_geometry(bytes, row, format))
++        return obs_failed(1);
++    if (!ios7leo_display_ready()) return obs_failed(2);
++    if (!rpi_graphics_owner) {
++        boolean_t enabled = ml_set_interrupts_enabled(FALSE);
++        (void)switch_to_serial_console();  /* stop text console drawing */
++        rpi_graphics_owner = 1;
++        ml_set_interrupts_enabled(enabled);
++    }
++    for (y = 0; y < RPI3_FB_HEIGHT; y++) {
++        /* Rows are short; masking per row keeps a fatal painter from
++         * interleaving with a half-written row, as on the HD2. */
++        boolean_t enabled = ml_set_interrupts_enabled(FALSE);
++        if (rpi_fatal_active) { ml_set_interrupts_enabled(enabled); return obs_failed(4); }
++        copy_row(rpi_pixels + y * RPI3_FB_WIDTH, pixels + (uint32_t)src_y[y] * row, format);
++        ++obs_rows; ++obs_last_rows;
++        ml_set_interrupts_enabled(enabled);
++    }
++    sync_writes();
++    ++rpi_graphics_sequence;
++    if (!rpi_graphics_sequence) ++rpi_graphics_sequence;
++    ++obs_completed;
++    *completed_sequence = rpi_graphics_sequence;
++    return 1;
++}
++
++void ios7leo_scanout_observe(LeoDisplayObservation *out)
++{
++    boolean_t enabled;
++    if (!out || out->version != 1) return;
++    enabled = ml_set_interrupts_enabled(FALSE);
++    out->known |= LEO_OBS_PE_COUNTERS;
++    out->present_attempts = obs_attempts;
++    out->conversion_rows = obs_rows;
++    out->last_conversion_rows = obs_last_rows;
++    out->completed = obs_completed;
++    out->failures = obs_failures;
++    out->last_failure = obs_failure_phase;
++    out->graphics_owner = rpi_graphics_owner;
++    out->fatal_active = rpi_fatal_active;
++    out->completed_sequence_before = rpi_graphics_sequence;
++    out->completed_sequence_after = rpi_graphics_sequence;
++    ml_set_interrupts_enabled(enabled);
++}
++
++/* ---- Boot stages ------------------------------------------------------ */
++
++static int cmdline_has(const boot_args *args, const char *word)
++{
++    const char *s = args->CommandLine;
++    unsigned int i, n = 0;
++    while (word[n]) n++;
++    for (i = 0; i + n <= BOOT_LINE_LENGTH && s[i]; i++) {
++        unsigned int k = 0;
++        if (i && s[i - 1] != ' ') continue;
++        while (k < n && s[i + k] == word[k]) k++;
++        if (k == n && (s[i + n] == ' ' || s[i + n] == 0)) return 1;
++    }
++    return 0;
++}
++
++/* arm_init calls this at stages 6, 7 and 8 before the kernel's own VM is up
++ * (locore identity-maps the framebuffer and UART sections for this window),
++ * then at 9 from PE_init_SocSupport_stub and 10 after arm_vm_init. */
++void ios7leo_checkpoint(boot_args *args, unsigned int stage)
++{
++    if (rpi_fatal_active) return;
++    if (stage == 6) {
++        rpi_uart_wanted = cmdline_has(args, "rpi3_uart=1");
++        if (rpi_uart_wanted) rpi_uart = (volatile unsigned int *)RPI3_UART0_PA;
++        if (!video_ok(args)) ios7leo_final_boundary(1);
++        rpi_fb_physical = args->Video.v_baseAddr;
++        rpi_pixels = (volatile unsigned short *)rpi_fb_physical;
++    }
++    if (stage != rpi_stage + 1U || stage < 6 || stage > 10) {
++        if (!(stage == 6 && rpi_stage == 0)) ios7leo_final_boundary(3);
++    }
++    rpi_stage = stage;
++    render_stage(callsite(__builtin_return_address(0)), 0xd000U | stage);
++}
++
++void ios7leo_forget_early_maps(void)
++{
++    rpi_pixels = 0;
++    rpi_uart = 0;
++}
++
++void ios7leo_debug_putc(char c)
++{
++    if (rpi_console_count < sizeof(rpi_console)) rpi_console[rpi_console_count++] = c;
++    rpi_uart_putc(c);
++}
++
++static int rpi_getc(void)
++{
++    volatile unsigned int *u = rpi_uart;
++    if (!u || (u[RPI3_UART_FR / 4] & RPI3_UART_FR_RXFE)) return -1;
++    return (int)(u[RPI3_UART_DR / 4] & 0xffU);
++}
++
++static void rpi_uart_init(void) {}
++
++static unsigned int rpi_emmc_clock_hz;
++unsigned int rpi3_emmc_clock_hz(void) { return rpi_emmc_clock_hz; }
++
++void PE_init_SocSupport_stub(void)
++{
++    DTEntry chosen;
++    rpi3_handoff *h = 0;
++    unsigned int size = 0;
++    boot_args *args = (boot_args *)PE_state.bootArgs;
++    vm_offset_t fb;
++
++    if (!video_ok(args) || DTLookupEntry(0, "/chosen", &chosen) != kSuccess ||
++        DTGetProperty(chosen, RPI3_HANDOFF_PROPERTY, (void **)&h, &size) != kSuccess ||
++        size != sizeof(rpi3_handoff) || !h || h->magic != RPI3_HANDOFF_MAGIC ||
++        h->version != RPI3_HANDOFF_VERSION || h->bytes != sizeof(rpi3_handoff) ||
++        h->fb_physical != args->Video.v_baseAddr || h->fb_pitch != RPI3_FB_ROW_BYTES ||
++        h->fb_width != RPI3_FB_WIDTH || h->fb_height != RPI3_FB_HEIGHT || h->fb_depth != 16 ||
++        h->memory_base != args->physBase || h->memory_bytes != args->memSize ||
++        h->top_of_kernel_data != args->topOfKernelData)
++        ios7leo_final_boundary(4);
++
++    rpi_emmc_clock_hz = h->emmc_clock_hz;
++    bzero((void *)&rpi_memory_state, sizeof(rpi_memory_state));
++    rpi_memory_state.version = IOS7_LEO_MEMORY_OBS_VERSION;
++    rpi_memory_state.status = LEO_MEMORY_STATUS_OK;
++    rpi_memory_state.bank_count = 1;
++    rpi_memory_state.banks[0].base = 0;
++    rpi_memory_state.banks[0].bytes = h->arm_memory_bytes;
++    rpi_memory_state.selected_base = args->physBase;
++    rpi_memory_state.selected_bytes = args->memSize;
++    rpi_memory_state.known = LEO_MEMORY_KNOWN_ATAG;
++    rpi_memory_state.sequence = ++rpi_memory_sequence;
++
++    fb = ml_io_map(rpi_fb_physical, RPI3_FB_BYTES);
++    if (!fb) ios7leo_final_boundary(5);
++    rpi_pixels = (volatile unsigned short *)fb;
++    if (rpi_uart_wanted) rpi_uart = (volatile unsigned int *)ml_io_map(RPI3_UART0_PA, PAGE_SIZE);
++    scale_tables_init();
++
++    PE_state.video.v_baseAddr = fb;
++    PE_state.video.v_rowBytes = RPI3_FB_ROW_BYTES;
++    PE_state.video.v_width = RPI3_FB_WIDTH;
++    PE_state.video.v_height = RPI3_FB_HEIGHT;
++    PE_state.video.v_depth = 16;
++
++    gPESocDispatch.uart_putc = ios7leo_debug_putc;
++    gPESocDispatch.uart_getc = rpi_getc;
++    gPESocDispatch.uart_init = rpi_uart_init;
++    gPESocDispatch.interrupt_init = Rpi3_interrupt_init;
++    gPESocDispatch.timebase_init = Rpi3_timebase_init;
++    gPESocDispatch.handle_interrupt = Rpi3_handle_interrupt;
++    gPESocDispatch.get_timebase = Rpi3_get_timebase;
++    gPESocDispatch.timer_value = Rpi3_timer_value;
++    gPESocDispatch.timer_enabled = Rpi3_timer_enabled;
++    {
++        /* The generic text console owns the screen until iOS presents. */
++        PE_Video console_video = PE_state.video;
++        console_video.v_baseAddr = rpi_fb_physical | 1U;
++        console_video.v_baseAddrHigh = 0;
++        console_video.v_offset = 0;
++        console_video.v_length = RPI3_FB_BYTES;
++        console_video.v_scale = kPEScaleFactor1x;
++        initialize_screen(&console_video, kPETextMode);
++    }
++    ios7leo_checkpoint(args, 9);
++    __asm__ volatile("" ::: "memory");
++}
++
++#endif /* BOARD_CONFIG_RASPBERRYPI3 */
+diff --git a/xnu/pexpert/arm/rpi3_board.h b/xnu/pexpert/arm/rpi3_board.h
+new file mode 100644
+index 0000000..8b3b807
+--- /dev/null
++++ b/xnu/pexpert/arm/rpi3_board.h
+@@ -0,0 +1,84 @@
++/*
++ * Raspberry Pi 3 Model B+ (BCM2837B0) board constants, 32-bit (AArch32) view.
++ *
++ * The Pi 3 runs this kernel the way the HTC HD2 port does: one CPU, one
++ * interrupt source (a free-running timer compare), a firmware-allocated
++ * framebuffer. Register layouts are from the BCM2835 ARM Peripherals manual
++ * and the BCM2836 "ARM local peripherals" note; BCM2837 keeps both at the
++ * same addresses as BCM2836 in 32-bit mode.
++ */
++#ifndef PEXPERT_ARM_RPI3_BOARD_H
++#define PEXPERT_ARM_RPI3_BOARD_H
++
++#define RPI3_PERIPHERAL_BASE    0x3f000000U
++#define RPI3_PERIPHERAL_BYTES   0x01000000U
++
++/* System timer: free-running 64-bit counter at 1 MHz, four 32-bit compares.
++ * Compares 0 and 2 belong to the VideoCore; 1 and 3 are free for the ARM. */
++#define RPI3_SYSTIMER_PA        (RPI3_PERIPHERAL_BASE + 0x003000U)
++#define RPI3_SYSTIMER_CS        0x00U   /* match flags, write 1 to clear */
++#define RPI3_SYSTIMER_CLO       0x04U
++#define RPI3_SYSTIMER_CHI       0x08U
++#define RPI3_SYSTIMER_C3        0x18U
++#define RPI3_SYSTIMER_M3        (1U << 3)
++#define RPI3_SYSTIMER_HZ        1000000U
++
++/* VideoCore/ARM interrupt controller ("armctrl"). GPU IRQ n<32 is bit n of
++ * the bank-1 registers; system timer compare 3 is GPU IRQ 3. */
++#define RPI3_ARMCTRL_PA         (RPI3_PERIPHERAL_BASE + 0x00b000U)
++#define RPI3_ARMCTRL_OFFSET     0x200U
++#define RPI3_IRQ_BASIC_PENDING  0x00U
++#define RPI3_IRQ_PENDING_1      0x04U
++#define RPI3_IRQ_PENDING_2      0x08U
++#define RPI3_FIQ_CONTROL        0x0cU
++#define RPI3_ENABLE_IRQS_1      0x10U
++#define RPI3_ENABLE_IRQS_2      0x14U
++#define RPI3_ENABLE_BASIC       0x18U
++#define RPI3_DISABLE_IRQS_1     0x1cU
++#define RPI3_DISABLE_IRQS_2     0x20U
++#define RPI3_DISABLE_BASIC      0x24U
++#define RPI3_IRQ_SYSTIMER3      3U
++
++/* PL011 UART0 (GPIO 14/15 when Bluetooth is moved off it). Debug only. */
++#define RPI3_UART0_PA           (RPI3_PERIPHERAL_BASE + 0x201000U)
++#define RPI3_UART_DR            0x00U
++#define RPI3_UART_FR            0x18U
++#define RPI3_UART_FR_TXFF       (1U << 5)
++#define RPI3_UART_FR_RXFE       (1U << 4)
++
++/* Display contract shared with the HD2 code: the boot shim asks the firmware
++ * for this exact 16bpp framebuffer, and the GPU scales it to the HDMI mode. */
++#define RPI3_FB_WIDTH           480U
++#define RPI3_FB_HEIGHT          800U
++#define RPI3_FB_ROW_BYTES       960U
++#define RPI3_FB_BYTES           (RPI3_FB_ROW_BYTES * RPI3_FB_HEIGHT)
++
++/* Machine type the shim writes into boot_args (Linux's BCM2709 number). */
++#define RPI3_MACHINE_TYPE       3138U
++
++/* Handoff from the boot shim, published as /chosen/rpi3-handoff. */
++#define RPI3_HANDOFF_MAGIC      0x33495052U /* "RPI3" */
++#define RPI3_HANDOFF_VERSION    1U
++#define RPI3_HANDOFF_PROPERTY   "rpi3-handoff"
++typedef struct rpi3_handoff {
++    unsigned int magic, version, bytes, flags;
++    unsigned int entry_cpsr, entry_sctlr;       /* as the shim found the CPU */
++    unsigned int board_revision, arm_memory_bytes;
++    unsigned int fb_physical, fb_bytes, fb_pitch, fb_width, fb_height, fb_depth;
++    unsigned int display_width, display_height; /* HDMI mode, 0 if unknown */
++    unsigned int memory_base, memory_bytes, top_of_kernel_data;
++    unsigned int shim_start, shim_end, payload_start, payload_end;
++    unsigned int emmc_clock_hz;                 /* SDHCI base clock */
++    unsigned int reserved[8];
++} rpi3_handoff;
++
++/* Values from the handoff for drivers (pe_rpi3.c). */
++#ifdef __cplusplus
++extern "C" {
++#endif
++unsigned int rpi3_emmc_clock_hz(void);
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PEXPERT_ARM_RPI3_BOARD_H */
+diff --git a/xnu/pexpert/arm/rpi3_timer.c b/xnu/pexpert/arm/rpi3_timer.c
+new file mode 100644
+index 0000000..1d8618f
+--- /dev/null
++++ b/xnu/pexpert/arm/rpi3_timer.c
+@@ -0,0 +1,192 @@
++/*
++ * Raspberry Pi 3 interrupt controller and timebase for the iOS 7 kernel.
++ *
++ * Follows the contract of the HTC HD2's leo_qsd8250_timer.c: a single CPU,
++ * one enabled interrupt (a timer compare) and a free-running hardware counter
++ * as the timebase. Here the counter is the BCM283x system timer (1 MHz, 64-bit)
++ * and the compare is channel 3, which reaches the ARM as GPU IRQ 3 through the
++ * armctrl block. The firmware leaves GPU interrupts routed to core 0's IRQ line.
++ */
++#include <mach/mach_types.h>
++#include <mach/arm/thread_status.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm/protos.h>
++#include <machine/machine_routines.h>
++#include <kern/debug.h>
++#include "rpi3_board.h"
++#include "rpi3_timer.h"
++
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++
++extern void rtc_configure(uint64_t hz);
++extern void rtclock_intr(arm_saved_state_t *regs);
++extern void ios7leo_timer_observe(uint32_t raw_ticks, uint32_t irq_count);
++
++uint64_t clock_decrementer;
++
++/* Reprogramming the compare takes a few bus cycles; never schedule closer. */
++#define MIN_MATCH_TICKS     8U
++#define MAX_MATCH_TICKS     0x7fffffffU
++
++static vm_offset_t armctrl, systimer;
++static uint32_t controller_ready, timebase_ready, armed;
++static uint32_t irq_count, last_irq_counter, spurious_irq_count;
++
++static uint32_t rd(vm_offset_t base, uint32_t offset)
++{
++    return *(volatile uint32_t *)(base + offset);
++}
++
++static void wr(vm_offset_t base, uint32_t offset, uint32_t value)
++{
++    *(volatile uint32_t *)(base + offset) = value;
++}
++
++static void drain(void) { __asm__ volatile("dsb sy" ::: "memory"); }
++
++/* CHI:CLO read with a carry check, as the counter keeps running. */
++static uint64_t counter64(void)
++{
++    uint32_t hi, lo, check;
++    do {
++        hi = rd(systimer, RPI3_SYSTIMER_CHI);
++        lo = rd(systimer, RPI3_SYSTIMER_CLO);
++        check = rd(systimer, RPI3_SYSTIMER_CHI);
++    } while (hi != check);
++    return ((uint64_t)hi << 32) | lo;
++}
++
++void Rpi3_interrupt_init(void)
++{
++    boolean_t was_enabled = ml_set_interrupts_enabled(FALSE);
++    if (controller_ready) { ml_set_interrupts_enabled(was_enabled); return; }
++
++    vm_offset_t page = ml_io_map(RPI3_ARMCTRL_PA, PAGE_SIZE);
++    systimer = ml_io_map(RPI3_SYSTIMER_PA, PAGE_SIZE);
++    if (!page || !systimer)
++        panic("Rpi3 armctrl/system timer IO mapping failed");
++    armctrl = page + RPI3_ARMCTRL_OFFSET;
++
++    /* Nothing reaches the CPU until the timebase asks for its one source. */
++    wr(armctrl, RPI3_FIQ_CONTROL, 0);
++    wr(armctrl, RPI3_DISABLE_IRQS_1, 0xffffffffU);
++    wr(armctrl, RPI3_DISABLE_IRQS_2, 0xffffffffU);
++    wr(armctrl, RPI3_DISABLE_BASIC, 0xffffffffU);
++    drain();
++    controller_ready = 1;
++    ml_set_interrupts_enabled(was_enabled);
++}
++
++void Rpi3_timebase_init(void)
++{
++    uint32_t before, after, i;
++    boolean_t was_enabled = ml_set_interrupts_enabled(FALSE);
++    if (!controller_ready) panic("Rpi3 timebase before interrupt controller");
++    if (timebase_ready) { ml_set_interrupts_enabled(was_enabled); return; }
++
++    wr(armctrl, RPI3_DISABLE_IRQS_1, 1U << RPI3_IRQ_SYSTIMER3);
++    wr(systimer, RPI3_SYSTIMER_CS, RPI3_SYSTIMER_M3);
++    drain();
++
++    /* The counter is free-running from power-on; just confirm it moves. */
++    before = rd(systimer, RPI3_SYSTIMER_CLO);
++    after = before;
++    for (i = 0; i < 1000000U && after == before; i++)
++        after = rd(systimer, RPI3_SYSTIMER_CLO);
++    if (after == before) panic("Rpi3 system timer did not advance");
++
++    timebase_ready = 1;
++    clock_decrementer = RPI3_SYSTIMER_HZ / 1000U;   /* 1 ms tick */
++    gPEClockFrequencyInfo.timebase_frequency_hz = RPI3_SYSTIMER_HZ;
++    gPEClockFrequencyInfo.dec_clock_rate_hz = RPI3_SYSTIMER_HZ;
++    rtc_configure(RPI3_SYSTIMER_HZ);
++    Rpi3_timer_enabled(TRUE);
++    ml_set_interrupts_enabled(was_enabled);
++}
++
++void Rpi3_timer_enabled(int enable)
++{
++    uint32_t ticks, attempt, now, match;
++    uint64_t requested;
++    boolean_t was_enabled = ml_set_interrupts_enabled(FALSE);
++    if (!timebase_ready) panic("Rpi3 timer before timebase initialization");
++
++    wr(armctrl, RPI3_DISABLE_IRQS_1, 1U << RPI3_IRQ_SYSTIMER3);
++    wr(systimer, RPI3_SYSTIMER_CS, RPI3_SYSTIMER_M3);
++    armed = 0;
++    drain();
++
++    requested = clock_decrementer;
++    if (!enable || requested == ~0ULL) {
++        ml_set_interrupts_enabled(was_enabled);
++        return;
++    }
++    ticks = requested > MAX_MATCH_TICKS ? MAX_MATCH_TICKS : (uint32_t)requested;
++    if (ticks < MIN_MATCH_TICKS) ticks = MIN_MATCH_TICKS;
++
++    /* The compare only fires on equality, so a match written into the past
++     * would wait a full 71-minute wrap. Re-read after writing and retry if
++     * the counter got too close. */
++    for (attempt = 0; attempt < 4U; attempt++) {
++        now = rd(systimer, RPI3_SYSTIMER_CLO);
++        match = now + ticks;
++        wr(systimer, RPI3_SYSTIMER_C3, match);
++        drain();
++        if ((int32_t)(match - rd(systimer, RPI3_SYSTIMER_CLO)) > (int32_t)(MIN_MATCH_TICKS / 2)) {
++            armed = 1;
++            wr(armctrl, RPI3_ENABLE_IRQS_1, 1U << RPI3_IRQ_SYSTIMER3);
++            drain();
++            ml_set_interrupts_enabled(was_enabled);
++            return;
++        }
++        ticks *= 2;
++    }
++    panic("Rpi3 system timer compare repeatedly late");
++}
++
++uint64_t Rpi3_get_timebase(void)
++{
++    return timebase_ready ? counter64() : 0; /* 1 MHz ticks; rtclock converts */
++}
++
++uint64_t Rpi3_timer_value(void)
++{
++    int32_t remaining = 0;
++    boolean_t was_enabled = ml_set_interrupts_enabled(FALSE);
++    if (timebase_ready && armed)
++        remaining = (int32_t)(rd(systimer, RPI3_SYSTIMER_C3) - rd(systimer, RPI3_SYSTIMER_CLO));
++    ml_set_interrupts_enabled(was_enabled);
++    return remaining > 0 ? (uint32_t)remaining : 0;
++}
++
++void Rpi3_handle_interrupt(void *context)
++{
++    uint32_t pending, budget;
++    if (!controller_ready || !timebase_ready)
++        panic("Rpi3 IRQ before controller/timebase initialization");
++
++    for (budget = 0; budget < 64U; budget++) {
++        /* Only our one enabled source is looked at: the VideoCore owns the
++         * other GPU interrupt lines, and documentation differs on whether
++         * the pending registers mask out sources the ARM never enabled. */
++        pending = rd(armctrl, RPI3_IRQ_PENDING_1);
++        if (!(pending & (1U << RPI3_IRQ_SYSTIMER3))) {
++            if (budget == 0) spurious_irq_count++;
++            return;
++        }
++        wr(armctrl, RPI3_DISABLE_IRQS_1, 1U << RPI3_IRQ_SYSTIMER3);
++        wr(systimer, RPI3_SYSTIMER_CS, RPI3_SYSTIMER_M3);   /* ack the match */
++        drain();
++        armed = 0;
++        last_irq_counter = rd(systimer, RPI3_SYSTIMER_CLO);
++        irq_count++;
++        rtclock_intr((arm_saved_state_t *)context);
++#if !CONFIG_TICKLESS
++        Rpi3_timer_enabled(TRUE);
++#endif
++        ios7leo_timer_observe(last_irq_counter, irq_count);
++    }
++    panic("Rpi3 IRQ drain budget exceeded");
++}
++
++#endif /* BOARD_CONFIG_RASPBERRYPI3 */
+diff --git a/xnu/pexpert/arm/rpi3_timer.h b/xnu/pexpert/arm/rpi3_timer.h
+new file mode 100644
+index 0000000..8091a95
+--- /dev/null
++++ b/xnu/pexpert/arm/rpi3_timer.h
+@@ -0,0 +1,14 @@
++/* Raspberry Pi 3 interrupt/timebase provider (see rpi3_timer.c). */
++#ifndef PEXPERT_ARM_RPI3_TIMER_H
++#define PEXPERT_ARM_RPI3_TIMER_H
++#include <mach/mach_types.h>
++
++/* Signatures match SocDeviceDispatch in pexpert/arm/protos.h. */
++void Rpi3_interrupt_init(void);
++void Rpi3_timebase_init(void);
++void Rpi3_handle_interrupt(void *context);
++uint64_t Rpi3_get_timebase(void);
++uint64_t Rpi3_timer_value(void);
++void Rpi3_timer_enabled(int enable);
++extern uint64_t clock_decrementer;
++#endif
+diff --git a/xnu/pexpert/conf/files.arm b/xnu/pexpert/conf/files.arm
+index 8c56832..431b0ed 100644
+--- a/xnu/pexpert/conf/files.arm
++++ b/xnu/pexpert/conf/files.arm
+@@ -22,3 +22,5 @@ pexpert/arm/pe_s5l8930x.c		standard
+ pexpert/arm/pe_apq8060.c		standard
+ pexpert/arm/pe_imx53.c			standard
+ pexpert/arm/leo_scanout_row.c standard
++pexpert/arm/pe_rpi3.c standard
++pexpert/arm/rpi3_timer.c standard
+-- 
+2.43.0
+

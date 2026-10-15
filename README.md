@@ -25,9 +25,10 @@ timer, display, SD, input) and reuses the root filesystem unchanged.
 |---|---|
 | Darwin ARM toolchain on Linux (ld64, cctools, MIG) | done |
 | Build the HD2 kernel from source; hand-written assembly matches the published HD2 kernel instruction for instruction | done |
-| Raspberry Pi 3B+ board target (boot shim, IRQ, timer, framebuffer) | in progress |
-| Pi drivers: HDMI display, SD card, USB mouse → touch | not started |
-| SD card image | not started |
+| Raspberry Pi 3B+ board target (boot shim, IRQ, timer, framebuffer) | done, tested in QEMU (raspi2b) |
+| SD card driver: root filesystem mounts, `launchd` starts | done, tested in QEMU |
+| USB mouse → touch | not started (no input yet) |
+| SD card image builder | done |
 
 Nothing here has run on real Pi hardware yet.
 
@@ -37,8 +38,24 @@ On Ubuntu 24.04 (x86_64), as root for the package install step:
 
 ```sh
 ./build-kernel.sh QSD8250_LEO DEBUG   # HD2 kernel, toolchain check
-./build-kernel.sh RASPBERRYPI3 DEBUG  # Pi kernel (once the target lands)
+./build-kernel.sh RASPBERRYPI3 DEBUG  # Pi kernel
+shim/build.sh out/shim
+tools/pack-kernel.py --shim out/shim/shim.bin \
+    --kernel out/build/DEBUG_ARM_RASPBERRYPI3/mach_kernel --out out/kernel7.img
+tools/make-sdcard.sh --rootfs rootfs.hfs --kernel out/kernel7.img \
+    --out out/sdcard.img [--firmware path/to/raspberrypi-firmware/boot]
 ```
+
+Test in QEMU (Raspberry Pi 2 machine: same peripherals as the 3B+ in 32-bit
+mode):
+
+```sh
+qemu-system-arm -M raspi2b -bios out/kernel7.img \
+    -drive file=out/sdcard.img,if=sd,format=raw -serial stdio
+```
+
+Add `rpi3_uart=1` to the boot-args (`--cmdline` or `cmdline.txt`) for kernel
+output on the serial port.
 
 This fetches the pinned xnu-hd2 commit, applies `patches/xnu/`, builds the
 toolchain into `out/toolchain` and the kernel into `out/build/`.
