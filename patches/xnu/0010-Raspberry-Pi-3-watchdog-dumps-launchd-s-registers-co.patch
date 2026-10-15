@@ -1,0 +1,90 @@
+From 701343252c340565229e468b2df0fde3e985e436 Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 13:06:25 +0000
+Subject: [PATCH] Raspberry Pi 3: watchdog dumps launchd's registers, code and
+ page attributes
+
+Fifth real-hardware boot: SD reads now ~6 MB/s and the mouse moves, but
+after the shared cache is read launchd spins at one user pc (inside the
+shared cache) with no SD activity and no fault: a tight loop. Print, for
+launchd's running main thread, r0-r12/sp/cpsr, 32 bytes of code around
+pc, the PTEs of pc, r0-r3 and sp, and where the shared cache mappings
+landed, so the loop and the memory type it spins on can be identified.
+---
+ xnu/bsd/vm/vm_unix.c | 11 +++++++++++
+ xnu/osfmk/arm/trap.c | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/xnu/bsd/vm/vm_unix.c b/xnu/bsd/vm/vm_unix.c
+index 70ba0bf..136d49c 100644
+--- a/xnu/bsd/vm/vm_unix.c
++++ b/xnu/bsd/vm/vm_unix.c
+@@ -1195,6 +1195,17 @@ shared_region_copyin_mappings(
+             mappings[index].sfm_file_offset = (mach_vm_offset_t)wire[index].offset;
+             mappings[index].sfm_max_prot = wire[index].max_prot;
+             mappings[index].sfm_init_prot = wire[index].init_prot;
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++            {
++                /* Where the shared cache's first mapping landed (the
++                 * watchdog prints it so PCs can be turned into cache offsets). */
++                extern uint32_t rpi3_shared_cache_va[4], rpi3_shared_cache_off[4];
++                if (index < 4) {
++                    rpi3_shared_cache_va[index] = (uint32_t)mappings[index].sfm_address;
++                    rpi3_shared_cache_off[index] = (uint32_t)mappings[index].sfm_file_offset;
++                }
++            }
++#endif
+             printf("IOS7LAB cache mapping %u va=%08x size=%08x offset=%08x max=%x init=%x\n",
+                    index, mappings[index].sfm_address, mappings[index].sfm_size,
+                    mappings[index].sfm_file_offset, wire[index].max_prot, wire[index].init_prot);
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index 2abd8fe..ccecf11 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -307,6 +307,34 @@ static boolean_t rpi3_unfixable_user_abort(thread_t thread, uint32_t fsr, uint32
+  * number on swi). Plus the USB mouse's raw reports. Stops after 10 minutes.
+  */
+ extern void rpi3_mouse_debug_print(void);
++uint32_t rpi3_shared_cache_va[4], rpi3_shared_cache_off[4];
++
++/* Registers, code around pc and page attributes of launchd's main thread. */
++static void rpi3_dump_thread(task_t task, thread_t th)
++{
++    arm_saved_state_t *s = &th->machine.user_regs;
++    uint32_t code[8], addr[6], i;
++    uint32_t base = (s->pc & ~1U) - 16;
++    printf(" regs r0-3 %08x %08x %08x %08x r4-7 %08x %08x %08x %08x\n",
++           s->r[0], s->r[1], s->r[2], s->r[3], s->r[4], s->r[5], s->r[6], s->r[7]);
++    printf(" r8-12 %08x %08x %08x %08x %08x sp %08x cpsr %08x\n",
++           s->r[8], s->r[9], s->r[10], s->r[11], s->r[12], s->sp, s->cpsr);
++    printf(" cache va %08x/%08x %08x/%08x\n", rpi3_shared_cache_va[0], rpi3_shared_cache_off[0],
++           rpi3_shared_cache_va[1], rpi3_shared_cache_off[1]);
++    if (copyinmap(task->map, base, code, sizeof(code)) == KERN_SUCCESS)
++        printf(" code@%08x %08x %08x %08x %08x %08x %08x %08x %08x\n", base,
++               code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7]);
++    addr[0] = s->pc; addr[1] = s->r[0]; addr[2] = s->r[1]; addr[3] = s->r[2];
++    addr[4] = s->r[3]; addr[5] = s->sp;
++    printf(" pte");
++    for (i = 0; i < 6; i++) {
++        uint32_t *ptep = 0;
++        if (addr[i] >= 0x1000 && addr[i] < 0x40000000U)
++            ptep = (uint32_t *) pmap_pte(task->map->pmap, (vm_offset_t) addr[i]);
++        printf(" %08x", ptep ? *ptep : 0xffffffffU);
++    }
++    printf("\n");
++}
+ extern uint32_t rpi3_sd_stat_reads, rpi3_sd_stat_errors, rpi3_sd_stat_commands, rpi3_sd_stat_multi_failures;
+ extern int32_t rpi3_sd_stat_fail_result;
+ extern uint32_t rpi3_sd_stat_fail_block, rpi3_sd_stat_fail_irq, rpi3_sd_stat_fail_status;
+@@ -338,6 +366,8 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                        proc_name_address(task->bsd_info), proc_pid(task->bsd_info), k,
+                        th->state, (uint32_t) th->wait_event, (uint32_t) th->continuation,
+                        s->pc, s->lr, s->r[12], s->r[0]);
++                if (k == 1 && proc_pid(task->bsd_info) == 1 && (th->state & TH_RUN))
++                    rpi3_dump_thread(task, th);
+             }
+         }
+         lck_mtx_unlock(&tasks_threads_lock);
+-- 
+2.43.0
+
