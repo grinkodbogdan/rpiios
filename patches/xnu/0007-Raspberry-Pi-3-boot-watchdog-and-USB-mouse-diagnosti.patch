@@ -1,0 +1,138 @@
+From eb5754cdc842be846e4405711ca31717794cd089 Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 12:26:30 +0000
+Subject: [PATCH] Raspberry Pi 3: boot watchdog and USB mouse diagnostics on
+ the console
+
+Third real-hardware boot: launchd is exec'd and the shared cache mapped,
+then no further exec and no unfixable user abort; the kernel stays alive.
+Mouse clicks arrive but the cursor never moves.
+
+Pi only: a kernel thread started at the first exec prints, every 5 s for
+10 minutes, each user task's first threads (state, wait event, kernel
+continuation, user pc/lr/r12/r0) and the mouse's raw report bytes,
+counts and cursor position. The first 12 mouse reports are also printed.
+---
+ xnu/bsd/kern/kern_exec.c                      |  4 ++
+ .../ARM/AppleARMPlatform/rpi3_touch.cpp       | 24 ++++++++++
+ xnu/osfmk/arm/trap.c                          | 47 +++++++++++++++++++
+ 3 files changed, 75 insertions(+)
+
+diff --git a/xnu/bsd/kern/kern_exec.c b/xnu/bsd/kern/kern_exec.c
+index 8adf97e..224394a 100644
+--- a/xnu/bsd/kern/kern_exec.c
++++ b/xnu/bsd/kern/kern_exec.c
+@@ -1302,6 +1302,10 @@ exec_activate_image(struct image_params *imgp)
+ #if defined(BOARD_CONFIG_RASPBERRYPI3)
+ 	/* Boot progress on the Pi's console: every program iOS starts. */
+ 	printf("exec %s\n", imgp->ip_strings);
++	{
++		extern void rpi3_watchdog_start(void);
++		rpi3_watchdog_start();
++	}
+ #endif
+ 
+ 	NDINIT(&nd, LOOKUP, OP_LOOKUP, FOLLOW | LOCKLEAF | AUDITVNPATH1,
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
+index 9ea2573..4ff8438 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp
+@@ -34,6 +34,22 @@ static int32_t cursorX = SCREEN_W / 2 * 256, cursorY = SCREEN_H / 2 * 256; /* 24
+ static uint8_t lastButtons;
+ static uint64_t nextRetryNs;
+ 
++/* Mouse diagnostics for the boot watchdog (osfmk/arm/trap.c). */
++static uint32_t dbgReports, dbgMoves, dbgShown;
++static uint8_t dbgLast[8];
++extern "C" void rpi3_mouse_debug_print(void)
++{
++    if (!usb.mouse_found) {
++        IOLog(" mouse: none (devices=%u hubs=%u errors=%u)\n", usb.devices, usb.hubs, usb.errors);
++        return;
++    }
++    IOLog(" mouse: a%u ep%u mps%u int%u spd%u split%u reports=%u moves=%u naks=%u err=%u last=%02x %02x %02x %02x %02x %02x %02x %02x xy=%d,%d\n",
++          usb.mouse.address, usb.mouse.endpoint, usb.mouse.max_packet, usb.mouse.interval,
++          usb.mouse.speed, usb.mouse.split, dbgReports, dbgMoves, usb.naks, usb.errors,
++          dbgLast[0], dbgLast[1], dbgLast[2], dbgLast[3], dbgLast[4], dbgLast[5], dbgLast[6], dbgLast[7],
++          (int)(cursorX >> 8), (int)(cursorY >> 8));
++}
++
+ static uint64_t usbNowNs(void *)
+ {
+     uint64_t ns = 0;
+@@ -118,6 +134,14 @@ extern "C" int leo_touch_transport_poll(LeoTouchState *s, LeoTouchReport *report
+     }
+     s->reads++;
+     s->packets++;
++    dbgReports++;
++    if (dx || dy) dbgMoves++;
++    for (unsigned i = 0; i < sizeof(dbgLast); i++) dbgLast[i] = usb.io.dma[1024 + i]  /* DMA_REPORT */;
++    if (dbgShown < 12) {
++        dbgShown++;
++        IOLog("mouse report %02x %02x %02x %02x %02x %02x %02x %02x\n",
++              dbgLast[0], dbgLast[1], dbgLast[2], dbgLast[3], dbgLast[4], dbgLast[5], dbgLast[6], dbgLast[7]);
++    }
+ 
+     cursorX += dx * SPEED_FIXED;
+     cursorY += dy * SPEED_FIXED;
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index 22c2e04..ed4d069 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -299,6 +299,53 @@ static boolean_t rpi3_unfixable_user_abort(thread_t thread, uint32_t fsr, uint32
+     }
+     return TRUE;
+ }
++
++/*
++ * Boot watchdog for the Pi's console: every 5 s, for the first 3 threads of
++ * each user task, print its state (TH_* bits), the event and kernel
++ * continuation it waits on, and its user registers (pc, lr, r12 = syscall
++ * number on swi). Plus the USB mouse's raw reports. Stops after 10 minutes.
++ */
++extern void rpi3_mouse_debug_print(void);
++static int rpi3_watchdog_event;
++static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
++{
++    unsigned round;
++    for (round = 0; round < 120; round++) {
++        task_t task;
++        assert_wait_timeout((event_t) &rpi3_watchdog_event, THREAD_UNINT, 5, NSEC_PER_SEC);
++        thread_block(THREAD_CONTINUE_NULL);
++        printf("WD %u:\n", round);
++        lck_mtx_lock(&tasks_threads_lock);
++        queue_iterate(&tasks, task, task_t, tasks) {
++            thread_t th;
++            unsigned k = 0;
++            if (task == kernel_task || !task->bsd_info)
++                continue;
++            queue_iterate(&task->threads, th, thread_t, task_threads) {
++                arm_saved_state_t *s = &th->machine.user_regs;
++                if (k++ >= 3)
++                    break;
++                printf(" %s[%d].%u st=%x ev=%08x k=%08x pc=%08x lr=%08x r12=%x r0=%x\n",
++                       proc_name_address(task->bsd_info), proc_pid(task->bsd_info), k,
++                       th->state, (uint32_t) th->wait_event, (uint32_t) th->continuation,
++                       s->pc, s->lr, s->r[12], s->r[0]);
++            }
++        }
++        lck_mtx_unlock(&tasks_threads_lock);
++        rpi3_mouse_debug_print();
++    }
++}
++
++void rpi3_watchdog_start(void)
++{
++    static int started;
++    thread_t thread;
++    if (started++)
++        return;
++    if (kernel_thread_start(rpi3_watchdog, NULL, &thread) == KERN_SUCCESS)
++        thread_deallocate(thread);
++}
+ #endif
+ 
+ void sleh_abort(void *context, int reason)
+-- 
+2.43.0
+
