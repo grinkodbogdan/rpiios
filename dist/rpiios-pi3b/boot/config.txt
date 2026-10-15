@@ -1,0 +1,11 @@
+# rpiios: boot the iOS 7 XNU kernel in 32-bit mode.
+arm_64bit=0
+kernel=kernel7.img
+# The shim talks to the firmware framebuffer itself; keep the GPU memory
+# split modest so ARM keeps most of the 1 GiB.
+gpu_mem=64
+# Prefer HDMI even without a monitor detected at power-on.
+hdmi_force_hotplug=1
+disable_splash=1
+# No Linux device tree: the firmware passes ATAGs (with cmdline.txt) instead.
+device_tree=

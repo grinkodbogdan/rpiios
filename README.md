@@ -24,15 +24,23 @@ timer, display, SD, input) and reuses the root filesystem unchanged.
 | Step | State |
 |---|---|
 | Darwin ARM toolchain on Linux (ld64, cctools, MIG) | done |
-| Build the HD2 kernel from source; hand-written assembly matches the published HD2 kernel instruction for instruction | done |
-| Raspberry Pi 3B+ board target (boot shim, IRQ, timer, framebuffer) | done, tested in QEMU (raspi2b) |
-| SD card driver: root filesystem mounts, `launchd` starts | done, tested in QEMU |
-| SpringBoard / iOS 7 lock screen on HDMI | done, tested in QEMU |
-| USB mouse → touch (DWC2 host, hubs, split transactions) | done; pointer and touches reach iOS in QEMU, unlock gesture not yet confirmed |
-| Cortex-A53 fixes (`swp`, HYP exit, SCTLR) | done |
-| SD card image builder | done |
+| HD2 kernel from source | done |
+| Pi 3B+ board target: boot shim, interrupts, timer, HDMI framebuffer | done, **runs on real hardware** |
+| SD card: multi-block reads (~6 MB/s on a real Pi) | done, real hardware |
+| Cortex-A53 fixes: write-back cacheable RAM, TLB maintenance after faults, no `swp`, HYP exit | done, real hardware |
+| iOS 7.1.2 userland to SpringBoard / lock screen | done, **real hardware and QEMU** |
+| USB mouse/tablet as touch (DWC2 host, hubs, split transactions, HID report descriptors) | done, real hardware and QEMU |
+| Touches reach backboardd and SpringBoard | verified in QEMU |
+| AppleKeyStore stand-in (no passcode), real mach timebase | done |
+| Slide to unlock / home screen | **not yet**: SpringBoard's main thread spends long stretches blocked in MobileGestalt queries |
 
-Nothing here has run on real Pi hardware yet.
+The kernel is built with `-O2` on the Pi (the HD2 kernel stays `-O0`).
+
+## Ready-made card
+
+`dist/rpiios-pi3b/` holds the current boot files (Raspberry Pi firmware,
+`kernel7.img`) and `flash-sdcard.sh`, which writes a card (or an image) from
+the HD2 release's `ios7.rar`. See its README.txt.
 
 ## Building the kernel
 
@@ -68,6 +76,12 @@ qemu-system-arm -M raspi2b -bios out/kernel7.img \
 
 Add `rpi3_uart=1` to the boot-args (`--cmdline` or `cmdline.txt`) for kernel
 output on the serial port.
+
+Driving it like a finger: start QEMU with `-device usb-tablet -qmp
+unix:out/qmp.sock,server,nowait` from the repo root, then for example
+`tools/qemu/qtouch.py out/qmp.sock "drag 60 720 440 720 8" "shot after"`
+(`tap`, `drag`, `home` = right click, `shot`). `tools/dscsym.py` turns
+userland PCs (printed by the kernel's boot watchdog) into shared-cache symbols.
 
 ## What is not in this repo
 
