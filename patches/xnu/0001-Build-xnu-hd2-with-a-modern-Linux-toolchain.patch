@@ -1,0 +1,657 @@
+From 03e4d4d5cd79c8740b4089397634f659b2d0b37d Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 06:02:49 +0000
+Subject: [PATCH] Build xnu-hd2 with a modern Linux toolchain
+
+- Restore executable bits on build scripts (lost in publication).
+- Turn the '# HTC HD2 ...' publication notice into a C comment where it
+  heads C/yacc sources, so the preprocessor accepts it.
+- Add iokit/IOKit/storage/Makefile (dir is listed but had no Makefile).
+- Include paths the author's build had: AppleARMPlatform for pexpert,
+  osfmk/ipc+kern for osfmk and iokit, pexpert/arm for iokit.
+- genassym: accept '@DEFINITION#' (modern clang prints ARM's comment char).
+- Respell pre-UAL mnemonics in bcopyinout.s (tools/ual-convert.py).
+- compute_pageout_gc_throttle: definition matches its prototype.
+- kxld: comma between attributes.
+- List HD2 display/touch/logger/COW sources that the author linked.
+- Stand-ins for leo_scanout_copy_row and five diagnostic observers whose
+  implementations are not in the public tree.
+---
+ xnu/SETUP/config/doconf                       |  0
+ xnu/SETUP/newvers                             |  0
+ xnu/SETUP/setup.sh                            |  0
+ xnu/bsd/kern/makesyscalls.sh                  |  0
+ xnu/bsd/miscfs/devfs/reproto.sh               |  0
+ xnu/bsd/netat/atalk.exp                       |  0
+ xnu/bsd/netat/atalk.imp                       |  0
+ xnu/bsd/sys/make_posix_availability.sh        |  0
+ xnu/bsd/sys/make_symbol_aliasing.sh           |  0
+ xnu/bsd/vfs/vnode_if.sh                       |  0
+ xnu/buildscripts/darwinbuild.common           |  0
+ xnu/config/compress-man-pages.pl              |  0
+ xnu/config/generate_linker_exports.sh         |  0
+ xnu/config/list_supported.sh                  |  0
+ xnu/config/newvers.pl                         |  0
+ xnu/freebsd_glue.sh                           |  0
+ .../ARM/AppleARMPlatform/leo_diag_stubs.c     | 32 +++++++++++
+ xnu/iokit/IOKit/storage/Makefile              | 36 ++++++++++++
+ xnu/iokit/conf/Makefile.template              |  2 +-
+ xnu/iokit/conf/files.arm                      | 10 ++++
+ xnu/libkern/c++/OSUnserialize.y               |  2 +-
+ xnu/libkern/c++/OSUnserializeXML.y            |  2 +-
+ xnu/libkern/kxld/kxld_object.h                |  2 +-
+ xnu/libkern/kxld/tests/loadtest.py            |  0
+ xnu/libkern/libkern/version.h.template        |  2 +-
+ .../xcodescripts/compat-symlinks.sh           |  0
+ .../xcodescripts/compile-syscalls.pl          |  0
+ .../xcodescripts/create-syscalls.pl           |  0
+ .../xcodescripts/mach_install_mig.sh          |  0
+ xnu/lldbmacros.py                             |  0
+ xnu/osfmk/arm/bcopyinout.s                    | 56 +++++++++----------
+ xnu/osfmk/conf/Makefile.template              |  4 +-
+ xnu/osfmk/vm/vm_pageout.c                     |  2 +-
+ xnu/pexpert/arm/leo_scanout_row.c             | 23 ++++++++
+ xnu/pexpert/conf/Makefile.template            |  2 +-
+ xnu/pexpert/conf/files.arm                    |  1 +
+ xnu/tools/remote_build.sh                     |  0
+ xnu/tools/symbolify.py                        |  0
+ xnu/tools/tests/execperf/test.sh              |  0
+ xnu/tools/tests/libMicro/bench.sh             |  0
+ xnu/tools/tests/libMicro/benchDS.sh           |  0
+ xnu/tools/tests/libMicro/coreos_bench.sh      |  0
+ xnu/tools/tests/libMicro/create_stuff.sh      |  0
+ xnu/tools/tests/libMicro/embd_bench.sh        |  0
+ xnu/tools/tests/libMicro/mk_tarball           |  0
+ xnu/tools/tests/libMicro/multiview.sh         |  0
+ xnu/tools/tests/libMicro/od_account_create.sh |  0
+ xnu/tools/tests/libMicro/od_account_delete.sh |  0
+ xnu/tools/tests/libMicro/wrapper.sh           |  0
+ xnu/tools/xcrun_cache.sh                      |  0
+ xnu/xnu-build                                 |  0
+ 51 files changed, 139 insertions(+), 37 deletions(-)
+ mode change 100644 => 100755 xnu/SETUP/config/doconf
+ mode change 100644 => 100755 xnu/SETUP/newvers
+ mode change 100644 => 100755 xnu/SETUP/setup.sh
+ mode change 100644 => 100755 xnu/bsd/kern/makesyscalls.sh
+ mode change 100644 => 100755 xnu/bsd/miscfs/devfs/reproto.sh
+ mode change 100644 => 100755 xnu/bsd/netat/atalk.exp
+ mode change 100644 => 100755 xnu/bsd/netat/atalk.imp
+ mode change 100644 => 100755 xnu/bsd/sys/make_posix_availability.sh
+ mode change 100644 => 100755 xnu/bsd/sys/make_symbol_aliasing.sh
+ mode change 100644 => 100755 xnu/bsd/vfs/vnode_if.sh
+ mode change 100644 => 100755 xnu/buildscripts/darwinbuild.common
+ mode change 100644 => 100755 xnu/config/compress-man-pages.pl
+ mode change 100644 => 100755 xnu/config/generate_linker_exports.sh
+ mode change 100644 => 100755 xnu/config/list_supported.sh
+ mode change 100644 => 100755 xnu/config/newvers.pl
+ mode change 100644 => 100755 xnu/freebsd_glue.sh
+ create mode 100644 xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_diag_stubs.c
+ create mode 100644 xnu/iokit/IOKit/storage/Makefile
+ mode change 100644 => 100755 xnu/libkern/kxld/tests/loadtest.py
+ mode change 100644 => 100755 xnu/libsyscall/xcodescripts/compat-symlinks.sh
+ mode change 100644 => 100755 xnu/libsyscall/xcodescripts/compile-syscalls.pl
+ mode change 100644 => 100755 xnu/libsyscall/xcodescripts/create-syscalls.pl
+ mode change 100644 => 100755 xnu/libsyscall/xcodescripts/mach_install_mig.sh
+ mode change 100644 => 100755 xnu/lldbmacros.py
+ create mode 100644 xnu/pexpert/arm/leo_scanout_row.c
+ mode change 100644 => 100755 xnu/tools/remote_build.sh
+ mode change 100644 => 100755 xnu/tools/symbolify.py
+ mode change 100644 => 100755 xnu/tools/tests/execperf/test.sh
+ mode change 100644 => 100755 xnu/tools/tests/libMicro/bench.sh
+ mode change 100644 => 100755 xnu/tools/tests/libMicro/benchDS.sh
+ mode change 100644 => 100755 xnu/tools/tests/libMicro/coreos_bench.sh
+ mode change 100644 => 100755 xnu/tools/tests/libMicro/create_stuff.sh
+ mode change 100644 => 100755 xnu/tools/tests/libMicro/embd_bench.sh
+ mode change 100644 => 100755 xnu/tools/tests/libMicro/mk_tarball
+ mode change 100644 => 100755 xnu/tools/tests/libMicro/multiview.sh
+ mode change 100644 => 100755 xnu/tools/tests/libMicro/od_account_create.sh
+ mode change 100644 => 100755 xnu/tools/tests/libMicro/od_account_delete.sh
+ mode change 100644 => 100755 xnu/tools/tests/libMicro/wrapper.sh
+ mode change 100644 => 100755 xnu/tools/xcrun_cache.sh
+ mode change 100644 => 100755 xnu/xnu-build
+
+diff --git a/xnu/SETUP/config/doconf b/xnu/SETUP/config/doconf
+old mode 100644
+new mode 100755
+diff --git a/xnu/SETUP/newvers b/xnu/SETUP/newvers
+old mode 100644
+new mode 100755
+diff --git a/xnu/SETUP/setup.sh b/xnu/SETUP/setup.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/bsd/kern/makesyscalls.sh b/xnu/bsd/kern/makesyscalls.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/bsd/miscfs/devfs/reproto.sh b/xnu/bsd/miscfs/devfs/reproto.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/bsd/netat/atalk.exp b/xnu/bsd/netat/atalk.exp
+old mode 100644
+new mode 100755
+diff --git a/xnu/bsd/netat/atalk.imp b/xnu/bsd/netat/atalk.imp
+old mode 100644
+new mode 100755
+diff --git a/xnu/bsd/sys/make_posix_availability.sh b/xnu/bsd/sys/make_posix_availability.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/bsd/sys/make_symbol_aliasing.sh b/xnu/bsd/sys/make_symbol_aliasing.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/bsd/vfs/vnode_if.sh b/xnu/bsd/vfs/vnode_if.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/buildscripts/darwinbuild.common b/xnu/buildscripts/darwinbuild.common
+old mode 100644
+new mode 100755
+diff --git a/xnu/config/compress-man-pages.pl b/xnu/config/compress-man-pages.pl
+old mode 100644
+new mode 100755
+diff --git a/xnu/config/generate_linker_exports.sh b/xnu/config/generate_linker_exports.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/config/list_supported.sh b/xnu/config/list_supported.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/config/newvers.pl b/xnu/config/newvers.pl
+old mode 100644
+new mode 100755
+diff --git a/xnu/freebsd_glue.sh b/xnu/freebsd_glue.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_diag_stubs.c b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_diag_stubs.c
+new file mode 100644
+index 0000000..9f403da
+--- /dev/null
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_diag_stubs.c
+@@ -0,0 +1,32 @@
++/*
++ * No-op stand-ins for HD2 diagnostic observers that IOS7LeoSDLogger.cpp calls
++ * but whose implementations are not in the public xnu-hd2 tree. They only
++ * feed the on-card boot log; returning "nothing observed" (zeroed records)
++ * leaves the logger writing what it can. QSD8250_LEO only.
++ */
++#if defined(BOARD_CONFIG_QSD8250_LEO)
++#include <stdint.h>
++#include <string.h>
++#include "IOS7LeoPresentCost.h"
++#include "IOS7LeoSurfaceAdmission.h"
++#include "IOS7LeoSwitchObservation.h"
++
++void ios7leo_log_progress(uint32_t stage, uint32_t value) { (void)stage; (void)value; }
++
++void ios7leo_mdp_ack_observe_v2(uint32_t *a, uint32_t *b, uint32_t *c,
++                                uint32_t *d, uint32_t *e, uint32_t *f)
++{
++    uint32_t *outs[] = { a, b, c, d, e, f };
++    for (unsigned i = 0; i < 6; i++)
++        if (outs[i]) *outs[i] = 0;
++}
++
++void ios7leo_present_cost_observe(LeoPresentCostObservation *out)
++{ if (out) memset(out, 0, sizeof(*out)); }
++
++void ios7leo_surface_admission_observe(LeoSurfaceAdmissionObservation *out)
++{ if (out) memset(out, 0, sizeof(*out)); }
++
++void ios7leo_switch_observe(LeoSwitchObservation *out)
++{ if (out) memset(out, 0, sizeof(*out)); }
++#endif
+diff --git a/xnu/iokit/IOKit/storage/Makefile b/xnu/iokit/IOKit/storage/Makefile
+new file mode 100644
+index 0000000..a8d6bcd
+--- /dev/null
++++ b/xnu/iokit/IOKit/storage/Makefile
+@@ -0,0 +1,36 @@
++export MakeInc_cmd=${SRCROOT}/makedefs/MakeInc.cmd
++export MakeInc_def=${SRCROOT}/makedefs/MakeInc.def
++export MakeInc_rule=${SRCROOT}/makedefs/MakeInc.rule
++export MakeInc_dir=${SRCROOT}/makedefs/MakeInc.dir
++
++IOKIT_FRAMEDIR = $(FRAMEDIR)/IOKit.framework/Versions/A
++export INCDIR = $(IOKIT_FRAMEDIR)/Headers
++export LCLDIR = $(IOKIT_FRAMEDIR)/PrivateHeaders
++
++include $(MakeInc_cmd)
++include $(MakeInc_def)
++
++MI_DIR = storage
++NOT_EXPORT_HEADERS = 
++
++INSTINC_SUBDIRS =
++INSTINC_SUBDIRS_I386 =
++INSTINC_SUBDIRS_X86_64 =
++INSTINC_SUBDIRS_ARM =
++
++EXPINC_SUBDIRS = ${INSTINC_SUBDIRS}
++EXPINC_SUBDIRS_I386 = ${INSTINC_SUBDIRS_I386}
++EXPINC_SUBDIRS_X86_64 = ${INSTINC_SUBDIRS_X86_64}
++EXPINC_SUBDIRS_ARM = ${INSTINC_SUBDIRS_ARM}
++
++ALL_HEADERS = $(shell (cd $(SOURCE); echo *.h))
++
++INSTALL_MI_LIST	= 
++INSTALL_MI_LCL_LIST = ""
++INSTALL_MI_DIR = $(MI_DIR)
++
++EXPORT_MI_LIST	= $(filter-out $(NOT_EXPORT_HEADERS), $(ALL_HEADERS))
++EXPORT_MI_DIR = IOKit/$(MI_DIR)
++
++include $(MakeInc_rule)
++include $(MakeInc_dir)
+diff --git a/xnu/iokit/conf/Makefile.template b/xnu/iokit/conf/Makefile.template
+index 96fe217..0a1f2e5 100644
+--- a/xnu/iokit/conf/Makefile.template
++++ b/xnu/iokit/conf/Makefile.template
+@@ -13,7 +13,7 @@ export IDENT
+ #
+ # XXX: INCFLAGS 
+ #
+-INCFLAGS_MAKEFILE=  $(INCFLAGS_POSIX) -I$(SOURCE) -I$(SOURCE)include
++INCFLAGS_MAKEFILE=  $(INCFLAGS_POSIX) -I$(SOURCE) -I$(SOURCE)include -I$(SRCROOT)/osfmk/kern -I$(SRCROOT)/osfmk/ipc -I$(SRCROOT)/pexpert/arm
+ 
+ export MakeInc_cmd=${SRCROOT}/makedefs/MakeInc.cmd
+ export MakeInc_def=${SRCROOT}/makedefs/MakeInc.def
+diff --git a/xnu/iokit/conf/files.arm b/xnu/iokit/conf/files.arm
+index ce77489..4692a25 100644
+--- a/xnu/iokit/conf/files.arm
++++ b/xnu/iokit/conf/files.arm
+@@ -46,3 +46,13 @@ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoSDCC2.cpp optional iokit
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp optional iokitcpp
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_sdcc.c standard
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/fat_locator.c standard
++# HD2 objects linked by the author's build plan but absent from this list in the
++# public tree (display, touch, SD logger, copy-on-write root overlay).
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp optional iokitcpp
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHIDTouch.cpp optional iokitcpp
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoSDLogger.cpp optional iokitcpp
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_touch_transport.c standard
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_cow.c standard
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_log_format.c standard
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_log_locator.c standard
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_diag_stubs.c standard
+diff --git a/xnu/libkern/c++/OSUnserialize.y b/xnu/libkern/c++/OSUnserialize.y
+index 9fe5d9d..169ad7c 100644
+--- a/xnu/libkern/c++/OSUnserialize.y
++++ b/xnu/libkern/c++/OSUnserialize.y
+@@ -1,4 +1,4 @@
+-# HTC HD2 integration/publication changes: Garysss123, 2026-10-04. Original license notices are preserved.
++/* HTC HD2 integration/publication changes: Garysss123, 2026-10-04. Original license notices are preserved. */
+ /*
+  * Copyright (c) 2000 Apple Computer, Inc. All rights reserved.
+  *
+diff --git a/xnu/libkern/c++/OSUnserializeXML.y b/xnu/libkern/c++/OSUnserializeXML.y
+index 3f93e4c..3e0019c 100644
+--- a/xnu/libkern/c++/OSUnserializeXML.y
++++ b/xnu/libkern/c++/OSUnserializeXML.y
+@@ -1,4 +1,4 @@
+-# HTC HD2 integration/publication changes: Garysss123, 2026-10-04. Original license notices are preserved.
++/* HTC HD2 integration/publication changes: Garysss123, 2026-10-04. Original license notices are preserved. */
+ /*
+  * Copyright (c) 1999-2009 Apple Inc. All rights reserved.
+  *
+diff --git a/xnu/libkern/kxld/kxld_object.h b/xnu/libkern/kxld/kxld_object.h
+index 7435915..c0869da 100644
+--- a/xnu/libkern/kxld/kxld_object.h
++++ b/xnu/libkern/kxld/kxld_object.h
+@@ -57,7 +57,7 @@ kern_return_t kxld_object_init_from_macho(KXLDObject *object,
+     u_char *file, u_long size, const char *name,
+     struct kxld_array *section_order,
+     cpu_type_t cputype, cpu_subtype_t cpusubtype, KXLDFlags flags)
+-    __attribute__((nonnull(1,2,4) visibility("hidden")));
++    __attribute__((nonnull(1,2,4), visibility("hidden")));
+ 
+ void kxld_object_clear(KXLDObject *object)
+     __attribute__((nonnull, visibility("hidden")));
+diff --git a/xnu/libkern/kxld/tests/loadtest.py b/xnu/libkern/kxld/tests/loadtest.py
+old mode 100644
+new mode 100755
+diff --git a/xnu/libkern/libkern/version.h.template b/xnu/libkern/libkern/version.h.template
+index edb2f05..b6807d1 100644
+--- a/xnu/libkern/libkern/version.h.template
++++ b/xnu/libkern/libkern/version.h.template
+@@ -1,4 +1,4 @@
+-# HTC HD2 integration/publication changes: Garysss123, 2026-10-04. Original license notices are preserved.
++/* HTC HD2 integration/publication changes: Garysss123, 2026-10-04. Original license notices are preserved. */
+ /*
+  * Copyright (c) 2004 Apple Computer, Inc. All rights reserved.
+  *
+diff --git a/xnu/libsyscall/xcodescripts/compat-symlinks.sh b/xnu/libsyscall/xcodescripts/compat-symlinks.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/libsyscall/xcodescripts/compile-syscalls.pl b/xnu/libsyscall/xcodescripts/compile-syscalls.pl
+old mode 100644
+new mode 100755
+diff --git a/xnu/libsyscall/xcodescripts/create-syscalls.pl b/xnu/libsyscall/xcodescripts/create-syscalls.pl
+old mode 100644
+new mode 100755
+diff --git a/xnu/libsyscall/xcodescripts/mach_install_mig.sh b/xnu/libsyscall/xcodescripts/mach_install_mig.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/lldbmacros.py b/xnu/lldbmacros.py
+old mode 100644
+new mode 100755
+diff --git a/xnu/osfmk/arm/bcopyinout.s b/xnu/osfmk/arm/bcopyinout.s
+index ef112d5..5fe1df3 100644
+--- a/xnu/osfmk/arm/bcopyinout.s
++++ b/xnu/osfmk/arm/bcopyinout.s
+@@ -76,8 +76,8 @@ EnterARM(copyinmsg)
+     str     r11, [r10, TH_RECOVER]
+ 	mov	r0, #0xE    /* EFAULT */
+ 	cmp	r3, #0x00
+-	ldmgtfd	sp!, {r4-r7}		/* r3 > 0 Restore r4-r7 */
+-	ldmltfd	sp!, {r4-r9}		/* r3 < 0 Restore r4-r9 */
++	ldmfdgt	sp!, {r4-r7}		/* r3 > 0 Restore r4-r7 */
++	ldmfdlt	sp!, {r4-r9}		/* r3 < 0 Restore r4-r9 */
+ 	ldmfd	sp!, {r10-r11, pc}
+ 
+ .Lcopyin_guts:
+@@ -110,7 +110,7 @@ EnterARM(copyinmsg)
+ 
+ 	/* Quad-align the destination buffer */
+ 	tst	r1, #0x07		/* Already quad aligned? */
+-	ldrnet	ip, [r0], #0x04
++	ldrtne	ip, [r0], #0x04
+ 	strne	ip, [r1], #0x04
+ 	subne	r2, r2, #0x04
+ 	stmfd	sp!, {r4-r9}		/* Free up some registers */
+@@ -179,7 +179,7 @@ EnterARM(copyinmsg)
+ 
+ .Lcopyin_w_lessthan128:
+ 	adds	r2, r2, #0x80		/* Adjust for extra sub */
+-	ldmeqfd	sp!, {r4-r9}
++	ldmfdeq	sp!, {r4-r9}
+ 	RETeq
+ 	subs	r2, r2, #0x20
+ 	blt	.Lcopyin_w_lessthan32
+@@ -204,7 +204,7 @@ EnterARM(copyinmsg)
+ 
+ .Lcopyin_w_lessthan32:
+ 	adds	r2, r2, #0x20		/* Adjust for extra sub */
+-	ldmeqfd	sp!, {r4-r9}
++	ldmfdeq	sp!, {r4-r9}
+ 	RETeq				/* Return now if done */
+ 
+ 	and	r4, r2, #0x18
+@@ -238,17 +238,17 @@ EnterARM(copyinmsg)
+ 
+ .Lcopyin_w_less_than8:
+ 	subs	r2, r2, #0x04
+-	ldrget	ip, [r0], #0x04
++	ldrtge	ip, [r0], #0x04
+ 	strge	ip, [r1], #0x04
+ 	RETeq				/* Return now if done */
+ 	addlt	r2, r2, #0x04
+ 	ldrbt	ip, [r0], #0x01
+ 	cmp	r2, #0x02
+-	ldrgebt	r2, [r0], #0x01
++	ldrbtge	r2, [r0], #0x01
+ 	strb	ip, [r1], #0x01
+-	ldrgtbt	ip, [r0]
+-	strgeb	r2, [r1], #0x01
+-	strgtb	ip, [r1]
++	ldrbtgt	ip, [r0]
++	strbge	r2, [r1], #0x01
++	strbgt	ip, [r1]
+ 	RET
+ 
+ /*
+@@ -303,7 +303,7 @@ EnterARM(copyinmsg)
+ 	bge	.Lcopyin_bad1_loop16
+ 
+ 	adds	r2, r2, #0x10
+-	ldmeqfd	sp!, {r4-r7}
++	ldmfdeq	sp!, {r4-r7}
+ 	RETeq				/* Return now if done */
+ 	subs	r2, r2, #0x04
+ 	sublt	r0, r0, #0x03
+@@ -364,7 +364,7 @@ EnterARM(copyinmsg)
+ 	bge	.Lcopyin_bad2_loop16
+ 
+ 	adds	r2, r2, #0x10
+-	ldmeqfd	sp!, {r4-r7}
++	ldmfdeq	sp!, {r4-r7}
+ 	RETeq				/* Return now if done */
+ 	subs	r2, r2, #0x04
+ 	sublt	r0, r0, #0x02
+@@ -425,7 +425,7 @@ EnterARM(copyinmsg)
+ 	bge	.Lcopyin_bad3_loop16
+ 
+ 	adds	r2, r2, #0x10
+-	ldmeqfd	sp!, {r4-r7}
++	ldmfdeq	sp!, {r4-r7}
+ 	RETeq				/* Return now if done */
+ 	subs	r2, r2, #0x04
+ 	sublt	r0, r0, #0x01
+@@ -496,8 +496,8 @@ EnterARM(copyoutmsg)
+     str     r11, [r10, TH_RECOVER]
+ 	mov r0, #0x0e
+ 	cmp	r3, #0x00
+-	ldmgtfd	sp!, {r4-r7}		/* r3 > 0 Restore r4-r7 */
+-	ldmltfd	sp!, {r4-r9}		/* r3 < 0 Restore r4-r9 */
++	ldmfdgt	sp!, {r4-r7}		/* r3 > 0 Restore r4-r7 */
++	ldmfdlt	sp!, {r4-r9}		/* r3 < 0 Restore r4-r9 */
+ 	ldmfd	sp!, {r10-r11, pc}
+ 
+ .Lcopyout_guts:
+@@ -532,7 +532,7 @@ EnterARM(copyoutmsg)
+ 	tst	r0, #0x07		/* Already quad aligned? */
+ 	ldrne	ip, [r0], #0x04
+ 	subne	r2, r2, #0x04
+-	strnet	ip, [r1], #0x04
++	strtne	ip, [r1], #0x04
+ 	
+ 	stmfd	sp!, {r4-r9}		/* Free up some registers */
+ 	mov	r3, #-1			/* Signal restore r4-r9 */
+@@ -600,7 +600,7 @@ EnterARM(copyoutmsg)
+ 
+ .Lcopyout_w_lessthan128:
+ 	adds	r2, r2, #0x80		/* Adjust for extra sub */
+-	ldmeqfd	sp!, {r4-r9}
++	ldmfdeq	sp!, {r4-r9}
+ 	RETeq				/* Return now if done */
+ 	subs	r2, r2, #0x20
+ 	blt	.Lcopyout_w_lessthan32
+@@ -625,7 +625,7 @@ EnterARM(copyoutmsg)
+ 
+ .Lcopyout_w_lessthan32:
+ 	adds	r2, r2, #0x20		/* Adjust for extra sub */
+-	ldmeqfd	sp!, {r4-r9}
++	ldmfdeq	sp!, {r4-r9}
+ 	RETeq				/* Return now if done */
+ 
+ 	and	r4, r2, #0x18
+@@ -660,16 +660,16 @@ EnterARM(copyoutmsg)
+ .Lcopyout_w_less_than8:
+ 	subs	r2, r2, #0x04
+ 	ldrge	ip, [r0], #0x04
+-	strget	ip, [r1], #0x04
++	strtge	ip, [r1], #0x04
+ 	RETeq				/* Return now if done */
+ 	addlt	r2, r2, #0x04
+ 	ldrb	ip, [r0], #0x01
+ 	cmp	r2, #0x02
+-	ldrgeb	r2, [r0], #0x01
++	ldrbge	r2, [r0], #0x01
+ 	strbt	ip, [r1], #0x01
+-	ldrgtb	ip, [r0]
+-	strgebt	r2, [r1], #0x01
+-	strgtbt	ip, [r1]
++	ldrbgt	ip, [r0]
++	strbtge	r2, [r1], #0x01
++	strbtgt	ip, [r1]
+ 	RET
+ 
+ /*
+@@ -724,7 +724,7 @@ EnterARM(copyoutmsg)
+ 	bge	.Lcopyout_bad1_loop16
+ 
+ 	adds	r2, r2, #0x10
+-	ldmeqfd	sp!, {r4-r7}
++	ldmfdeq	sp!, {r4-r7}
+ 	RETeq				/* Return now if done */
+ 	subs	r2, r2, #0x04
+ 	sublt	r0, r0, #0x03
+@@ -785,7 +785,7 @@ EnterARM(copyoutmsg)
+ 	bge	.Lcopyout_bad2_loop16
+ 
+ 	adds	r2, r2, #0x10
+-	ldmeqfd	sp!, {r4-r7}
++	ldmfdeq	sp!, {r4-r7}
+ 	RETeq				/* Return now if done */
+ 	subs	r2, r2, #0x04
+ 	sublt	r0, r0, #0x02
+@@ -846,7 +846,7 @@ EnterARM(copyoutmsg)
+ 	bge	.Lcopyout_bad3_loop16
+ 
+ 	adds	r2, r2, #0x10
+-	ldmeqfd	sp!, {r4-r7}
++	ldmfdeq	sp!, {r4-r7}
+ 	RETeq				/* Return now if done */
+ 	subs	r2, r2, #0x04
+ 	sublt	r0, r0, #0x01
+@@ -1037,9 +1037,9 @@ copyio_kernel:
+ .Lcopyio_copy2:
+     subs    r2, r2, #2
+     ldrb    r3, [r0], #1
+-    ldrplb  r12, [r0], #1
++    ldrbpl  r12, [r0], #1
+     strb    r3, [r1], #1
+-    strplb  r12, [r1], #1
++    strbpl  r12, [r1], #1
+     bhi     .Lcopyio_copy2
+ .Lcopyio_exit:
+     movs    r0, #0
+diff --git a/xnu/osfmk/conf/Makefile.template b/xnu/osfmk/conf/Makefile.template
+index c39e844..2cbdc29 100644
+--- a/xnu/osfmk/conf/Makefile.template
++++ b/xnu/osfmk/conf/Makefile.template
+@@ -13,7 +13,7 @@ export IDENT
+ #
+ # XXX: INCFLAGS to include libsa prototypes
+ #
+-INCFLAGS_MAKEFILE= -I$(SOURCE)libsa
++INCFLAGS_MAKEFILE= -I$(SOURCE)libsa -I$(SRCROOT)/osfmk/ipc -I$(SRCROOT)/osfmk/kern
+ 
+ export MakeInc_cmd=${SRCROOT}/makedefs/MakeInc.cmd
+ export MakeInc_def=${SRCROOT}/makedefs/MakeInc.def
+@@ -120,7 +120,7 @@ genassym.o: $(SOURCE_DIR)/$(COMPONENT)/$(GENASSYM_LOCATION)/genassym.c
+ 	$(_v)${KCC} $(subst -flto,,${CFLAGS}) -MD ${_HOST_EXTRA_CFLAGS} -S -o ${@} -c ${INCFLAGS} $<
+ 
+ assym.s: genassym.o
+-	$(_v)sed -e '/#DEFINITION#/!d' -e 's/^.*#DEFINITION#//' -e 's/\$$//' -e 'p' -e 's/#//2' -e 's/[^A-Za-z0-9_]*\([A-Za-z0-9_]*\)/ \1_NUM/2' genassym.o > ${@}
++	$(_v)sed -e '/[#@]DEFINITION#/!d' -e 's/^.*[#@]DEFINITION#//' -e 's/\$$//' -e 'p' -e 's/#//2' -e 's/[^A-Za-z0-9_]*\([A-Za-z0-9_]*\)/ \1_NUM/2' genassym.o > ${@}
+ 
+ ${SOBJS}: assym.s
+ 
+diff --git a/xnu/osfmk/vm/vm_pageout.c b/xnu/osfmk/vm/vm_pageout.c
+index 2218cd4..97a7573 100644
+--- a/xnu/osfmk/vm/vm_pageout.c
++++ b/xnu/osfmk/vm/vm_pageout.c
+@@ -3026,7 +3026,7 @@ uint32_t vm_pageout_considered_page_last = 0;
+  * called once per-second via "compute_averages"
+  */
+ void
+-compute_pageout_gc_throttle()
++compute_pageout_gc_throttle(__unused void *arg)
+ {
+ 	if (vm_pageout_considered_page != vm_pageout_considered_page_last) {
+ 
+diff --git a/xnu/pexpert/arm/leo_scanout_row.c b/xnu/pexpert/arm/leo_scanout_row.c
+new file mode 100644
+index 0000000..b1d62e4
+--- /dev/null
++++ b/xnu/pexpert/arm/leo_scanout_row.c
+@@ -0,0 +1,23 @@
++/*
++ * Stand-in for the HD2 scanout row converter, which is referenced by
++ * pe_qsd8250_leo.c but absent from the public xnu-hd2 tree. Not used on
++ * Raspberry Pi; present so the QSD8250_LEO target links for toolchain checks.
++ *
++ * Contract (IOS7LeoScanoutRow.h): one 320-pixel 32bpp input row becomes
++ * 480 RGB565 output pixels (1.5x horizontal, nearest neighbour).
++ */
++#if defined(BOARD_CONFIG_QSD8250_LEO)
++#include <stdint.h>
++#include "IOS7LeoScanoutRow.h"
++
++void leo_scanout_copy_row(volatile uint16_t *out, const uint8_t *pixels, uint32_t format)
++{
++    /* 0x42475241 'BGRA': bytes B,G,R,A. 0x52474241 'RGBA': bytes R,G,B,A. */
++    const int bgra = (format == 0x42475241U);
++    for (uint32_t x = 0; x < 480; x++) {
++        const uint8_t *p = pixels + (x * 2 / 3) * 4;
++        uint32_t r = bgra ? p[2] : p[0], g = p[1], b = bgra ? p[0] : p[2];
++        out[x] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
++    }
++}
++#endif
+diff --git a/xnu/pexpert/conf/Makefile.template b/xnu/pexpert/conf/Makefile.template
+index 0fcca19..7eaee39 100644
+--- a/xnu/pexpert/conf/Makefile.template
++++ b/xnu/pexpert/conf/Makefile.template
+@@ -13,7 +13,7 @@ export IDENT
+ #
+ # INCFLAGS 
+ #
+-INCFLAGS_MAKEFILE=  $(INCFLAGS_POSIX)
++INCFLAGS_MAKEFILE=  $(INCFLAGS_POSIX) -I$(SRCROOT)/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform
+ 
+ export MakeInc_cmd=${SRCROOT}/makedefs/MakeInc.cmd
+ export MakeInc_def=${SRCROOT}/makedefs/MakeInc.def
+diff --git a/xnu/pexpert/conf/files.arm b/xnu/pexpert/conf/files.arm
+index 8cc0ba3..8c56832 100644
+--- a/xnu/pexpert/conf/files.arm
++++ b/xnu/pexpert/conf/files.arm
+@@ -21,3 +21,4 @@ pexpert/arm/pe_s5l8900x.c		standard
+ pexpert/arm/pe_s5l8930x.c		standard
+ pexpert/arm/pe_apq8060.c		standard
+ pexpert/arm/pe_imx53.c			standard
++pexpert/arm/leo_scanout_row.c standard
+diff --git a/xnu/tools/remote_build.sh b/xnu/tools/remote_build.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/symbolify.py b/xnu/tools/symbolify.py
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/execperf/test.sh b/xnu/tools/tests/execperf/test.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/libMicro/bench.sh b/xnu/tools/tests/libMicro/bench.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/libMicro/benchDS.sh b/xnu/tools/tests/libMicro/benchDS.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/libMicro/coreos_bench.sh b/xnu/tools/tests/libMicro/coreos_bench.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/libMicro/create_stuff.sh b/xnu/tools/tests/libMicro/create_stuff.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/libMicro/embd_bench.sh b/xnu/tools/tests/libMicro/embd_bench.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/libMicro/mk_tarball b/xnu/tools/tests/libMicro/mk_tarball
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/libMicro/multiview.sh b/xnu/tools/tests/libMicro/multiview.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/libMicro/od_account_create.sh b/xnu/tools/tests/libMicro/od_account_create.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/libMicro/od_account_delete.sh b/xnu/tools/tests/libMicro/od_account_delete.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/tests/libMicro/wrapper.sh b/xnu/tools/tests/libMicro/wrapper.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/tools/xcrun_cache.sh b/xnu/tools/xcrun_cache.sh
+old mode 100644
+new mode 100755
+diff --git a/xnu/xnu-build b/xnu/xnu-build
+old mode 100644
+new mode 100755
+-- 
+2.43.0
+
