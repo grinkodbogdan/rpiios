@@ -1,0 +1,48 @@
+From 5318dc6ad3098b0cc18c1d250abff4042921a9fe Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 19:08:09 +0000
+Subject: [PATCH] thread_switch: accept iOS 7's options 3, 4 and 5
+
+os_lock_handoff in iOS 7's libsystem_platform (malloc's locks among
+others) calls thread_switch(owner, SWITCH_OPTION_OSLOCK_DEPRESS (4) or
+SWITCH_OPTION_OSLOCK_WAIT (5), 1 ms). This kernel rejected anything above
+2 with KERN_INVALID_ARGUMENT without yielding, so a contended lock was a
+busy loop: the owner ran only when the spinner's quantum ran out, or never
+if it had a lower priority. Map 3 and 4 to DEPRESS and 5 to WAIT; the
+existing code hands off to the named owner thread when it is runnable.
+---
+ xnu/osfmk/kern/syscall_subr.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/xnu/osfmk/kern/syscall_subr.c b/xnu/osfmk/kern/syscall_subr.c
+index 0cf92ad..edbafeb 100644
+--- a/xnu/osfmk/kern/syscall_subr.c
++++ b/xnu/osfmk/kern/syscall_subr.c
+@@ -237,6 +237,24 @@ thread_switch(
+ 	case SWITCH_OPTION_WAIT:
+ 	    break;
+ 
++	/*
++	 * iOS 7 userland (os_lock_handoff in libsystem_platform, used by
++	 * malloc and others) passes the newer options: 3 dispatch contention,
++	 * 4 depress and 5 wait, naming the lock owner's thread. Rejecting them
++	 * made every contended lock a busy loop that never let the owner run.
++	 */
++	case 3: /* SWITCH_OPTION_DISPATCH_CONTENTION */
++	    option = SWITCH_OPTION_DEPRESS;
++	    if (option_time == 0)
++		    option_time = 1;
++	    break;
++	case 4: /* SWITCH_OPTION_OSLOCK_DEPRESS */
++	    option = SWITCH_OPTION_DEPRESS;
++	    break;
++	case 5: /* SWITCH_OPTION_OSLOCK_WAIT */
++	    option = SWITCH_OPTION_WAIT;
++	    break;
++
+ 	default:
+ 	    return (KERN_INVALID_ARGUMENT);
+     }
+-- 
+2.43.0
+
