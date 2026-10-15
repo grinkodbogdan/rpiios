@@ -1,0 +1,49 @@
+From 1c6ac33da40c194e8acd000c30774ac76bf9c1a0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 15 Oct 2026 18:31:06 +0000
+Subject: [PATCH] Raspberry Pi 3: mach timebase back to 1/1 (absolute time is
+ nanoseconds)
+
+mach_absolute_time already converts the 1 MHz system timer to nanoseconds,
+in the kernel and for userland (Mach trap -3). Reporting 1000/1 made
+userland think every real second was 1000 seconds: HID event timestamps
+and gesture time limits broke. The frozen lock screen clock that change
+was meant to fix came from the missing AppleKeyStore.
+---
+ xnu/osfmk/arm/rtclock.c | 18 +++++-------------
+ 1 file changed, 5 insertions(+), 13 deletions(-)
+
+diff --git a/xnu/osfmk/arm/rtclock.c b/xnu/osfmk/arm/rtclock.c
+index 5e83553..02ae022 100644
+--- a/xnu/osfmk/arm/rtclock.c
++++ b/xnu/osfmk/arm/rtclock.c
+@@ -334,21 +334,13 @@ int rtclock_init(void)
+ 
+ void clock_timebase_info(mach_timebase_info_t info)
+ {
+-#if defined(BOARD_CONFIG_RASPBERRYPI3)
+     /*
+-     * mach_absolute_time counts the timer configured with rtc_configure()
+-     * (the BCM2837 system timer, 1 MHz), not nanoseconds. Userland converts
+-     * with this ratio: reporting 1/1 made every userland timer and
+-     * animation run 1000 times too slowly (a 60 s timer fired after ~17
+-     * hours), so SpringBoard never updated its clock or finished gestures.
++     * mach_absolute_time is nanoseconds here (rtclock_timer_scale_convert
++     * scales the hardware ticks), in the kernel and in userland, which gets
++     * it from Mach trap -3. The ratio is 1/1; anything else makes userland
++     * think time runs faster than it does (taps exceed their time limits,
++     * HID events look stale, animations end at once).
+      */
+-    if (rtclock_sec_divisor && rtclock_sec_divisor <= NSEC_PER_SEC &&
+-        !(NSEC_PER_SEC % rtclock_sec_divisor)) {
+-        info->numer = (uint32_t)(NSEC_PER_SEC / rtclock_sec_divisor);
+-        info->denom = 1;
+-        return;
+-    }
+-#endif
+     info->numer = info->denom = 1;
+ }
+ 
+-- 
+2.43.0
+
