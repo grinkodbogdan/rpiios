@@ -1,0 +1,51 @@
+From e14730f2a59fd4d6df0fb819dc79e8f6cfe6f4d6 Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 17:32:17 +0000
+Subject: [PATCH 17/19] Raspberry Pi 3: build the kernel with -O2
+
+At -O0 every Mach message, page fault and timer is several times
+slower; iOS, rendered on the CPU, then has no time left for input. The
+Pi kernel (MACHINE_CONFIG RASPBERRYPI3) is now built with -O2 (override
+with RPI3_OPT=-O0); the HD2 kernel stays -O0.
+
+-O2 merged adjacent word loads into LDRD/LDM in code that reads
+byte-aligned buffers as words (YSHA1Transform's static workspace[64]),
+which faults even with SCTLR.A clear. -mllvm
+-arm-assume-misaligned-load-store keeps the ARM load/store optimizer
+from forming those without known alignment.
+
+QEMU: the lock screen comes up in ~4 minutes instead of ~8.
+---
+ xnu/makedefs/MakeInc.def | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/xnu/makedefs/MakeInc.def b/xnu/makedefs/MakeInc.def
+index f05792e..ffa1da8 100644
+--- a/xnu/makedefs/MakeInc.def
++++ b/xnu/makedefs/MakeInc.def
+@@ -326,7 +326,8 @@ ARCH_FLAGS_ARM_RASPBERRYPI3 = -arch armv7
+ # The Pi 3B+ target is the HD2 iOS 7 kernel with a different board layer:
+ # everything gated on BOARD_CONFIG_QSD8250_LEO (the iOS 7 userland fixes)
+ # stays on, and board files check BOARD_CONFIG_RASPBERRYPI3 to swap hardware.
+-MACHINE_FLAGS_RASPBERRYPI3 = -DBOARD_CONFIG_QSD8250_LEO=1
++MACHINE_FLAGS_RASPBERRYPI3 = -DBOARD_CONFIG_QSD8250_LEO=1 \
++	-mllvm -arm-assume-misaligned-load-store
+ ARCH_FLAGS_ARM_MSM8960_TOUCHPAD	= -arch armv7
+ ARCH_FLAGS_ARM_RASPBERRYPI	= -arch armv6
+ ARCH_FLAGS_ARM_ARM_RVEB_V6	= -arch armv6
+@@ -411,7 +412,11 @@ export CFLAGS_PROFILEX86_64 = -O2
+ 
+ export CFLAGS_RELEASEARM = -O0
+ export CFLAGS_DEVELOPMENTARM = -O0
+-export CFLAGS_DEBUGARM = -O0
++# The Raspberry Pi 3 kernel is built optimized: at -O0 every Mach message,
++# page fault and timer is several times slower, and iOS (rendered on the
++# CPU) leaves no time for input. The HD2 kernel stays -O0.
++export CFLAGS_DEBUGARM = $(if $(filter RASPBERRYPI3,$(MACHINE_CONFIG)),$(RPI3_OPT),-O0)
++export RPI3_OPT ?= -O2
+ export CFLAGS_PROFILEARM = -O0
+ 
+ export CFLAGS 	= $(CFLAGS_GEN) \
+-- 
+2.43.0
+

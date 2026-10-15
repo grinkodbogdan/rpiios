@@ -1,0 +1,49 @@
+From dcfb0b48e02309d3eebba3bcac27494f0d1bc981 Mon Sep 17 00:00:00 2001
+From: rpiios <grinkod.bogdan@gmail.com>
+Date: Thu, 15 Oct 2026 17:32:17 +0000
+Subject: [PATCH 19/19] Raspberry Pi 3: watchdog dumps SpringBoard's main
+ thread
+
+Registers, code, user frame chain and PTEs of SpringBoard's first thread
+every 5 s, running or waiting, to see what it spends its time on.
+---
+ xnu/osfmk/arm/trap.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index 84c640f..ab47280 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -324,6 +324,18 @@ static void rpi3_dump_thread(task_t task, thread_t th)
+     if (copyinmap(task->map, base, code, sizeof(code)) == KERN_SUCCESS)
+         printf(" code@%08x %08x %08x %08x %08x %08x %08x %08x %08x\n", base,
+                code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7]);
++    {
++        /* User frame chain (Thumb/ARM APCS: [r7] = caller r7, [r7+4] = lr). */
++        uint32_t fp = s->r[7], frame[2], k;
++        printf(" bt");
++        for (k = 0; k < 8 && fp; k++) {
++            if (copyinmap(task->map, fp, frame, sizeof(frame)) != KERN_SUCCESS) break;
++            printf(" %08x", frame[1]);
++            if (frame[0] <= fp) break;
++            fp = frame[0];
++        }
++        printf("\n");
++    }
+     addr[0] = s->pc; addr[1] = s->r[0]; addr[2] = s->r[1]; addr[3] = s->r[2];
+     addr[4] = s->r[3]; addr[5] = s->sp;
+     printf(" pte");
+@@ -366,7 +378,9 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                        proc_name_address(task->bsd_info), proc_pid(task->bsd_info), k,
+                        th->state, (uint32_t) th->wait_event, (uint32_t) th->continuation,
+                        s->pc, s->lr, s->r[12], s->r[0]);
+-                if (k == 1 && proc_pid(task->bsd_info) == 1 && (th->state & TH_RUN))
++                if (k == 1 &&
++                    ((proc_pid(task->bsd_info) == 1 && (th->state & TH_RUN)) ||
++                     !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11)))
+                     rpi3_dump_thread(task, th);
+             }
+         }
+-- 
+2.43.0
+
