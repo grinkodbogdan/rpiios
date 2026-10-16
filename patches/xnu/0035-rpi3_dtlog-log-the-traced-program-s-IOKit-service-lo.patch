@@ -1,0 +1,89 @@
+From 395f20b0fd024b06c434ea8f540d6befb9946b00 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 14:47:29 +0000
+Subject: [PATCH] rpi3_dtlog: log the traced program's IOKit service lookups
+ and opens
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                   |  2 +-
+ xnu/iokit/Kernel/IOUserClient.cpp | 34 +++++++++++++++++++++++++++++++
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index d660b06..fce46a9 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-c2682e5fa3054f86
++dc68b009074fd0ba
+diff --git a/xnu/iokit/Kernel/IOUserClient.cpp b/xnu/iokit/Kernel/IOUserClient.cpp
+index 52ec197..953f991 100644
+--- a/xnu/iokit/Kernel/IOUserClient.cpp
++++ b/xnu/iokit/Kernel/IOUserClient.cpp
+@@ -1685,6 +1685,31 @@ kern_return_t is_io_service_match_property_table_ool(
+ }
+ 
+ /* Routine io_service_get_matching_services */
++#if BOARD_CONFIG_RASPBERRYPI3
++/* rpi3_dtlog=NAME: log NAME's IOKit service lookups and opens on serial */
++extern "C" const char *rpi3_dtlog_name(void);
++extern "C" void kprintf(const char *fmt, ...);
++extern "C" struct proc *current_proc(void);
++extern "C" char *proc_name_address(void *p);
++static bool rpi3_iokit_traced(void)
++{
++    const char *name = rpi3_dtlog_name();
++    proc_t p = current_proc();
++    return name[0] && p && strncmp(proc_name_address(p), name, strlen(name)) == 0;
++}
++static void rpi3_iokit_note(const char *what, const char *detail, kern_return_t kr)
++{
++    char text[200];
++    if (!rpi3_iokit_traced()) return;
++    strlcpy(text, detail ? detail : "", sizeof(text));
++    kprintf("rpi3 iokit: %s[%d] %s %s -> %x\n", proc_name_address(current_proc()),
++        proc_pid(current_proc()), what, text, kr);
++}
++#define RPI3_IOKIT_NOTE(w, d, k) rpi3_iokit_note(w, d, k)
++#else
++#define RPI3_IOKIT_NOTE(w, d, k) do { } while (0)
++#endif
++
+ kern_return_t is_io_service_get_matching_services(
+ 	mach_port_t master_port,
+ 	io_string_t matching,
+@@ -1708,6 +1733,7 @@ kern_return_t is_io_service_get_matching_services(
+ /* IOS7LEO_WAIT_END */
+         *existing = IOService::getMatchingServices( dict );
+ 	kr = kIOReturnSuccess;
++        RPI3_IOKIT_NOTE("matching-services", matching, *existing ? 0 : 1);
+ /* IOS7LEO_WAIT_BEGIN */
+ #if defined(BOARD_CONFIG_QSD8250_LEO)
+         ios7leo_wait_note(leo_wait,1,1,kr,*existing != 0,0,0);
+@@ -1772,6 +1798,7 @@ kern_return_t is_io_service_get_matching_service(
+ /* IOS7LEO_WAIT_END */
+         *service = IOService::copyMatchingService( dict );
+ 	kr = *service ? kIOReturnSuccess : kIOReturnNotFound;
++        RPI3_IOKIT_NOTE("matching-service", matching, kr);
+ /* IOS7LEO_WAIT_BEGIN */
+ #if defined(BOARD_CONFIG_QSD8250_LEO)
+         ios7leo_wait_note(leo_wait,2,1,kr,*service != 0,0,0);
+@@ -2739,6 +2766,13 @@ kern_return_t is_io_service_open_extended(
+     while (false);
+ 
+     *connection = client;
++#if BOARD_CONFIG_RASPBERRYPI3
++    {
++        char what[80];
++        snprintf(what, sizeof(what), "open %s type %u", service->getMetaClass()->getClassName(), connect_type);
++        RPI3_IOKIT_NOTE(what, "", res);
++    }
++#endif
+     *result = res;
+ 
+     return (err);
+-- 
+2.43.0
+
