@@ -1,0 +1,169 @@
+From 418a3398aa87b95f173ab14a4cb8bd24d1085d87 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 13:35:44 +0000
+Subject: [PATCH] iOS 10 display bring-up probes and os_log-to-serial debugging
+ aid
+
+- Framebuffer client (iOS 10 only): IOMobileFramebufferGetID (selector 7)
+  answers 1; unimplemented selectors with inline struct outputs succeed
+  with zeroed output.
+- rpi3_dtlog=NAME boot-arg: programs whose path contains NAME get
+  OS_ACTIVITY_DT_MODE / ACTIVITY_LOG_STDERR / CFLOG_FORCE_STDERR, and
+  their write/writev to fd 2 is copied to the serial log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                               |  2 +-
+ xnu/bsd/kern/kern_exec.c                      | 66 +++++++++++++++++++
+ xnu/bsd/kern/sys_generic.c                    | 14 ++++
+ .../ARM/AppleARMPlatform/IOS7LeoDisplay.cpp   |  7 +-
+ 4 files changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 71cfec8..d660b06 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-c28b896b887800e8
++c2682e5fa3054f86
+diff --git a/xnu/bsd/kern/kern_exec.c b/xnu/bsd/kern/kern_exec.c
+index e560ed7..f7c4872 100644
+--- a/xnu/bsd/kern/kern_exec.c
++++ b/xnu/bsd/kern/kern_exec.c
+@@ -2964,6 +2964,51 @@ bad:
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if BOARD_CONFIG_RASPBERRYPI3
++static int
++rpi3_contains(const char *s, const char *find)
++{
++	size_t n = strlen(find);
++
++	for (; *s; s++)
++		if (strncmp(s, find, n) == 0)
++			return 1;
++	return 0;
++}
++
++const char *
++rpi3_dtlog_name(void)
++{
++	static char name[32];
++	static int init;
++
++	if (!init) {
++		init = 1;
++		if (!PE_parse_boot_argn("rpi3_dtlog", name, sizeof(name)))
++			name[0] = '\0';
++	}
++	return name;
++}
++
++/* write(2) to fd 2 by an rpi3_dtlog program: copy the text to serial */
++void
++rpi3_stderr_tee(proc_t p, int fd, user_addr_t buf, user_size_t len)
++{
++	const char *name = rpi3_dtlog_name();
++	char text[257];
++	size_t n;
++
++	if (fd != 2 || !name[0] || !rpi3_contains(p->p_comm, name))
++		return;
++	n = len < sizeof(text) - 1 ? (size_t)len : sizeof(text) - 1;
++	if (copyin(buf, text, n) != 0)
++		return;
++	text[n] = '\0';
++	kprintf("rpi3: %s[%d] stderr: %s%s", p->p_comm, p->p_pid, text,
++	    (n && text[n - 1] == '\n') ? "" : "\n");
++}
++#endif
++
+ static int
+ exec_extract_strings(struct image_params *imgp)
+ {
+@@ -3129,6 +3174,27 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++	/*
++	 * Debugging aid: rpi3_dtlog=NAME gives programs whose path contains
++	 * NAME OS_ACTIVITY_DT_MODE, so their os_log messages go to stderr,
++	 * which rpi3_stderr_tee() copies to the serial log.
++	 */
++	if (rpi3_dtlog_name()[0] && rpi3_contains(imgp->ip_strings, rpi3_dtlog_name())) {
++		static const char *dtenv[] = { "OS_ACTIVITY_DT_MODE=YES", "ACTIVITY_LOG_STDERR=1",
++		    "CFLOG_FORCE_STDERR=1" };
++		unsigned k;
++
++		for (k = 0; k < sizeof(dtenv) / sizeof(dtenv[0]); k++) {
++			if (imgp->ip_argspace < new_ptr_size ||
++			    exec_add_user_string(imgp, CAST_USER_ADDR_T(dtenv[k]), UIO_SYSSPACE, TRUE) != 0)
++				break;
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+diff --git a/xnu/bsd/kern/sys_generic.c b/xnu/bsd/kern/sys_generic.c
+index 393ba8f..2317c42 100644
+--- a/xnu/bsd/kern/sys_generic.c
++++ b/xnu/bsd/kern/sys_generic.c
+@@ -465,6 +465,12 @@ write_nocancel(struct proc *p, struct write_nocancel_args *uap, user_ssize_t *re
+ 
+ 	AUDIT_ARG(fd, fd);
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++	{
++		extern void rpi3_stderr_tee(proc_t, int, user_addr_t, user_size_t);
++		rpi3_stderr_tee(p, fd, uap->cbuf, uap->nbyte);
++	}
++#endif
+ 	error = fp_lookup(p,fd,&fp,0);
+ 	if (error)
+ 		return(error);
+@@ -643,6 +649,14 @@ writev_nocancel(struct proc *p, struct writev_nocancel_args *uap, user_ssize_t *
+ 	if (error) {
+ 		goto ExitThisRoutine;
+ 	}
++#if BOARD_CONFIG_RASPBERRYPI3
++	{
++		extern void rpi3_stderr_tee(proc_t, int, user_addr_t, user_size_t);
++		int k;
++		for (k = 0; k < uap->iovcnt; k++)
++			rpi3_stderr_tee(p, uap->fd, iovp[k].iov_base, iovp[k].iov_len);
++	}
++#endif
+ 	
+ 	/* finalize uio_t for use and do the IO 
+ 	 */
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+index 0bdf90b..38c6f4f 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+@@ -1383,10 +1383,15 @@ IOReturn IOS7LabFramebufferClient::externalMethod(uint32_t selector,
+         extern int rpi3_ios10_layout;
+         static unsigned resultLogs;
+         if (rpi3_ios10_layout && result == kIOReturnUnsupported && args &&
+-            !args->structureInputSize && !args->structureOutputSize &&
++            !args->structureInputSize &&
+             !args->structureInputDescriptor && !args->structureOutputDescriptor) {
+             for (uint32_t i = 0; i < args->scalarOutputCount; i++)
+                 args->scalarOutput[i] = 0;
++            /* IOMobileFramebufferGetID: the display's (non-zero) id */
++            if (selector == 7 && args->scalarOutputCount == 1)
++                args->scalarOutput[0] = 1;
++            if (args->structureOutput && args->structureOutputSize)
++                bzero(args->structureOutput, args->structureOutputSize);
+             result = kIOReturnSuccess;
+         }
+         if (resultLogs++ < 160)
+-- 
+2.43.0
+
