@@ -1,0 +1,458 @@
+From c4e116220aacea3bbffe50fa1a84ea4fec3a4d03 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 12:41:40 +0000
+Subject: [PATCH] iOS 10: rw-lock upgrade fix, getattrlistbulk, persona, kqueue
+ wakeups, display probes
+
+- lck_rw_lock_shared_to_exclusive: with other readers (or an upgrade or
+  interlock pending) the assembly fast path jumped to
+  lck_rw_lock_shared_gen, which took another read hold and returned
+  "upgraded"; callers then modified vm_maps held only shared.  Go to the
+  C upgrade path instead.  Only shows with real read contention, which
+  iOS 10's many workqueue threads produce.
+- getattrlistbulk (461): directory enumeration for launchd and others,
+  built on getattrlist_internal and an extended readdir.
+- persona (494): no process has a persona.  Other unimplemented
+  iOS 10-numbered calls (445+) fail with ENOTSUP instead of SIGSYS.
+- kevent: a Mach port knote added or re-enabled while a message is
+  already queued wakes the kqueue (nothing else would).
+- Framebuffer client: iOS 10's IOMobileFramebuffer opens the display
+  with selectors iOS 7 never used; answer the plain scalar ones with
+  success (iOS 10 only), and log calls and results on serial.
+- Serial diagnostics: user data aborts, the crashing thread's backtrace
+  on exit by signal, backboardd/SpringBoard thread states.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                               |   2 +-
+ xnu/bsd/kern/kern_descrip.c                   |  16 +++
+ xnu/bsd/kern/kern_event.c                     |  18 ++-
+ xnu/bsd/kern/subr_xxx.c                       |  11 ++
+ xnu/bsd/kern/syscalls.master                  |   4 +-
+ xnu/bsd/vfs/vfs_attrlist.c                    | 128 ++++++++++++++++++
+ .../ARM/AppleARMPlatform/IOS7LeoDisplay.cpp   |  27 ++++
+ xnu/osfmk/arm/hw_lock.s                       |  17 ++-
+ xnu/osfmk/arm/trap.c                          |  34 ++++-
+ 9 files changed, 248 insertions(+), 9 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index ceae8ea..71cfec8 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-1575df59d72fd443
++c28b896b887800e8
+diff --git a/xnu/bsd/kern/kern_descrip.c b/xnu/bsd/kern/kern_descrip.c
+index 62cd0e3..735159d 100644
+--- a/xnu/bsd/kern/kern_descrip.c
++++ b/xnu/bsd/kern/kern_descrip.c
+@@ -5862,3 +5862,19 @@ coalition_info(__unused proc_t p, struct coalition_info_args *uap, __unused int3
+ 		return (error);
+ 	return (copyout(&size, uap->bufsize, sizeof (size)));
+ }
++
++/*
++ * iOS 10: personas.  No process here has one, which is what a kernel
++ * with personas reports for an ordinary process.
++ */
++int
++persona(__unused proc_t p, struct persona_args *uap, __unused int32_t *retval)
++{
++	switch (uap->operation) {
++	case 1:		/* PERSONA_OP_ALLOC */
++	case 2:		/* PERSONA_OP_DEALLOC */
++		return (EPERM);
++	default:	/* GET, INFO, PIDINFO, FIND */
++		return (ESRCH);
++	}
++}
+diff --git a/xnu/bsd/kern/kern_event.c b/xnu/bsd/kern/kern_event.c
+index b948087..23d729f 100644
+--- a/xnu/bsd/kern/kern_event.c
++++ b/xnu/bsd/kern/kern_event.c
+@@ -1685,9 +1685,9 @@ rpi3_kqwq_callback(__unused struct kqueue *kq, struct kevent64_s *kevp, void *da
+ 	int error;
+ 
+ 	if (rpi3_kq_trace > 0)
+-		kprintf("rpi3: %s[%d] kq deliver filter %d ident 0x%llx flags 0x%x fflags 0x%x data 0x%llx ext 0x%llx 0x%llx\n",
++		kprintf("rpi3: %s[%d] kq deliver filter %d ident 0x%llx flags 0x%x fflags 0x%x data 0x%llx udata 0x%llx ext 0x%llx 0x%llx\n",
+ 		    current_proc()->p_comm, current_proc()->p_pid, kevp->filter, kevp->ident, kevp->flags,
+-		    kevp->fflags, kevp->data, kevp->ext[0], kevp->ext[1]);
++		    kevp->fflags, kevp->data, kevp->udata, kevp->ext[0], kevp->ext[1]);
+ 	error = kevent_copyout(kevp, &scan->list, current_proc(), KEVENT_LAYOUT_QOS);
+ 	if (error == 0 && ++scan->out == scan->max)
+ 		error = EWOULDBLOCK;
+@@ -1973,7 +1973,21 @@ kevent_register(struct kqueue *kq, struct kevent64_s *kev, __unused struct proc
+ 			knote_activate(kn, 1);
+ 		kqunlock(kq);
+ 	} else {
++		/*
++		 * A stay-queued knote (a Mach port) added or re-enabled while
++		 * its port already holds a message: no later post will wake a
++		 * thread that is already waiting on this kqueue (iOS 10's event
++		 * manager usually is), so wake it now.
++		 */
++		int wake = ((kn->kn_status & (KN_STAYQUEUED | KN_DISABLED)) == KN_STAYQUEUED &&
++		    kn->kn_fop->f_peek != NULL && kn->kn_fop->f_peek(kn));
++
+ 		knote_put(kn);
++		if (wake) {
++			kqlock(kq);
++			kqueue_wakeup(kq, 0);
++			kqunlock(kq);
++		}
+ 	}
+ 
+ done:
+diff --git a/xnu/bsd/kern/subr_xxx.c b/xnu/bsd/kern/subr_xxx.c
+index f951770..1c3a7f0 100644
+--- a/xnu/bsd/kern/subr_xxx.c
++++ b/xnu/bsd/kern/subr_xxx.c
+@@ -196,6 +196,17 @@ nosys(struct proc *p, __unused struct nosys_args *args, __unused int32_t *retval
+ 		       p->p_comm, p->p_pid);
+ 		rpi3_dump_current_thread();
+ 		}
++		/*
++		 * iOS 10's own kernel has the calls numbered above iOS 7's
++		 * (networking agents, Skywalk channels, ...); its daemons
++		 * expect them to fail, not a SIGSYS.
++		 */
++		{
++			extern int rpi3_ios10_layout;
++
++			if (rpi3_ios10_layout && regs && regs[12] >= 445 && regs[12] < 600)
++				return (ENOTSUP);
++		}
+ 	}
+ #endif
+ 	psignal(p, SIGSYS);
+diff --git a/xnu/bsd/kern/syscalls.master b/xnu/bsd/kern/syscalls.master
+index 35a15dd..8f39f02 100644
+--- a/xnu/bsd/kern/syscalls.master
++++ b/xnu/bsd/kern/syscalls.master
+@@ -691,7 +691,7 @@
+ 458	AUE_NULL	ALL	{ int coalition(uint32_t operation, user_addr_t cid, uint32_t flags) NO_SYSCALL_STUB; }
+ 459	AUE_NULL	ALL	{ int coalition_info(uint32_t flavor, user_addr_t cid, user_addr_t buffer, user_addr_t bufsize) NO_SYSCALL_STUB; }
+ 460	AUE_NULL	ALL	{ int nosys(void); }
+-461	AUE_NULL	ALL	{ int nosys(void); }
++461	AUE_NULL	ALL	{ int getattrlistbulk(int dirfd, user_addr_t alist, user_addr_t attributeBuffer, uint32_t bufferSize, uint32_t options_lo, uint32_t options_hi) NO_SYSCALL_STUB; }
+ 462	AUE_NULL	ALL	{ int nosys(void); }
+ 463	AUE_NULL	ALL	{ int openat(int fd, user_addr_t path, int flags, int mode) NO_SYSCALL_STUB; }
+ 464	AUE_NULL	ALL	{ int openat_nocancel(int fd, user_addr_t path, int flags, int mode) NO_SYSCALL_STUB; }
+@@ -724,7 +724,7 @@
+ 491	AUE_NULL	ALL	{ int nosys(void); }
+ 492	AUE_NULL	ALL	{ int nosys(void); }
+ 493	AUE_NULL	ALL	{ int nosys(void); }
+-494	AUE_NULL	ALL	{ int nosys(void); }
++494	AUE_NULL	ALL	{ int persona(uint32_t operation, uint32_t flags, user_addr_t info, user_addr_t id, user_addr_t idlen) NO_SYSCALL_STUB; }
+ 495	AUE_NULL	ALL	{ int nosys(void); }
+ 496	AUE_NULL	ALL	{ int nosys(void); }
+ 497	AUE_NULL	ALL	{ int nosys(void); }
+diff --git a/xnu/bsd/vfs/vfs_attrlist.c b/xnu/bsd/vfs/vfs_attrlist.c
+index 6020557..9f438ed 100644
+--- a/xnu/bsd/vfs/vfs_attrlist.c
++++ b/xnu/bsd/vfs/vfs_attrlist.c
+@@ -47,6 +47,8 @@
+ #include <sys/attr.h>
+ #include <sys/sysproto.h>
+ #include <sys/xattr.h>
++#include <sys/file_internal.h>
++#include <sys/dirent.h>
+ #include <sys/fsevents.h>
+ #include <kern/kalloc.h>
+ #include <miscfs/specfs/specdev.h>
+@@ -2484,3 +2486,129 @@ fsetattrlist(proc_t p, struct fsetattrlist_args *uap, __unused int32_t *retval)
+ 	return error;
+ }
+ 
++
++
++/*
++ * getattrlistbulk (iOS 10): the requested attributes of every entry of a
++ * directory, packed one after another the way getattrlist(2) packs one
++ * (each entry starts with its length).  Built on getattrlist_internal and
++ * an extended readdir, whose per-entry seek offsets let a full buffer stop
++ * between entries.  Returns the number of entries; 0 at the end.
++ */
++int
++getattrlistbulk(proc_t p, struct getattrlistbulk_args *uap, int32_t *retval)
++{
++	vfs_context_t ctx = vfs_context_current();
++	struct fileproc *fp;
++	vnode_t dvp;
++	char *dirbuf = NULL;
++	const size_t dirbufsize = 8192;
++	user_addr_t out = uap->attributeBuffer;
++	uint32_t left = uap->bufferSize;
++	off_t offset;
++	int count = 0, eof = 0, error;
++
++	*retval = 0;
++	if ((error = fp_getfvp(p, uap->dirfd, &fp, &dvp)) != 0)
++		return (error);
++	if ((fp->f_fglob->fg_flag & FREAD) == 0) {
++		error = EBADF;
++		goto out_fp;
++	}
++	if ((error = vnode_getwithref(dvp)) != 0)
++		goto out_fp;
++	if (dvp->v_type != VDIR) {
++		error = ENOTDIR;
++		goto out_vp;
++	}
++	MALLOC(dirbuf, char *, dirbufsize, M_TEMP, M_WAITOK);
++	if (dirbuf == NULL) {
++		error = ENOMEM;
++		goto out_vp;
++	}
++	offset = fp->f_fglob->fg_offset;
++
++	while (!eof && left >= sizeof(uint32_t)) {
++		uio_t auio;
++		char uio_buf[UIO_SIZEOF(1)];
++		int numdirent = 0;
++		char *pos, *end;
++		int full = 0;
++
++		auio = uio_createwithbuffer(1, offset, UIO_SYSSPACE, UIO_READ, &uio_buf[0], sizeof(uio_buf));
++		uio_addiov(auio, CAST_USER_ADDR_T(dirbuf), dirbufsize);
++		error = VNOP_READDIR(dvp, auio, VNODE_READDIR_EXTENDED, &eof, &numdirent, ctx);
++		if (error)
++			break;
++		end = dirbuf + (dirbufsize - uio_resid(auio));
++		if (end == dirbuf)
++			break;
++
++		for (pos = dirbuf; pos < end; ) {
++			struct direntry *de = (struct direntry *)pos;
++			struct nameidata nd;
++			struct getattrlist_args ga;
++			uint32_t entrylen = 0;
++			off_t next = de->d_seekoff;
++
++			if (de->d_reclen == 0)
++				break;
++			pos += de->d_reclen;
++			if ((de->d_namlen == 1 && de->d_name[0] == '.') ||
++			    (de->d_namlen == 2 && de->d_name[0] == '.' && de->d_name[1] == '.') ||
++			    de->d_ino == 0) {
++				offset = next;
++				continue;
++			}
++
++			NDINIT(&nd, LOOKUP, OP_GETATTR, USEDVP | NOFOLLOW | AUDITVNPATH1,
++			    UIO_SYSSPACE, CAST_USER_ADDR_T(de->d_name), ctx);
++			nd.ni_dvp = dvp;
++			if (namei(&nd) != 0) {
++				/* vanished since the readdir: skip it */
++				offset = next;
++				continue;
++			}
++			nameidone(&nd);
++
++			ga.path = USER_ADDR_NULL;
++			ga.alist = uap->alist;
++			ga.attributeBuffer = out;
++			ga.bufferSize = left;
++			ga.options = uap->options_lo & ~FSOPT_NOFOLLOW;
++			error = getattrlist_internal(nd.ni_vp, &ga, p, ctx);
++			vnode_put(nd.ni_vp);
++			if (error == 0)
++				error = copyin(out, &entrylen, sizeof(entrylen));
++			if (error)
++				goto done;
++			entrylen = (entrylen + 3) & ~3U;
++			if (entrylen > left || entrylen == 0) {
++				/* no room: this entry goes in the next call */
++				full = 1;
++				break;
++			}
++			out += entrylen;
++			left -= entrylen;
++			count++;
++			offset = next;
++		}
++		if (full) {
++			if (count == 0)
++				error = ERANGE;	/* not even one entry fits */
++			break;
++		}
++	}
++done:
++	if (error == 0 || count > 0) {
++		error = 0;
++		fp->f_fglob->fg_offset = offset;
++		*retval = count;
++	}
++	FREE(dirbuf, M_TEMP);
++out_vp:
++	vnode_put(dvp);
++out_fp:
++	file_drop(uap->dirfd);
++	return (error);
++}
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+index a471f7e..0bdf90b 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+@@ -470,6 +470,7 @@ class IOCoreSurfaceRoot : public IOSurfaceRoot {
+     OSDeclareDefaultStructors(IOCoreSurfaceRoot);
+ };
+ 
++extern "C" void kprintf(const char *fmt, ...);
+ OSDefineMetaClassAndStructors(IOS7LabSurfaceClient, IOUserClient);
+ OSDefineMetaClassAndStructors(IOSurfaceRoot, IOService);
+ OSDefineMetaClassAndStructors(IOCoreSurfaceRoot, IOSurfaceRoot);
+@@ -1372,6 +1373,26 @@ IOReturn IOS7LabFramebufferClient::externalMethod(uint32_t selector,
+     if(prerequisite)leo_graphics_prereq_attempt(graphicsClient,graphicsOwnerPID,selector);
+     LeoGraphicsCall note={0,0,LEO_GRAPHICS_REASON_ARGUMENT,UINT32_MAX,false};
+     IOReturn result=performExternalMethod(selector,args,&note);
++    {
++        /*
++         * iOS 10's IOMobileFramebuffer opens the display with selectors
++         * the iOS 7 client never used (7, 15, 22, 33, 57, ...).  Until
++         * each is understood, answer the plain scalar ones with success
++         * and zeroed outputs.
++         */
++        extern int rpi3_ios10_layout;
++        static unsigned resultLogs;
++        if (rpi3_ios10_layout && result == kIOReturnUnsupported && args &&
++            !args->structureInputSize && !args->structureOutputSize &&
++            !args->structureInputDescriptor && !args->structureOutputDescriptor) {
++            for (uint32_t i = 0; i < args->scalarOutputCount; i++)
++                args->scalarOutput[i] = 0;
++            result = kIOReturnSuccess;
++        }
++        if (resultLogs++ < 160)
++            kprintf("rpi3: framebuffer method=%u result=%x out0=%llx\n", selector, result,
++                (args && args->scalarOutputCount) ? (unsigned long long)args->scalarOutput[0] : 0ULL);
++    }
+     if(prerequisite)leo_graphics_prereq_result(graphicsClient,graphicsOwnerPID,selector,result);
+     if(watched)noteGraphics(LEO_GRAPHICS_EVENT_METHOD,selector,result,note);
+     return result;
+@@ -1387,6 +1408,11 @@ IOReturn IOS7LabFramebufferClient::performExternalMethod(uint32_t selector,
+         IOLog("IOS7LAB framebuffer method=%u scalar-in=%u struct-in=%u scalar-out=%u struct-out=%u\n",
+               selector, args->scalarInputCount, args->structureInputSize,
+               args->scalarOutputCount, args->structureOutputSize);
++    if (logs < 160)
++        kprintf("rpi3: framebuffer method=%u scalar-in=%u struct-in=%u scalar-out=%u struct-out=%u%s\n",
++              selector, args->scalarInputCount, args->structureInputSize,
++              args->scalarOutputCount, args->structureOutputSize,
++              (args->structureInputDescriptor || args->structureOutputDescriptor) ? " (descriptor)" : "");
+     if (args->structureInputDescriptor || args->structureOutputDescriptor) {
+         note->reason=LEO_GRAPHICS_REASON_DESCRIPTOR;return kIOReturnUnsupported;
+     }
+@@ -1599,6 +1625,7 @@ IOReturn IOMobileFramebuffer::newUserClient(task_t task, void *security, UInt32
+     static unsigned int logs;
+     if (logs++ < 24)
+         IOLog("IOS7LAB framebuffer open type=%u\n", (unsigned int)type);
++    kprintf("rpi3: framebuffer open type=%u\n", (unsigned int)type);
+     if (type != 0 || !handler)
+         return kIOReturnBadArgument;
+     *handler = 0;
+diff --git a/xnu/osfmk/arm/hw_lock.s b/xnu/osfmk/arm/hw_lock.s
+index 1ad87db..3dc0bd0 100644
+--- a/xnu/osfmk/arm/hw_lock.s
++++ b/xnu/osfmk/arm/hw_lock.s
+@@ -283,11 +283,18 @@ EnterARM(lck_rw_lock_shared_to_exclusive)
+     ands        r2, r1, r3
+     beq         rwlsepanic
+     bic         r1, r1, r3
+-    LOAD_ADDR(r12, lck_rw_lock_shared_gen)
++    /*
++     * Other readers, an interlock holder or a pending upgrade: the C
++     * slow path drops our read hold and waits (or reports failure).
++     * This used to go to lck_rw_lock_shared_gen, which took a second
++     * read hold and returned "upgraded": the caller then changed a
++     * vm_map it held only shared.
++     */
++    LOAD_ADDR(r12, lck_rw_lock_shared_to_exclusive_gen)
+     subs        r2, r2, #0x10000
+-    bxne        r12
++    bne         rwlseslow
+     ands        r3, r1, #5
+-    bxne        r12
++    bne         rwlseslow
+     orr         r1, r1, #4
+ #ifndef BOARD_CONFIG_OMAP3530
+     strex       r2, r1, [r0]
+@@ -298,6 +305,9 @@ EnterARM(lck_rw_lock_shared_to_exclusive)
+ #endif
+     mov         r0, #1
+     bx          lr
++rwlseslow:
++    clrex
++    bx          r12
+ rwlsepanic:
+     mov         r1, r2
+     mov         r1, r0
+@@ -682,4 +692,5 @@ EnterARM(hw_unlock_bit)
+ 
+ LOAD_ADDR_GEN_DEF(thread_wakeup)
+ LOAD_ADDR_GEN_DEF(lck_rw_lock_shared_gen)
++LOAD_ADDR_GEN_DEF(lck_rw_lock_shared_to_exclusive_gen)
+ LOAD_ADDR_GEN_DEF(lck_rw_lock_exclusive_gen)
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index ad2af3f..9d1ff8d 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -351,8 +351,25 @@ static void rpi3_dump_thread(task_t task, thread_t th)
+ void rpi3_dump_current_thread(void)
+ {
+     thread_t th = current_thread();
+-    if (th && th->task && th->task != kernel_task)
++    if (th && th->task && th->task != kernel_task) {
++        arm_saved_state_t *st = &th->machine.user_regs;
++        uint32_t fp = st->r[7], frame[2], k;
++
++        /* The same on the serial log: pc, lr and the frame chain. */
++        kprintf("rpi3: %s[%d] crashed thread pc %08x lr %08x sp %08x bt",
++                proc_name_address(th->task->bsd_info), proc_pid(th->task->bsd_info),
++                st->pc, st->lr, st->sp);
++        for (k = 0; k < 16 && fp; k++) {
++            if (copyinmap(th->task->map, fp, frame, sizeof(frame)) != KERN_SUCCESS)
++                break;
++            kprintf(" %08x", frame[1]);
++            if (frame[0] <= fp)
++                break;
++            fp = frame[0];
++        }
++        kprintf("\n");
+         rpi3_dump_thread(th->task, th);
++    }
+ }
+ extern uint32_t rpi3_sd_stat_reads, rpi3_sd_stat_errors, rpi3_sd_stat_commands, rpi3_sd_stat_multi_failures;
+ extern int32_t rpi3_sd_stat_fail_result;
+@@ -385,6 +402,13 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                        proc_name_address(task->bsd_info), proc_pid(task->bsd_info), k,
+                        th->state, (uint32_t) th->wait_event, (uint32_t) th->continuation,
+                        s->pc, s->lr, s->r[12], s->r[0]);
++                if ((round % 6) == 5 &&
++                    (!strncmp(proc_name_address(task->bsd_info), "backboardd", 10) ||
++                     !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11)))
++                    kprintf("rpi3 wd: %s[%d].%u st=%x ev=%08x k=%08x pc=%08x lr=%08x sp=%08x r12=%x r0=%x\n",
++                            proc_name_address(task->bsd_info), proc_pid(task->bsd_info), k,
++                            th->state, (uint32_t) th->wait_event, (uint32_t) th->continuation,
++                            s->pc, s->lr, s->sp, s->r[12], s->r[0]);
+                 if (k == 1 &&
+                     ((proc_pid(task->bsd_info) == 1 && (th->state & TH_RUN)) ||
+                      !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11)))
+@@ -859,6 +883,14 @@ void sleh_abort(void *context, int reason)
+                     /*
+                      * Only for debug.
+                      */
++                    {
++                        static unsigned rpi3_data_abort_logs;
++                        if (rpi3_data_abort_logs++ < 64)
++                            kprintf("rpi3: %s[%d] data abort pc 0x%08x lr 0x%08x sp 0x%08x far 0x%08x vm_fault %d\n",
++                                proc_name_address(thread->task->bsd_info),
++                                proc_pid(thread->task->bsd_info), arm_ctx->pc, arm_ctx->lr, arm_ctx->sp,
++                                arm_ctx->far, code);
++                    }
+                     printf
+                         (ANSI_COLOR_RED "%s[%d]: " ANSI_COLOR_BLUE "usermode data abort, EXC_BAD_ACCESS at 0x%08x in map %p (pmap %p) (%s)" ANSI_COLOR_RESET "\n",
+                          proc_name_address(thread->task->bsd_info),
+-- 
+2.43.0
+
