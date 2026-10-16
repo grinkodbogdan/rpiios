@@ -1,0 +1,198 @@
+From 1fffb01fc53edbe401cff0c67262af09197f01e7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 16:32:10 +0000
+Subject: [PATCH] rpi3: answer sandbox_check for iOS 10 launchd; XPC lookup
+ debugging
+
+iOS 10's launchd runs sandbox_check("mach-lookup") before each
+bootstrap lookup; with no Sandbox policy __mac_syscall failed and
+launchd refused every lookup (BOOTSTRAP_NOT_PRIVILEGED), so notifyd
+and other on-demand services never started. The Sandbox check call now
+reports "allowed", as the Sandbox kext does for unsandboxed processes.
+
+Also: privileged bootstrap lookups drop BOOTSTRAP_PRIVILEGED_SERVER,
+rpi3_dtlog dumps the traced program's XPC traffic with launchd and its
+exec arguments.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches          |   2 +-
+ xnu/bsd/kern/kern_exec.c |   5 ++
+ xnu/osfmk/ipc/mach_msg.c | 101 +++++++++++++++++++++++++++++++++++++++
+ xnu/security/mac_base.c  |  16 +++++++
+ 4 files changed, 123 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 4a67702..9bc43ae 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-37f65b4b6e020c69
++d8cd4114ce500be8
+diff --git a/xnu/bsd/kern/kern_exec.c b/xnu/bsd/kern/kern_exec.c
+index f7c4872..7b98d9b 100644
+--- a/xnu/bsd/kern/kern_exec.c
++++ b/xnu/bsd/kern/kern_exec.c
+@@ -3184,7 +3184,12 @@ exec_extract_strings(struct image_params *imgp)
+ 		static const char *dtenv[] = { "OS_ACTIVITY_DT_MODE=YES", "ACTIVITY_LOG_STDERR=1",
+ 		    "CFLOG_FORCE_STDERR=1" };
+ 		unsigned k;
++		const char *s = imgp->ip_strings;
+ 
++		/* The path and the first arguments (xpcproxy's job label). */
++		for (k = 0; k < 4 && s < imgp->ip_strendp; s += strlen(s) + 1)
++			if (*s)
++				kprintf("rpi3 exec: [%d] %s\n", k++, s);
+ 		for (k = 0; k < sizeof(dtenv) / sizeof(dtenv[0]); k++) {
+ 			if (imgp->ip_argspace < new_ptr_size ||
+ 			    exec_add_user_string(imgp, CAST_USER_ADDR_T(dtenv[k]), UIO_SYSSPACE, TRUE) != 0)
+diff --git a/xnu/osfmk/ipc/mach_msg.c b/xnu/osfmk/ipc/mach_msg.c
+index 5914841..5b438ce 100644
+--- a/xnu/osfmk/ipc/mach_msg.c
++++ b/xnu/osfmk/ipc/mach_msg.c
+@@ -605,6 +605,103 @@ rpi3_msg_error(const char *stage, mach_msg_header_t *h, mach_msg_return_t mr)
+ 	    h ? h->msgh_size : 0, h ? (unsigned)(uintptr_t)h->msgh_remote_port : 0,
+ 	    h ? (unsigned)(uintptr_t)h->msgh_local_port : 0, mr);
+ }
++
++/*
++ * rpi3_dtlog=NAME: dump the readable text of messages between NAME and
++ * launchd (XPC bootstrap requests and their replies).
++ */
++static void
++rpi3_msg_dump(ipc_kmsg_t kmsg)
++{
++	const char *name = rpi3_dtlog_name();
++	ipc_port_t dest = (ipc_port_t)kmsg->ikm_header->msgh_remote_port;
++	task_t rt = TASK_NULL;
++	void *sp = current_task()->bsd_info, *rp;
++	static unsigned logs;
++	char line[200];
++	unsigned i, n = 0, size = kmsg->ikm_header->msgh_size;
++	const unsigned char *b = (const unsigned char *)kmsg->ikm_header;
++
++	if (!name[0] || !sp || logs > 300 || !IP_VALID(dest))
++		return;
++	ip_lock(dest);
++	if (ip_active(dest) && dest->ip_receiver_name && dest->ip_receiver)
++		rt = dest->ip_receiver->is_task;
++	ip_unlock(dest);
++	if (rt == TASK_NULL || (rp = rt->bsd_info) == NULL)
++		return;
++	if (!((proc_pid(sp) == 1 && !strncmp(proc_name_address(rp), name, strlen(name))) ||
++	    (proc_pid(rp) == 1 && !strncmp(proc_name_address(sp), name, strlen(name)))))
++		return;
++	logs++;
++	for (i = 0; i < size && i < 1024 && n < sizeof(line) - 1; i++) {
++		unsigned char c = b[i];
++
++		if (c >= 0x20 && c < 0x7f)
++			line[n++] = c;
++		else if (n && line[n - 1] != '|')
++			line[n++] = '|';
++	}
++	line[n] = 0;
++	kprintf("rpi3 xpc: %s->%s id=%x size=%u %s\n", proc_name_address(sp),
++	    proc_name_address(rp), kmsg->ikm_header->msgh_id, size, line);
++	if (size <= 300) {
++		char hex[700];
++
++		for (i = 0, n = 0; i < size && n < sizeof(hex) - 10; i += 4)
++			n += snprintf(hex + n, sizeof(hex) - n, "%08x ", *(const uint32_t *)(b + i));
++		kprintf("rpi3 xpc: hex %s\n", hex);
++	}
++	if (0) {
++		for (i = 0, n = 0; i < size; i += 4)
++			n += snprintf(line + n, sizeof(line) - n, "%08x ", *(const uint32_t *)(b + i));
++		kprintf("rpi3 xpc: hex %s\n", line);
++	}
++}
++
++/*
++ * iOS 10 libxpc bootstrap lookups (XPC routine 207) sent to launchd with
++ * BOOTSTRAP_PRIVILEGED_SERVER are refused with BOOTSTRAP_NOT_PRIVILEGED on
++ * this kernel (launchd does not see the callers in its system domain), so
++ * nothing can reach notifyd. Drop the flag: every service here is a
++ * system one anyway.
++ */
++static void
++rpi3_xpc_lookup_fixup(ipc_kmsg_t kmsg)
++{
++	extern int rpi3_ios10_layout;
++	static const char routine[] = "routine\0\0\x40\0\0\xcf\0\0\0";
++	static const char flags[] = "flags\0\0\0\0\x40\0\0";
++	ipc_port_t dest = (ipc_port_t)kmsg->ikm_header->msgh_remote_port;
++	unsigned char *b = (unsigned char *)(kmsg->ikm_header + 1);
++	unsigned size = kmsg->ikm_header->msgh_size, i, have = 0;
++	task_t rt = TASK_NULL;
++
++	if (!rpi3_ios10_layout || size < 64 || size > 2048 ||
++	    (kmsg->ikm_header->msgh_bits & MACH_MSGH_BITS_COMPLEX) || !IP_VALID(dest))
++		return;
++	size -= sizeof(mach_msg_header_t);
++	if (memcmp(b, "!CPX", 4) != 0)
++		return;
++	ip_lock(dest);
++	if (ip_active(dest) && dest->ip_receiver_name && dest->ip_receiver)
++		rt = dest->ip_receiver->is_task;
++	ip_unlock(dest);
++	if (rt == TASK_NULL || rt->bsd_info == NULL || proc_pid(rt->bsd_info) != 1)
++		return;
++	for (i = 0; i + sizeof(routine) <= size; i += 4)
++		if (!memcmp(b + i, routine, sizeof(routine) - 1)) {
++			have = 1;
++			break;
++		}
++	if (!have)
++		return;
++	for (i = 0; i + sizeof(flags) + 4 <= size; i += 4)
++		if (!memcmp(b + i, flags, sizeof(flags) - 1)) {
++			*(uint32_t *)(b + i + sizeof(flags) - 1) &= ~8U;
++			break;
++		}
++}
+ #endif
+ 
+ mach_msg_return_t
+@@ -707,6 +804,10 @@ mach_msg_overwrite_trap(
+             printf("IOS7LAB checkin ROUTE id=%d receiver-task=%p receiver-name=%x\n",
+                    lab_send_id, receiver_task, receiver_name);
+         }
++#endif
++#if BOARD_CONFIG_RASPBERRYPI3
++		rpi3_xpc_lookup_fixup(kmsg);
++		rpi3_msg_dump(kmsg);
+ #endif
+ 		mr = ipc_kmsg_send(kmsg, option & MACH_SEND_TIMEOUT, msg_timeout);
+ #if BOARD_CONFIG_QSD8250_LEO
+diff --git a/xnu/security/mac_base.c b/xnu/security/mac_base.c
+index 31f625a..0ee39cd 100644
+--- a/xnu/security/mac_base.c
++++ b/xnu/security/mac_base.c
+@@ -2125,6 +2125,22 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
+ 	AUDIT_ARG(value32, uap->call);
+ 	AUDIT_ARG(mac_string, target);
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++	/*
++	 * There is no Sandbox policy here, so nothing is sandboxed. iOS 10's
++	 * launchd still asks sandbox_check() ("mach-lookup") before every
++	 * bootstrap lookup and treats a failed check as a denial; answer
++	 * the check call (2) the way the Sandbox kext does for an
++	 * unsandboxed process: allowed.
++	 */
++	{
++		extern int rpi3_ios10_layout;
++
++		if (rpi3_ios10_layout && uap->call == 2 && strcmp(target, "Sandbox") == 0)
++			return (0);
++	}
++#endif
++
+ 	error = ENOPOLICY;
+ 
+ 	for (i = 0; i < mac_policy_list.staticmax; i++) {
+-- 
+2.43.0
+
