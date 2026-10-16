@@ -1,0 +1,393 @@
+From 8cd39d04fcc8381299d0ebd2eee993473bf960e0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 05:51:04 +0000
+Subject: [PATCH] Load newer iOS root filesystems: zlib HFS compression, any
+ rootfs size, zero-based dyld
+
+Groundwork from trying iOS 10.3.4 (iPhone 5, armv7s) on the Pi:
+- decmpfs: built-in zlib decompressors for HFS+ compression types 3
+  (xattr) and 4 (resource fork). iOS 8+ root filesystems store most files
+  compressed (iOS 10.3.4: 88649 of 97022 files); reading one failed with
+  ENOTSUP.
+- The Pi locates IOS7/ROOTFS.HFS of any size (the HD2 image's 939524096
+  bytes was hard-coded); both HFS+ headers are still checked.
+- dyld from iOS 8 on is linked at address 0: preflight it and map it at a
+  free address instead of on page zero. A preflight (no map) no longer
+  fails the entry-point check it cannot perform.
+---
+ xnu/bsd/kern/decmpfs.c                        | 273 ++++++++++++++++++
+ xnu/bsd/kern/mach_loader.c                    |  23 +-
+ .../ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp   |   8 +-
+ 3 files changed, 300 insertions(+), 4 deletions(-)
+
+diff --git a/xnu/bsd/kern/decmpfs.c b/xnu/bsd/kern/decmpfs.c
+index a2d649e..1f6bb17 100644
+--- a/xnu/bsd/kern/decmpfs.c
++++ b/xnu/bsd/kern/decmpfs.c
+@@ -1765,6 +1765,277 @@ static decmpfs_registration Type1Reg =
+     .get_flags         = NULL  /* no flags */
+ };
+ 
++#pragma mark --- zlib compressors (types 3 and 4) ---
++
++/*
++ * Apple's AppleFSCompressionTypeZlib kext, built in: iOS 8 and later root
++ * filesystems store most files compressed (types 3 and 4). This kernel had
++ * no decompressor for them, so reading such a file failed with ENOTSUP.
++ *   type 3: zlib stream (or, if the first byte's low nibble is 0xF, raw
++ *           bytes after it) in the com.apple.decmpfs xattr, after its header.
++ *   type 4: the same, in 64 KiB blocks in the resource fork: at 0x100 a
++ *           big-endian length, then a little-endian block count and
++ *           {offset, size} pairs, offsets relative to 0x104.
++ */
++#include <libkern/zlib.h>
++
++#define CMP_ZLIB_XATTR	3
++#define CMP_ZLIB_RSRC	4
++#define CMP_ZLIB_BLOCK	65536
++#define CMP_ZLIB_MAX	(64 * 1024 * 1024)
++
++static void *
++decmpfs_z_alloc(__unused void *opaque, u_int items, u_int size)
++{
++	uint64_t bytes = (uint64_t)items * size + sizeof(uint32_t);
++	uint32_t *p;
++
++	if (bytes > 8 * 1024 * 1024)
++		return (NULL);
++	p = (uint32_t *)kalloc((vm_size_t)bytes);
++	if (!p)
++		return (NULL);
++	*p = (uint32_t)bytes;
++	return (p + 1);
++}
++
++static void
++decmpfs_z_free(__unused void *opaque, void *ptr)
++{
++	uint32_t *p = (uint32_t *)ptr - 1;
++
++	if (ptr)
++		kfree(p, *p);
++}
++
++/* Decompress one chunk (zlib or raw-marked) into dst; *outlen = bytes produced. */
++static int
++decmpfs_zlib_chunk(const uint8_t *src, size_t srclen, uint8_t *dst, size_t dstlen, size_t *outlen)
++{
++	z_stream z;
++	int zr;
++
++	*outlen = 0;
++	if (srclen == 0)
++		return (0);
++	if ((src[0] & 0x0f) == 0x0f) {
++		size_t n = srclen - 1;
++		if (n > dstlen)
++			n = dstlen;
++		memcpy(dst, src + 1, n);
++		*outlen = n;
++		return (0);
++	}
++	bzero(&z, sizeof (z));
++	z.zalloc = decmpfs_z_alloc;
++	z.zfree = decmpfs_z_free;
++	z.next_in = (Bytef *)(uintptr_t)src;
++	z.avail_in = (uInt)srclen;
++	z.next_out = dst;
++	z.avail_out = (uInt)dstlen;
++	if (inflateInit(&z) != Z_OK)
++		return (EIO);
++	zr = inflate(&z, Z_FINISH);
++	*outlen = dstlen - z.avail_out;
++	inflateEnd(&z);
++	return ((zr == Z_STREAM_END || zr == Z_BUF_ERROR || zr == Z_OK) ? 0 : EIO);
++}
++
++/* Copy src into the vector list starting at *vi/*voff. */
++static void
++decmpfs_vec_put(decmpfs_vector *vec, int nvec, int *vi, user_ssize_t *voff, const uint8_t *src, size_t len, user_ssize_t *done)
++{
++	while (len && *vi < nvec) {
++		user_ssize_t room = vec[*vi].size - *voff;
++		size_t n = (size_t)room < len ? (size_t)room : len;
++		memcpy((uint8_t *)vec[*vi].buf + *voff, src, n);
++		src += n; len -= n; *voff += n; *done += n;
++		if (*voff == vec[*vi].size) {
++			(*vi)++;
++			*voff = 0;
++		}
++	}
++}
++
++static int
++decmpfs_validate_zlib_xattr(__unused vnode_t vp, __unused vfs_context_t ctx, decmpfs_header *hdr)
++{
++	if (hdr->attr_size <= sizeof (decmpfs_disk_header) || hdr->uncompressed_size > CMP_ZLIB_MAX)
++		return (EINVAL);
++	return (0);
++}
++
++static int
++decmpfs_fetch_zlib_xattr(__unused vnode_t vp, __unused vfs_context_t ctx, decmpfs_header *hdr, off_t offset, user_ssize_t size, int nvec, decmpfs_vector *vec, uint64_t *bytes_read)
++{
++	size_t total = (size_t)hdr->uncompressed_size, got = 0;
++	uint8_t *buf;
++	int err, vi = 0;
++	user_ssize_t voff = 0, done = 0;
++
++	if (offset < 0 || (uint64_t)offset >= hdr->uncompressed_size) {
++		if (bytes_read)
++			*bytes_read = 0;
++		return (0);
++	}
++	if (total == 0 || total > CMP_ZLIB_MAX)
++		return (EINVAL);
++	buf = (uint8_t *)kalloc(total);
++	if (!buf)
++		return (ENOMEM);
++	err = decmpfs_zlib_chunk(hdr->attr_bytes, hdr->attr_size - sizeof (decmpfs_disk_header), buf, total, &got);
++	if (!err) {
++		size_t n = got > (size_t)offset ? got - (size_t)offset : 0;
++		if ((user_ssize_t)n > size)
++			n = (size_t)size;
++		decmpfs_vec_put(vec, nvec, &vi, &voff, buf + offset, n, &done);
++		if (bytes_read)
++			*bytes_read = done;
++	}
++	kfree(buf, total);
++	return (err);
++}
++
++static int
++decmpfs_read_rsrc(vnode_t vp, vfs_context_t ctx, off_t off, void *buf, size_t len)
++{
++	uio_t uio;
++	size_t sz = 0;
++	int err;
++
++	uio = uio_create(1, off, UIO_SYSSPACE, UIO_READ);
++	if (!uio)
++		return (ENOMEM);
++	uio_addiov(uio, CAST_USER_ADDR_T(buf), len);
++	err = vn_getxattr(vp, XATTR_RESOURCEFORK_NAME, uio, &sz, XATTR_NOSECURITY, ctx);
++	if (!err && uio_resid(uio) != 0)
++		err = EIO;
++	uio_free(uio);
++	return (err);
++}
++
++static int
++decmpfs_validate_zlib_rsrc(__unused vnode_t vp, __unused vfs_context_t ctx, decmpfs_header *hdr)
++{
++	return (hdr->uncompressed_size > 16ULL * 1024 * 1024 * 1024 ? EINVAL : 0);
++}
++
++static void
++decmpfs_adjust_zlib_rsrc(__unused vnode_t vp, __unused vfs_context_t ctx, decmpfs_header *hdr, off_t *offset, user_ssize_t *size)
++{
++	off_t start = *offset & ~(off_t)(CMP_ZLIB_BLOCK - 1);
++	off_t end = *offset + *size;
++
++	end = (end + CMP_ZLIB_BLOCK - 1) & ~(off_t)(CMP_ZLIB_BLOCK - 1);
++	if ((uint64_t)end > hdr->uncompressed_size)
++		end = (off_t)hdr->uncompressed_size;
++	if (end < start)
++		end = start;
++	*offset = start;
++	*size = end - start;
++}
++
++static int
++decmpfs_fetch_zlib_rsrc(vnode_t vp, vfs_context_t ctx, decmpfs_header *hdr, off_t offset, user_ssize_t size, int nvec, decmpfs_vector *vec, uint64_t *bytes_read)
++{
++	uint32_t head[2], count, first, last, b, table_bytes;
++	uint32_t *table = NULL;
++	uint8_t *in = NULL, *out = NULL;
++	size_t in_bytes = 0;
++	int err = 0, vi = 0;
++	user_ssize_t voff = 0, done = 0, skip;
++
++	if (bytes_read)
++		*bytes_read = 0;
++	if (offset < 0 || size <= 0 || (uint64_t)offset >= hdr->uncompressed_size)
++		return (0);
++	err = decmpfs_read_rsrc(vp, ctx, 0x100, head, sizeof (head));
++	if (err)
++		return (err);
++	count = OSSwapLittleToHostInt32(head[1]);
++	if (count == 0 || count > (uint32_t)((hdr->uncompressed_size + CMP_ZLIB_BLOCK - 1) / CMP_ZLIB_BLOCK) + 1)
++		return (EINVAL);
++	first = (uint32_t)(offset / CMP_ZLIB_BLOCK);
++	last = (uint32_t)((offset + size - 1) / CMP_ZLIB_BLOCK);
++	if (last >= count)
++		last = count - 1;
++	table_bytes = (last - first + 1) * 8;
++	table = (uint32_t *)kalloc(table_bytes);
++	out = (uint8_t *)kalloc(CMP_ZLIB_BLOCK);
++	if (!table || !out) {
++		err = ENOMEM;
++		goto done;
++	}
++	err = decmpfs_read_rsrc(vp, ctx, 0x108 + (off_t)first * 8, table, table_bytes);
++	if (err)
++		goto done;
++	skip = offset - (off_t)first * CMP_ZLIB_BLOCK;
++	for (b = first; b <= last && done < size && !err; b++) {
++		uint32_t boff = OSSwapLittleToHostInt32(table[(b - first) * 2]);
++		uint32_t bsize = OSSwapLittleToHostInt32(table[(b - first) * 2 + 1]);
++		size_t got = 0;
++
++		if (bsize == 0 || bsize > CMP_ZLIB_BLOCK + 1024) {
++			err = EINVAL;
++			break;
++		}
++		if (bsize > in_bytes) {
++			if (in)
++				kfree(in, in_bytes);
++			in_bytes = bsize;
++			in = (uint8_t *)kalloc(in_bytes);
++			if (!in) {
++				in_bytes = 0;
++				err = ENOMEM;
++				break;
++			}
++		}
++		err = decmpfs_read_rsrc(vp, ctx, 0x104 + (off_t)boff, in, bsize);
++		if (err)
++			break;
++		err = decmpfs_zlib_chunk(in, bsize, out, CMP_ZLIB_BLOCK, &got);
++		if (err)
++			break;
++		if ((size_t)skip < got) {
++			size_t n = got - (size_t)skip;
++			if ((user_ssize_t)n > size - done)
++				n = (size_t)(size - done);
++			decmpfs_vec_put(vec, nvec, &vi, &voff, out + skip, n, &done);
++		}
++		skip = 0;
++	}
++	if (!err && bytes_read)
++		*bytes_read = done;
++done:
++	if (in)
++		kfree(in, in_bytes);
++	if (out)
++		kfree(out, CMP_ZLIB_BLOCK);
++	if (table)
++		kfree(table, table_bytes);
++	return (err);
++}
++
++static decmpfs_registration ZlibXattrReg =
++{
++	.decmpfs_registration = DECMPFS_REGISTRATION_VERSION,
++	.validate = decmpfs_validate_zlib_xattr,
++	.adjust_fetch = NULL,
++	.fetch = decmpfs_fetch_zlib_xattr,
++	.free_data = NULL,
++	.get_flags = NULL
++};
++
++static decmpfs_registration ZlibRsrcReg =
++{
++	.decmpfs_registration = DECMPFS_REGISTRATION_VERSION,
++	.validate = decmpfs_validate_zlib_rsrc,
++	.adjust_fetch = decmpfs_adjust_zlib_rsrc,
++	.fetch = decmpfs_fetch_zlib_rsrc,
++	.free_data = NULL,
++	.get_flags = NULL
++};
++
+ #pragma mark --- decmpfs initialization ---
+ 
+ void decmpfs_init()
+@@ -1780,6 +2051,8 @@ void decmpfs_init()
+     decompress_channel_mtx = lck_mtx_alloc_init(decmpfs_lockgrp, NULL);
+     
+     register_decmpfs_decompressor(CMP_Type1, &Type1Reg);
++    register_decmpfs_decompressor(CMP_ZLIB_XATTR, &ZlibXattrReg);
++    register_decmpfs_decompressor(CMP_ZLIB_RSRC, &ZlibRsrcReg);
+     
+     done = 1;
+ }
+diff --git a/xnu/bsd/kern/mach_loader.c b/xnu/bsd/kern/mach_loader.c
+index 0f4a09f..545fbe6 100644
+--- a/xnu/bsd/kern/mach_loader.c
++++ b/xnu/bsd/kern/mach_loader.c
+@@ -81,6 +81,7 @@
+ #include <vm/vnode_pager.h>
+ #include <vm/vm_protos.h> 
+ 
++
+ /*
+  * XXX vm/pmap.h should not treat these prototypes as MACH_KERNEL_PRIVATE
+  * when KERNEL is defined.
+@@ -594,7 +595,8 @@ parse_machfile(
+ 		/*
+ 		 * Check that the entry point is contained in an executable segments
+ 		 */ 
+-		if ((pass == 3) && (result->validentry == 0)) {
++		/* A preflight (no map) maps nothing and cannot validate the entry. */
++		if ((pass == 3) && (result->validentry == 0) && (map != VM_MAP_NULL)) {
+ 			thread_state_initialize(thread);
+ 			ret = LOAD_FAILURE;
+ 			break;
+@@ -1379,8 +1381,21 @@ load_dylinker(
+ 	 *	mapped to its address.
+ 	 */
+ 
+-	ret = parse_machfile(vp, map, thread, header, file_offset,
+-	    macho_size, depth, slide, myresult);
++	/*
++	 * dyld from iOS 8 on is linked at address 0 and expects the kernel to
++	 * choose its address (newer kernels always slide it). Mapped "as is"
++	 * it would land on page zero, so place it like a dyld that was in the
++	 * way: preflight its ranges, then map it at a free address.
++	 */
++	ret = parse_machfile(vp, VM_MAP_NULL, THREAD_NULL, header,
++	    file_offset, macho_size, depth, 0 /* slide */, myresult);
++	if (ret == LOAD_SUCCESS && myresult->min_vm_addr == 0) {
++		ret = LOAD_NOSPACE;
++	} else {
++		*myresult = load_result_null;
++		ret = parse_machfile(vp, map, thread, header, file_offset,
++		    macho_size, depth, slide, myresult);
++	}
+ 
+ 	/*
+ 	 *	If it turned out something was in the way, then we'll take
+@@ -1414,6 +1429,8 @@ load_dylinker(
+ 
+ 		/* To find an appropriate load address, do a quick allocation */
+ 		map_addr = dyl_start;
++		if (map_addr == 0)
++			map_addr = 0x1fe00000ULL;	/* where 32-bit dyld used to live */
+ 		ret = mach_vm_allocate(map, &map_addr, dyl_length, VM_FLAGS_ANYWHERE);
+ 		if (ret != KERN_SUCCESS) {
+ 			ret = LOAD_NOSPACE;
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
+index a132921..903df74 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
+@@ -253,10 +253,16 @@ bool IOS7LeoHFSFile::start(IOService *provider)
+  work=(fl32_work *)IOMalloc(sizeof(*work));extents=(fl32_extent *)IOMalloc(sizeof(*extents)*LEO_EXTENT_CAP);
+  if(!mutex||!bounce||!work||!extents){phase(StorageFailed,0,kIOReturnNoMemory);return false;}
+  fl32_io io={this,read512,rawSectors};
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++ /* Any size: the HD2 release's rootfs.hfs or another iOS build's. The
++  * locator still checks that both HFS+ volume headers match the file. */
++ fl32_limits limits={131072U,128U,0};
++#else
+  fl32_limits limits={131072U,128U,939524096ULL};
++#endif
+  phase(LocatingFile);int result=fl32_locate(&io,&limits,work,extents,LEO_EXTENT_CAP,&image);
+  if(result!=FL32_OK){phase(StorageFailed,result,(IOReturn)work->backend_error);ios7leo_root_file_status();return false;}
+- if(image.magic!=FL32_IMAGE_MAGIC||image.file_bytes!=limits.expected_file_bytes||
++ if(image.magic!=FL32_IMAGE_MAGIC||(limits.expected_file_bytes&&image.file_bytes!=limits.expected_file_bytes)||
+     !image.extent_count||image.extent_count>LEO_EXTENT_CAP){phase(StorageFailed,FL32_RANGE);return false;}
+  initialized=true;
+  if(!initializeCow()){phase(StorageFailed,0,kIOReturnNoMemory);ios7leo_root_file_status();return false;}
+-- 
+2.43.0
+
