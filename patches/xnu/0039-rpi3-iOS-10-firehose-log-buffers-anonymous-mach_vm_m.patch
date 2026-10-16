@@ -1,0 +1,96 @@
+From 5e9fd8715eb4b17ca89b87c8168fce9e12f1b00b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 16:58:31 +0000
+Subject: [PATCH] rpi3: iOS 10 firehose log buffers (anonymous mach_vm_map MIG,
+ MAP_MEM_VM_SHARE)
+
+libdispatch maps its firehose buffer with mach_vm_map(MEMORY_OBJECT_NULL,
+VM_INHERIT_NONE), which goes through MIG; the 64-bit wire adapter only
+converted requests carrying a memory object, so the kernel answered
+MIG_BAD_ARGUMENTS and every process crashed on a NULL buffer once logd
+was reachable. It then shares the buffer with
+mach_make_memory_entry_64(MAP_MEM_VM_SHARE), which this kernel rejected
+as an unknown flag. Also silence a leftover vm_map_pmap_enter print.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                         |  2 +-
+ xnu/osfmk/kern/ios7lab_named_map_wire.h |  4 +++-
+ xnu/osfmk/vm/vm_map.c                   |  2 +-
+ xnu/osfmk/vm/vm_user.c                  | 17 +++++++++++++++++
+ 4 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 9bc43ae..37fcd08 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-d8cd4114ce500be8
++c52a121ef54bcda7
+diff --git a/xnu/osfmk/kern/ios7lab_named_map_wire.h b/xnu/osfmk/kern/ios7lab_named_map_wire.h
+index 0912805..f0cff06 100644
+--- a/xnu/osfmk/kern/ios7lab_named_map_wire.h
++++ b/xnu/osfmk/kern/ios7lab_named_map_wire.h
+@@ -24,7 +24,9 @@ static int ios7lab_named_map_request32(unsigned char *message, size_t length)
+         message[39] != 0 || message[38] != 17 || message[48] != 1)
+         return 0;
+     port = ios7lab_named_map_get(message + 28);
+-    if (!port || port == 0xffffffffU) return 0;
++    /* A null object is an anonymous mapping (iOS 10 libdispatch's
++     * firehose buffer is mapped this way with VM_INHERIT_NONE). */
++    if (port == 0xffffffffU) return 0;
+     /* Real kernel maps remain ARM32. Never silently truncate native values. */
+     if (ios7lab_named_map_get(message + 56) ||
+         ios7lab_named_map_get(message + 64) ||
+diff --git a/xnu/osfmk/vm/vm_map.c b/xnu/osfmk/vm/vm_map.c
+index dd9eeee..ce75197 100644
+--- a/xnu/osfmk/vm/vm_map.c
++++ b/xnu/osfmk/vm/vm_map.c
+@@ -1412,7 +1412,7 @@ vm_map_pmap_enter(
+ 			return;
+ 		}
+ 
+-		{
++		if (0) {
+ 			kprintf("vm_map_pmap_enter:");
+ 			kprintf("map: %p, addr: %llx, object: %p, offset: %llx\n",
+ 			       map, (unsigned long long)addr, object, (unsigned long long)offset);
+diff --git a/xnu/osfmk/vm/vm_user.c b/xnu/osfmk/vm/vm_user.c
+index eb47077..6b76f84 100644
+--- a/xnu/osfmk/vm/vm_user.c
++++ b/xnu/osfmk/vm/vm_user.c
+@@ -951,6 +951,11 @@ mach_vm_map(
+ 				       cur_protection,
+ 				       max_protection,
+ 				       inheritance);
++#if BOARD_CONFIG_RASPBERRYPI3
++	if (kr != KERN_SUCCESS && (flags >> 24) == 78 /* VM_MEMORY_GENEALOGY */)
++		kprintf("rpi3: mach_vm_map genealogy size %llx flags %x port %p prot %x/%x inh %x -> %d\n",
++		    initial_size, flags, port, cur_protection, max_protection, inheritance, kr);
++#endif
+ 
+ 	*address = vmmaddr;
+ 	return kr;
+@@ -1936,6 +1941,18 @@ mach_make_memory_entry_64(
+ 
+ 	boolean_t		force_shadow = FALSE;
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++	/*
++	 * MAP_MEM_VM_SHARE (0x400000, later kernels): a named entry that
++	 * shares the given range of the caller's map. iOS 10's libdispatch
++	 * hands its firehose log buffer to logd this way. This kernel's
++	 * default (no MAP_MEM_* creation flag) path already returns an
++	 * entry referencing the range's VM object, which is the same thing
++	 * for an ordinary anonymous region.
++	 */
++	if (permission & 0x00400000)
++		permission &= ~0x00400000;
++#endif
+ 	if (((permission & 0x00FF0000) &
+ 	     ~(MAP_MEM_ONLY |
+ 	       MAP_MEM_NAMED_CREATE |
+-- 
+2.43.0
+
