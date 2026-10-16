@@ -1,0 +1,70 @@
+From 572749fc899ffc661f64a188a7810cd83a264e91 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 19:15:40 +0000
+Subject: [PATCH] rpi3: hand out signed entitlements to iOS 10 daemons
+
+SecTaskLoadEntitlements failed (EINVAL) because every iOS 10 process
+loses CS_VALID over one slid shared cache page, and SHA-256 code
+directories could not be checked by the SHA-1-only entitlements
+verifier. With enforcement off, return the blob anyway.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches          |  2 +-
+ xnu/bsd/kern/kern_proc.c | 12 ++++++++++++
+ xnu/bsd/kern/ubc_subr.c  |  7 +++++++
+ 3 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 2a8ff10..2d8f544 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-32f821b80ea602bb
++82bcdb9498d37f95
+diff --git a/xnu/bsd/kern/kern_proc.c b/xnu/bsd/kern/kern_proc.c
+index 57a7d06..0cce2f0 100644
+--- a/xnu/bsd/kern/kern_proc.c
++++ b/xnu/bsd/kern/kern_proc.c
+@@ -1938,7 +1938,19 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 			void *start;
+ 			size_t length;
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++			/*
++			 * Code signing is not enforced here and one slid shared
++			 * cache page clears CS_VALID in every iOS 10 process;
++			 * the signed entitlements are still what the binary
++			 * carries, and iOS 10 daemons gate their services on them.
++			 */
++			extern int rpi3_ios10_layout;
++
++			if ((pt->p_csflags & CS_VALID) == 0 && !rpi3_ios10_layout) {
++#else
+ 			if ((pt->p_csflags & CS_VALID) == 0) {
++#endif
+ 				error = EINVAL;
+ 				break;
+ 			}
+diff --git a/xnu/bsd/kern/ubc_subr.c b/xnu/bsd/kern/ubc_subr.c
+index b8b1875..adc96ac 100644
+--- a/xnu/bsd/kern/ubc_subr.c
++++ b/xnu/bsd/kern/ubc_subr.c
+@@ -483,6 +483,13 @@ cs_entitlements_blob_get(proc_t p, void **out_start, size_t *out_length)
+ 		error = EBADEXEC;
+ 		goto out;
+ 	}
++#if BOARD_CONFIG_RASPBERRYPI3
++	/* Newer (SHA-256) code directories: not verified here (no enforcement). */
++	if (hash_size != SHA1_RESULTLEN) {
++		error = 0;
++		goto out;
++	}
++#endif
+ 	if (NULL == (computed_hash = kalloc(hash_size))) {
+ 		error = ENOMEM;
+ 		goto out;
+-- 
+2.43.0
+
