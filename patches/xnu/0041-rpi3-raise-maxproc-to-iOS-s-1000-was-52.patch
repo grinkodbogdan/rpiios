@@ -1,0 +1,110 @@
+From a939c4f416b6a976a7db553a3fb2f302911861e2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 18:44:00 +0000
+Subject: [PATCH] rpi3: raise maxproc to iOS's 1000 (was 52)
+
+MAXUSERS 2 gave maxproc 52; iOS 10 runs more processes than that, so
+launchd's later posix_spawn calls failed with EAGAIN and on-demand
+daemons (MobileGestaltHelper, which backboardd waits on) never started.
+Also log launchd's failing spawns, and let the watchdog backtrace the
+rpi3_dtlog program.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches          |  2 +-
+ xnu/bsd/conf/param.c     | 10 ++++++++++
+ xnu/bsd/kern/kern_exec.c |  9 +++++++++
+ xnu/osfmk/arm/trap.c     |  5 ++++-
+ 4 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index ba9bc19..2a8ff10 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-49f3b435dfabc2f9
++32f821b80ea602bb
+diff --git a/xnu/bsd/conf/param.c b/xnu/bsd/conf/param.c
+index ca30db4..9e36159 100644
+--- a/xnu/bsd/conf/param.c
++++ b/xnu/bsd/conf/param.c
+@@ -86,8 +86,18 @@ struct	timezone tz = { TIMEZONE, PST };
+ 
+ #define	NPROC (20 + 16 * MAXUSERS)
+ #define HNPROC 2500	/* based on thread_max */
++#if BOARD_CONFIG_RASPBERRYPI3
++/*
++ * MAXUSERS 2 allowed only 52 processes; iOS 10 runs well over that at
++ * boot (launchd's later spawns failed with EAGAIN, so on-demand daemons
++ * such as MobileGestaltHelper never started). Use iOS's own limits.
++ */
++int	maxproc = 1000;
++int	maxprocperuid = 666;
++#else
+ int	maxproc = NPROC;
+ int	maxprocperuid = NPROC/2;
++#endif
+ /*__private_extern__*/ int hard_maxproc = HNPROC;	/* hardcoded limit */
+ int nprocs = 0; /* XXX */
+ 
+diff --git a/xnu/bsd/kern/kern_exec.c b/xnu/bsd/kern/kern_exec.c
+index 7b98d9b..8c2aee3 100644
+--- a/xnu/bsd/kern/kern_exec.c
++++ b/xnu/bsd/kern/kern_exec.c
+@@ -2364,6 +2364,15 @@ bad:
+ 	if (ios7lab_spawn_path != NULL)
+ 		FREE(ios7lab_spawn_path, M_TEMP);
+ #endif
++#if BOARD_CONFIG_RASPBERRYPI3
++	if (error && p->p_pid == 1) {
++		char path[64] = "";
++		size_t len;
++
++		(void)copyinstr(uap->path, path, sizeof(path), &len);
++		kprintf("rpi3: launchd posix_spawn %s failed: %d\n", path, error);
++	}
++#endif
+ 	
+ 	return(error);
+ }
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index e389089..db4ab95 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -376,6 +376,7 @@ extern int32_t rpi3_sd_stat_fail_result;
+ extern uint32_t rpi3_sd_stat_fail_block, rpi3_sd_stat_fail_irq, rpi3_sd_stat_fail_status;
+ extern uint64_t rpi3_sd_stat_us;
+ static int rpi3_watchdog_event;
++extern const char *rpi3_dtlog_name(void);
+ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+ {
+     unsigned round;
+@@ -396,7 +397,7 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                 continue;
+             queue_iterate(&task->threads, th, thread_t, task_threads) {
+                 arm_saved_state_t *s = &th->machine.user_regs;
+-                if (k++ >= 3)
++                if (k++ >= 6)
+                     break;
+                 printf(" %s[%d].%u st=%x ev=%08x k=%08x pc=%08x lr=%08x r12=%x r0=%x\n",
+                        proc_name_address(task->bsd_info), proc_pid(task->bsd_info), k,
+@@ -405,6 +406,7 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                 if ((round % 6) == 5 &&
+                     (!strncmp(proc_name_address(task->bsd_info), "backboardd", 10) ||
+                      !strcmp(proc_name_address(task->bsd_info), "logd") ||
++                     (rpi3_dtlog_name()[0] && !strcmp(proc_name_address(task->bsd_info), rpi3_dtlog_name())) ||
+                      !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11)))
+                     kprintf("rpi3 wd: %s[%d].%u st=%x ev=%08x k=%08x pc=%08x lr=%08x sp=%08x r12=%x r0=%x\n",
+                             proc_name_address(task->bsd_info), proc_pid(task->bsd_info), k,
+@@ -413,6 +415,7 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                 if ((round % 6) == 5 &&
+                     (!strncmp(proc_name_address(task->bsd_info), "backboardd", 10) ||
+                      !strcmp(proc_name_address(task->bsd_info), "logd") ||
++                     (rpi3_dtlog_name()[0] && !strcmp(proc_name_address(task->bsd_info), rpi3_dtlog_name())) ||
+                      !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11))) {
+                     uint32_t fp = s->r[7], frame[2];
+                     unsigned f;
+-- 
+2.43.0
+
