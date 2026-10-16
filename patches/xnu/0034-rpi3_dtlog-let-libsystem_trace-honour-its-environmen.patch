@@ -1,0 +1,36 @@
+From 4fe522d887915961d933d34b8413842da6c56e61 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 14:26:36 +0000
+Subject: [PATCH] rpi3_dtlog: let libsystem_trace honour its environment
+ (issetugid 0)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/bsd/kern/kern_prot.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/xnu/bsd/kern/kern_prot.c b/xnu/bsd/kern/kern_prot.c
+index 0f1ab08..c2988a0 100644
+--- a/xnu/bsd/kern/kern_prot.c
++++ b/xnu/bsd/kern/kern_prot.c
+@@ -686,6 +686,16 @@ issetugid(proc_t p, __unused struct issetugid_args *uap, int32_t *retval)
+ 	 */
+ 
+ 	*retval = (p->p_flag & P_SUGID) ? 1 : 0;
++#if BOARD_CONFIG_RASPBERRYPI3
++	{
++		/* rpi3_dtlog programs: let libsystem_trace honour its environment */
++		extern const char *rpi3_dtlog_name(void);
++		const char *name = rpi3_dtlog_name();
++
++		if (name[0] && strncmp(p->p_comm, name, strlen(name)) == 0)
++			*retval = 0;
++	}
++#endif
+ 	return (0);
+ }
+ 
+-- 
+2.43.0
+
