@@ -1,0 +1,83 @@
+From b31bcfe63c70444bcb253075e941e59520d18812 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 14:58:54 +0000
+Subject: [PATCH] rpi3_dtlog: report the traced program's failing Mach message
+ sends
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches          |  2 +-
+ xnu/osfmk/ipc/mach_msg.c | 29 +++++++++++++++++++++++++++++
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index fce46a9..bd21bf1 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-dc68b009074fd0ba
++81ecada4fa9b5dca
+diff --git a/xnu/osfmk/ipc/mach_msg.c b/xnu/osfmk/ipc/mach_msg.c
+index f2f34aa..5914841 100644
+--- a/xnu/osfmk/ipc/mach_msg.c
++++ b/xnu/osfmk/ipc/mach_msg.c
+@@ -587,6 +587,26 @@ mach_msg_receive_continue(void)
+  *		All of mach_msg_send and mach_msg_receive error codes.
+  */
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++/* rpi3_dtlog=NAME: report NAME's failing Mach message sends on serial */
++extern const char *rpi3_dtlog_name(void);
++extern char *proc_name_address(void *p);
++static void
++rpi3_msg_error(const char *stage, mach_msg_header_t *h, mach_msg_return_t mr)
++{
++	const char *name = rpi3_dtlog_name();
++	void *p = current_task()->bsd_info;
++	static unsigned logs;
++
++	if (!name[0] || !p || strncmp(proc_name_address(p), name, strlen(name)) != 0 || logs++ > 200)
++		return;
++	kprintf("rpi3 msg: %s %s id=%d bits=%x size=%u remote=%x local=%x -> %x\n",
++	    proc_name_address(p), stage, h ? h->msgh_id : -1, h ? h->msgh_bits : 0,
++	    h ? h->msgh_size : 0, h ? (unsigned)(uintptr_t)h->msgh_remote_port : 0,
++	    h ? (unsigned)(uintptr_t)h->msgh_local_port : 0, mr);
++}
++#endif
++
+ mach_msg_return_t
+ mach_msg_overwrite_trap(
+ 	struct mach_msg_overwrite_trap_args *args)
+@@ -648,12 +668,18 @@ mach_msg_overwrite_trap(
+             printf("IOS7LAB checkin SEND pid=%d id=%d size=%u destination-name=%x bits=%x option=%x\n",
+                    proc_selfpid(), lab_send_id, kmsg->ikm_header->msgh_size,
+                    (unsigned)kmsg->ikm_header->msgh_remote_port, kmsg->ikm_header->msgh_bits, option);
++#endif
++#if BOARD_CONFIG_RASPBERRYPI3
++		mach_msg_header_t rpi3_hdr = *kmsg->ikm_header;
+ #endif
+ 		mr = ipc_kmsg_copyin(kmsg, space, map, option & MACH_SEND_NOTIFY);
+ #if BOARD_CONFIG_QSD8250_LEO
+         leo_rpc060_note(leo_rpc060_seq,mr==MACH_MSG_SUCCESS?LEO_RPC060_COPYIN:LEO_RPC060_DONE,(uint32_t)mr,0);
+ #endif
+ 		if (mr != MACH_MSG_SUCCESS) {
++#if BOARD_CONFIG_RASPBERRYPI3
++			rpi3_msg_error("send-copyin", &rpi3_hdr, mr);
++#endif
+ #if BOARD_CONFIG_ARMPBA8
+             if (lab_send) printf("IOS7LAB checkin COPYIN-ERROR pid=%d id=%d result=%x\n", proc_selfpid(), lab_send_id, mr);
+             if (lab_ls_send) printf("IOS7LAB LSIPC COPYIN-ERROR pid=%d id=%d result=%x\n", proc_selfpid(), lab_ls_send_id, mr);
+@@ -695,6 +721,9 @@ mach_msg_overwrite_trap(
+ #endif
+ 
+ 		if (mr != MACH_MSG_SUCCESS) {
++#if BOARD_CONFIG_RASPBERRYPI3
++			rpi3_msg_error("send", &rpi3_hdr, mr);
++#endif
+ 			mr |= ipc_kmsg_copyout_pseudo(kmsg, space, map, MACH_MSG_BODY_NULL);
+ 			(void) ipc_kmsg_put(msg_addr, kmsg, kmsg->ikm_header->msgh_size);
+ #if BOARD_CONFIG_QSD8250_LEO
+-- 
+2.43.0
+
