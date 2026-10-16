@@ -1,0 +1,310 @@
+From 5ae90c127a53ff3ff0867e6f0b9ae934b09bd148 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 18:04:07 +0000
+Subject: [PATCH] rpi3: iOS 10 logd/libdispatch: boot session UUID, activity
+ IDs, kevent fixes
+
+- kern.bootsessionuuid sysctl: libsystem_trace aborts without it (logd
+  could never start serving).
+- Mach trap 43 is mach_generate_activity_id on iOS 10 (map_fd here);
+  libdispatch aborts when it fails.
+- Undefined instructions: permanently-undefined encodings (Thumb trap,
+  ARM UDF) or a fault with VFP already on now raise EXC_BAD_INSTRUCTION
+  instead of re-enabling VFP and re-running the instruction forever;
+  logged on serial.
+- kevent: EV_VANISHED is not echoed back; EVFILT_MACHPORT knotes with no
+  message space left wait for the next scan, and too-large messages
+  report the buffer and the port name.
+- Watchdog prints user backtraces of backboardd/SpringBoard/logd;
+  rpi3_dtlog logs every send by the traced program.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches             |  2 +-
+ xnu/bsd/kern/kern_event.c   |  8 ++++++
+ xnu/bsd/kern/kern_sysctl.c  | 33 +++++++++++++++++++++++++
+ xnu/osfmk/arm/trap.c        | 49 +++++++++++++++++++++++++++++++++++++
+ xnu/osfmk/ipc/ipc_pset.c    | 14 ++++++++---
+ xnu/osfmk/ipc/mach_msg.c    | 13 +++++++++-
+ xnu/osfmk/kern/syscall_sw.c | 24 +++++++++++++++++-
+ xnu/osfmk/mach/mach_traps.h |  8 ++++++
+ 8 files changed, 145 insertions(+), 6 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 37fcd08..ba9bc19 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-c52a121ef54bcda7
++49f3b435dfabc2f9
+diff --git a/xnu/bsd/kern/kern_event.c b/xnu/bsd/kern/kern_event.c
+index 23d729f..8bc9570 100644
+--- a/xnu/bsd/kern/kern_event.c
++++ b/xnu/bsd/kern/kern_event.c
+@@ -1852,6 +1852,14 @@ kevent_register(struct kqueue *kq, struct kevent64_s *kev, __unused struct proc
+ 			kev->fflags = 0;
+ 			kev->data = 0;
+ 			kn->kn_kevent = *kev;
++#if BOARD_CONFIG_RASPBERRYPI3
++			/*
++			 * EV_VANISHED (0x0200) on registration only says the
++			 * caller copes with vanishing sources; it must not come
++			 * back on delivered events (libdispatch aborts on it).
++			 */
++			kn->kn_flags &= ~0x0200;
++#endif
+ 			kn->kn_inuse = 1;  /* for f_attach() */
+ 			kn->kn_status = KN_ATTACHING;
+ 
+diff --git a/xnu/bsd/kern/kern_sysctl.c b/xnu/bsd/kern/kern_sysctl.c
+index e8b7f9d..ab8c100 100644
+--- a/xnu/bsd/kern/kern_sysctl.c
++++ b/xnu/bsd/kern/kern_sysctl.c
+@@ -2321,6 +2321,39 @@ SYSCTL_PROC(_kern, OID_AUTO, bootargs,
+ 	NULL, 0,
+ 	sysctl_sysctl_bootargs, "A", "bootargs");
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++/*
++ * kern.bootsessionuuid (later kernels): a UUID made fresh at each boot.
++ * iOS 10's libsystem_trace stamps logs with it and aborts without it,
++ * which leaves logd unable to serve anyone.
++ */
++#include <sys/random.h>
++STATIC int
++sysctl_bootsessionuuid
++(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	static char uuid_string[37];
++
++	if (!uuid_string[0]) {
++		uint8_t u[16];
++
++		read_random(u, sizeof(u));
++		u[6] = (u[6] & 0x0f) | 0x40;	/* version 4 */
++		u[8] = (u[8] & 0x3f) | 0x80;
++		snprintf(uuid_string, sizeof(uuid_string),
++		    "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
++		    u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9],
++		    u[10], u[11], u[12], u[13], u[14], u[15]);
++	}
++	return (sysctl_io_string(req, uuid_string, sizeof(uuid_string), 0, NULL));
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, bootsessionuuid,
++	CTLFLAG_LOCKED | CTLFLAG_RD | CTLFLAG_KERN | CTLTYPE_STRING,
++	NULL, 0,
++	sysctl_bootsessionuuid, "A", "");
++#endif
++
+ SYSCTL_INT(_kern, KERN_MAXFILES, maxfiles, 
+ 		CTLFLAG_RW | CTLFLAG_KERN | CTLFLAG_LOCKED,
+ 		&maxfiles, 0, "");
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index 9d1ff8d..e389089 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -404,11 +404,31 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                        s->pc, s->lr, s->r[12], s->r[0]);
+                 if ((round % 6) == 5 &&
+                     (!strncmp(proc_name_address(task->bsd_info), "backboardd", 10) ||
++                     !strcmp(proc_name_address(task->bsd_info), "logd") ||
+                      !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11)))
+                     kprintf("rpi3 wd: %s[%d].%u st=%x ev=%08x k=%08x pc=%08x lr=%08x sp=%08x r12=%x r0=%x\n",
+                             proc_name_address(task->bsd_info), proc_pid(task->bsd_info), k,
+                             th->state, (uint32_t) th->wait_event, (uint32_t) th->continuation,
+                             s->pc, s->lr, s->sp, s->r[12], s->r[0]);
++                if ((round % 6) == 5 &&
++                    (!strncmp(proc_name_address(task->bsd_info), "backboardd", 10) ||
++                     !strcmp(proc_name_address(task->bsd_info), "logd") ||
++                     !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11))) {
++                    uint32_t fp = s->r[7], frame[2];
++                    unsigned f;
++
++                    kprintf("rpi3 wd bt: %s[%d].%u", proc_name_address(task->bsd_info),
++                            proc_pid(task->bsd_info), k);
++                    for (f = 0; f < 14 && fp; f++) {
++                        if (copyinmap(task->map, fp, frame, sizeof(frame)) != KERN_SUCCESS)
++                            break;
++                        kprintf(" %08x", frame[1]);
++                        if (frame[0] <= fp)
++                            break;
++                        fp = frame[0];
++                    }
++                    kprintf("\n");
++                }
+                 if (k == 1 &&
+                     ((proc_pid(task->bsd_info) == 1 && (th->state & TH_RUN)) ||
+                      !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11)))
+@@ -1133,6 +1153,30 @@ void sleh_undef(arm_saved_state_t * state)
+          * dyld's faulting one. I really just need to redo all of the VFP detection
+          * code, which will happen one day... I just hate myself for this.
+          */
++#if BOARD_CONFIG_RASPBERRYPI3
++        /*
++         * Permanently undefined encodings (Thumb "trap" 0xdeXX, ARM UDF), or
++         * any undefined instruction while VFP is already on, are real
++         * faults: iOS 10's libraries crash this way on purpose. Treating
++         * them as a VFP-enable request re-ran the instruction forever.
++         */
++        {
++            uint32_t fpexc, word = 0;
++            uint16_t half = 0;
++            int udf;
++
++            if (arm_ctx->cpsr & (1 << 5)) {
++                udf = copyin((user_addr_t) arm_ctx->pc, &half, sizeof(half)) == 0 &&
++                    (half & 0xff00) == 0xde00;
++            } else {
++                udf = copyin((user_addr_t) arm_ctx->pc, &word, sizeof(word)) == 0 &&
++                    (word & 0x0ff000f0) == 0x07f000f0;
++            }
++            __asm__ volatile("mrc p10, 7, %0, c8, c0, 0" : "=r"(fpexc));
++            if (udf || (fpexc & (1U << 30)))
++                instruction = 0xfedeffe7;
++        }
++#endif
+         if(instruction != 0xfedeffe7)
+         {
+             /*
+@@ -1189,6 +1233,11 @@ void sleh_undef(arm_saved_state_t * state)
+          */
+         exception_type = EXC_BAD_INSTRUCTION;
+         exception_subcode = 0;
++#if BOARD_CONFIG_RASPBERRYPI3
++        kprintf("rpi3: %s[%d] undefined instruction pc 0x%08x lr 0x%08x r7 0x%08x r8 0x%08x\n",
++                proc_name_address(thread->task->bsd_info), proc_pid(thread->task->bsd_info),
++                arm_ctx->pc, arm_ctx->lr, arm_ctx->r[7], arm_ctx->r[8]);
++#endif
+     } else if (cpsr == 0x17) {
+         panic("sleh_undef: undefined instruction in system mode");
+     }
+diff --git a/xnu/osfmk/ipc/ipc_pset.c b/xnu/osfmk/ipc/ipc_pset.c
+index 2f4d49f..b28333c 100644
+--- a/xnu/osfmk/ipc/ipc_pset.c
++++ b/xnu/osfmk/ipc/ipc_pset.c
+@@ -480,9 +480,14 @@ filt_machport(
+ 				kn->kn_hook = (void *)(uintptr_t)kn->kn_ext[1];
+ 				kbuf = 1;
+ 			} else {
+-				/* no buffer: just report the waiting message's size */
+-				option = (option & ~MACH_RCV_MSG) | MACH_RCV_LARGE;
+-				size = 0;
++				/*
++				 * No message space left in this scan: iOS 10's
++				 * libdispatch needs a buffer with every event, so
++				 * leave the message queued for the next scan (the
++				 * knote stays queued).
++				 */
++				io_release(object);
++				return 0;
+ 			}
+ 		}
+ 	} else {
+@@ -555,6 +560,9 @@ filt_machport(
+ 	if (kbuf) {
+ 		kn->kn_hookid |= FILT_MACHPORT_KBUF;
+ 		kn->kn_ext[0] = self->ith_msg_addr;
++		/* too large for the space left: say which port to receive from */
++		if (kn->kn_fflags == MACH_RCV_TOO_LARGE)
++			kn->kn_data = self->ith_receiver_name;
+ 		if (kn->kn_fflags == MACH_MSG_SUCCESS) {
+ 			/* message plus the largest trailer, kept 16-byte aligned */
+ 			rpi3_kevent_data_used((mach_msg_size_t)
+diff --git a/xnu/osfmk/ipc/mach_msg.c b/xnu/osfmk/ipc/mach_msg.c
+index 5b438ce..c110c58 100644
+--- a/xnu/osfmk/ipc/mach_msg.c
++++ b/xnu/osfmk/ipc/mach_msg.c
+@@ -628,8 +628,19 @@ rpi3_msg_dump(ipc_kmsg_t kmsg)
+ 	if (ip_active(dest) && dest->ip_receiver_name && dest->ip_receiver)
+ 		rt = dest->ip_receiver->is_task;
+ 	ip_unlock(dest);
+-	if (rt == TASK_NULL || (rp = rt->bsd_info) == NULL)
++	if (rt == TASK_NULL || (rp = rt->bsd_info) == NULL) {
++		if (!strncmp(proc_name_address(sp), name, strlen(name)) && logs++ < 300)
++			kprintf("rpi3 send: %s -> kernel id=%d size=%u\n", proc_name_address(sp),
++			    kmsg->ikm_header->msgh_id, size);
+ 		return;
++	}
++	if (proc_pid(rp) != 1 && !strncmp(proc_name_address(sp), name, strlen(name))) {
++		if (logs++ < 300)
++			kprintf("rpi3 send: %s -> %s[%d] id=%d size=%u bits=%x\n", proc_name_address(sp),
++			    proc_name_address(rp), proc_pid(rp), kmsg->ikm_header->msgh_id, size,
++			    kmsg->ikm_header->msgh_bits);
++		return;
++	}
+ 	if (!((proc_pid(sp) == 1 && !strncmp(proc_name_address(rp), name, strlen(name))) ||
+ 	    (proc_pid(rp) == 1 && !strncmp(proc_name_address(sp), name, strlen(name)))))
+ 		return;
+diff --git a/xnu/osfmk/kern/syscall_sw.c b/xnu/osfmk/kern/syscall_sw.c
+index 841d122..1a71588 100644
+--- a/xnu/osfmk/kern/syscall_sw.c
++++ b/xnu/osfmk/kern/syscall_sw.c
+@@ -99,6 +99,7 @@ int kern_invalid_debug = 0;
+ #include <kern/clock.h>
+ #include <mach/mk_timer.h>
+ #include <arm/ios7_compat.h>
++#include <libkern/OSAtomic.h>
+ #if IOS7_COMPAT_PLATFORM
+ extern int ios7lab_mach_vm_map_trap(void *saved_registers);
+ extern int ios7lab_mach_port_construct_trap(void *saved_registers);
+@@ -168,7 +169,9 @@ const mach_trap_t	mach_trap_table[MACH_TRAP_TABLE_COUNT] = {
+ /* 41 */	MACH_TRAP(kern_invalid, 0, NULL, NULL),
+ /* 42 */	MACH_TRAP(kern_invalid, 0, NULL, NULL),
+ #endif
+-#if	!defined(CONFIG_EMBEDDED)
++#if BOARD_CONFIG_RASPBERRYPI3
++/* 43 */	MACH_TRAP(rpi3_mach_generate_activity_id_trap, 3, NULL, NULL),
++#elif	!defined(CONFIG_EMBEDDED)
+ /* 43 */	MACH_TRAP(map_fd, 5, munge_wwwww, munge_ddddd),
+ #else
+ /* 43 */	MACH_TRAP(kern_invalid, 0, NULL, NULL),
+@@ -406,6 +409,25 @@ int	mach_trap_count = (sizeof(mach_trap_table) / sizeof(mach_trap_table[0]));
+  * hand back MACH_VOUCHER_NULL ("no voucher"), which libdispatch accepts,
+  * rather than an error it treats as fatal.
+  */
++/*
++ * mach_generate_activity_id (trap 43 in later kernels; map_fd here):
++ * libdispatch and libsystem_trace take activity IDs from it and abort
++ * if it fails. IDs only need to be unique and non-zero.
++ */
++kern_return_t
++rpi3_mach_generate_activity_id_trap(struct rpi3_mach_generate_activity_id_args *args)
++{
++	static volatile SInt64 rpi3_activity_id_next = 1;
++	uint64_t id;
++
++	if (args->count <= 0 || args->count > 4096 || args->activity_id == 0)
++		return KERN_INVALID_ARGUMENT;
++	id = (uint64_t)OSAddAtomic64(args->count, &rpi3_activity_id_next);
++	if (copyout(&id, (user_addr_t)args->activity_id, sizeof(id)))
++		return KERN_INVALID_ADDRESS;
++	return KERN_SUCCESS;
++}
++
+ kern_return_t
+ rpi3_host_create_mach_voucher_trap(struct rpi3_host_create_mach_voucher_args *args)
+ {
+diff --git a/xnu/osfmk/mach/mach_traps.h b/xnu/osfmk/mach/mach_traps.h
+index 9315f97..205b4f2 100644
+--- a/xnu/osfmk/mach/mach_traps.h
++++ b/xnu/osfmk/mach/mach_traps.h
+@@ -664,6 +664,14 @@ struct _kernelrpc_mach_port_insert_right_args {
+ extern kern_return_t _kernelrpc_mach_port_insert_right_trap(
+ 				struct _kernelrpc_mach_port_insert_right_args *args);
+ 
++struct rpi3_mach_generate_activity_id_args {
++	PAD_ARG_(uint32_t, target);
++	PAD_ARG_(int, count);
++	PAD_ARG_(uint32_t, activity_id);
++};
++extern kern_return_t rpi3_mach_generate_activity_id_trap(
++				struct rpi3_mach_generate_activity_id_args *args);
++
+ struct rpi3_host_create_mach_voucher_args {
+ 	PAD_ARG_(uint32_t, host);
+ 	PAD_ARG_(uint32_t, recipes);
+-- 
+2.43.0
+
