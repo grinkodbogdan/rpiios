@@ -1,0 +1,52 @@
+From d9b73330366611891e6a832edcc3f39a3381ba2a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 15:33:17 +0000
+Subject: [PATCH] rpi3: csops_audittoken accepts every operation for iOS 10
+
+iOS 10's launchd asks for CS_OPS_STATUS through the audit token to
+decide whether a caller is a platform binary; the iOS 7 kernel
+returned EINVAL, so launchd refused privileged lookups.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches          |  2 +-
+ xnu/bsd/kern/kern_proc.c | 15 +++++++++++++++
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index bd21bf1..4a67702 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-81ecada4fa9b5dca
++37f65b4b6e020c69
+diff --git a/xnu/bsd/kern/kern_proc.c b/xnu/bsd/kern/kern_proc.c
+index 7237488..57a7d06 100644
+--- a/xnu/bsd/kern/kern_proc.c
++++ b/xnu/bsd/kern/kern_proc.c
+@@ -1721,6 +1721,21 @@ csops_audittoken(__unused proc_t p, struct csops_audittoken_args *uap, __unused
+ {
+ 	if (uap->uaudittoken == USER_ADDR_NULL)
+ 		return(EINVAL);
++#if BOARD_CONFIG_RASPBERRYPI3
++	/*
++	 * iOS 10's launchd asks for CS_OPS_STATUS through the audit token
++	 * to decide whether a caller is a platform binary (privileged
++	 * lookups such as notifyd's, "all services read"); later kernels
++	 * accept every operation here.
++	 */
++	{
++		extern int rpi3_ios10_layout;
++
++		if (rpi3_ios10_layout)
++			return(csops_internal(uap->pid, uap->ops, uap->useraddr,
++			    uap->usersize, uap->uaudittoken));
++	}
++#endif
+ 	switch (uap->ops) {
+ 		case CS_OPS_PIDPATH:
+ 		case CS_OPS_ENTITLEMENTS_BLOB:
+-- 
+2.43.0
+
