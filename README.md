@@ -39,6 +39,9 @@ timer, display, SD, input) and reuses the root filesystem unchanged.
 | Guarded fd syscalls (sqlite), general IOSurfaceCreate, launch watchdog off (`tools/rootfs-tweaks.py`) | done |
 | ARM clock raised to the firmware maximum by the boot shim | done |
 | More than one CPU core | not yet: the kernel port is uniprocessor |
+| iOS 10.3.4 (32-bit, iPhone5,1) root: shared cache v2, zlib-compressed HFS files, iOS 10 system calls | done (QEMU) |
+| iOS 10 libdispatch: kevent workqueue (event manager thread, `kevent_qos`, Mach port knotes), ulock | done (QEMU) |
+| iOS 10 launchd: boot tasks, mounts (`tools/ios10-rootfs.py` fixes fstab), daemons via xpcproxy | in progress (QEMU) |
 
 The kernel is built with `-O2` on the Pi (the HD2 kernel stays `-O0`).
 

@@ -1,0 +1,2585 @@
+From 84d942254fdc25279499eff153bc75d5b6b9941d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 11:00:52 +0000
+Subject: [PATCH] iOS 10 workqueue, kevent_qos and the system calls its launchd
+ needs
+
+- libpthread 218 / libdispatch 703 workqueue: bsdthread_register returns
+  the kernel's features and fills in the main thread's QoS; thread
+  requests by pthread priority over six QoS buckets; threads get their
+  qos_class_t in the upcall flags.
+- One event manager thread per process delivers the workq kqueue's
+  events (kevent_qos_s, up to 16 per upcall, Mach messages received into
+  a 32 KiB area on its stack) and applies the changes libdispatch hands
+  back with WQOPS_THREAD_KEVENT_RETURN.
+- kevent_qos (374): QoS-sized events, KEVENT_FLAG_WORKQ / IMMEDIATE /
+  ERROR_EVENTS, kernel-provided data_out space; EV_UDATA_SPECIFIC knotes.
+- EVFILT_MACHPORT on receive rights (not only port sets), receiving
+  into the caller's data_out space.
+- kqueue_scan_continue passes the caller's data to its callback (it
+  passed the uthread scan state, which only kevent's layout tolerated).
+- ulock_wait/ulock_wake, bsdthread_ctl, memorystatus_control and
+  memorystatus_get_level, coalitions, proc_rlimit_control and other
+  no-op controls, the *at() calls, proc_info flavors 17-19,
+  csops CS_OPS_IDENTITY, platform-binary status, the
+  host_create_mach_voucher trap.
+- Mach: ignore EXC_GUARD/EXC_CORPSE_NOTIFY masks, task special ports
+  10/11, room for iOS 10's host special ports, and no double release
+  of the port on host_set_special_port's error path.
+- Diagnostics: exits, reboot reason, unimplemented syscall numbers,
+  user prefetch aborts and root image I/O errors go to the serial log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                               |   1 +
+ xnu/bsd/kern/kern_descrip.c                   | 348 +++++++++++-
+ xnu/bsd/kern/kern_event.c                     | 334 ++++++++++--
+ xnu/bsd/kern/kern_exec.c                      |   2 +-
+ xnu/bsd/kern/kern_exit.c                      |   7 +
+ xnu/bsd/kern/kern_proc.c                      |  45 ++
+ xnu/bsd/kern/kern_xxx.c                       |  13 +
+ xnu/bsd/kern/proc_info.c                      |  95 ++++
+ xnu/bsd/kern/pthread_synch.c                  | 515 +++++++++++++++++-
+ xnu/bsd/kern/subr_xxx.c                       |   5 +
+ xnu/bsd/kern/syscalls.master                  |  56 +-
+ xnu/bsd/kern/ubc_subr.c                       |  40 ++
+ xnu/bsd/sys/eventvar.h                        |   1 +
+ xnu/bsd/sys/pthread_internal.h                |  24 +-
+ xnu/bsd/sys/user.h                            |   4 +
+ xnu/bsd/vm/vm_unix.c                          |   2 +
+ .../ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp   |   3 +
+ xnu/osfmk/arm/trap.c                          |   3 +
+ xnu/osfmk/ipc/ipc_pset.c                      | 144 +++--
+ xnu/osfmk/kern/host.c                         |   7 +-
+ xnu/osfmk/kern/ipc_host.c                     |   6 +
+ xnu/osfmk/kern/ipc_tt.c                       |  25 +
+ xnu/osfmk/kern/syscall_sw.c                   |  19 +-
+ xnu/osfmk/mach/exception_types.h              |   6 +
+ xnu/osfmk/mach/host_special_ports.h           |   4 +-
+ xnu/osfmk/mach/mach_traps.h                   |   9 +
+ 26 files changed, 1595 insertions(+), 123 deletions(-)
+ create mode 100644 .rpiios-patches
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+new file mode 100644
+index 0000000..ceae8ea
+--- /dev/null
++++ b/.rpiios-patches
+@@ -0,0 +1 @@
++1575df59d72fd443
+diff --git a/xnu/bsd/kern/kern_descrip.c b/xnu/bsd/kern/kern_descrip.c
+index 99dfd54..62cd0e3 100644
+--- a/xnu/bsd/kern/kern_descrip.c
++++ b/xnu/bsd/kern/kern_descrip.c
+@@ -5478,7 +5478,7 @@ rpi3_payload_reason(proc_t p, const char *what, int *a)
+ 
+ 	printf("rpi3: %s[%d] %s args %x %x %x %x %x %x %x %x\n", p->p_comm, p->p_pid, what,
+ 	    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+-	for (i = 0; i < 8; i++) {
++	for (i = 0; i < 7; i++) {	/* a[7] is r7, not an argument */
+ 		char text[200];
+ 		size_t done = 0;
+ 
+@@ -5488,6 +5488,8 @@ rpi3_payload_reason(proc_t p, const char *what, int *a)
+ 		    done > 4) {
+ 			printf("rpi3:   arg%d: \"%s\"\n", i, text);
+ 			kprintf("rpi3: %s[%d] %s arg%d: \"%s\"\n", p->p_comm, p->p_pid, what, i, text);
++			if (p->p_pid == 1)
++				panic("launchd: %s", text);
+ 		}
+ 	}
+ }
+@@ -5516,3 +5518,347 @@ terminate_with_payload(proc_t p, struct terminate_with_payload_args *uap, __unus
+ 	proc_rele(target);
+ 	return (0);
+ }
++
++/*
++ * iOS 10: system calls that only need to succeed here (resource and
++ * telemetry controls with nothing behind them on the Pi).
++ */
++int rpi3_usrctl(__unused proc_t p, __unused struct rpi3_usrctl_args *uap, __unused int32_t *retval) { return (0); }
++int rpi3_proc_rlimit_control(__unused proc_t p, __unused struct rpi3_proc_rlimit_control_args *uap, __unused int32_t *retval) { return (0); }
++int rpi3_telemetry(__unused proc_t p, __unused struct rpi3_telemetry_args *uap, __unused int32_t *retval) { return (0); }
++int rpi3_proc_uuid_policy(__unused proc_t p, __unused struct rpi3_proc_uuid_policy_args *uap, __unused int32_t *retval) { return (0); }
++int rpi3_system_override(__unused proc_t p, __unused struct rpi3_system_override_args *uap, __unused int32_t *retval) { return (0); }
++int rpi3_vfs_purge(__unused proc_t p, __unused struct rpi3_vfs_purge_args *uap, __unused int32_t *retval) { return (0); }
++int rpi3_proc_trace_log(__unused proc_t p, __unused struct rpi3_proc_trace_log_args *uap, __unused int32_t *retval) { return (0); }
++
++/* memory pressure level: always normal */
++int
++memorystatus_get_level(__unused proc_t p, struct memorystatus_get_level_args *uap, __unused int32_t *retval)
++{
++	uint32_t level = 100;
++
++	return (copyout(&level, uap->level, sizeof (level)));
++}
++
++/*
++ * iOS 10: the *at() family.  A relative path is looked up from the
++ * directory fd by making it the calling thread's working directory for
++ * the duration of the call (namei honours uu_cdir).
++ */
++#define RPI3_AT_FDCWD		-2
++#define RPI3_AT_EACCESS		0x0010
++#define RPI3_AT_SYMLINK_NOFOLLOW 0x0020
++#define RPI3_AT_REMOVEDIR	0x0080
++
++struct rpi3_at {
++	int		fd;
++	vnode_t		saved_cdir;
++	int		active;
++};
++
++static int
++rpi3_at_begin(proc_t p, int fd, user_addr_t path, struct rpi3_at *at)
++{
++	struct uthread *ut = get_bsdthread_info(current_thread());
++	char c = 0;
++	vnode_t vp;
++	int error;
++
++	at->active = 0;
++	if (fd == RPI3_AT_FDCWD)
++		return (0);
++	if (path != USER_ADDR_NULL && copyin(path, &c, 1) == 0 && c == '/')
++		return (0);
++	if ((error = file_vnode(fd, &vp)) != 0)
++		return (error);
++	if (vnode_vtype(vp) != VDIR) {
++		file_drop(fd);
++		return (ENOTDIR);
++	}
++	(void)p;
++	at->fd = fd;
++	at->saved_cdir = ut->uu_cdir;
++	ut->uu_cdir = vp;
++	at->active = 1;
++	return (0);
++}
++
++static int
++rpi3_at_end(struct rpi3_at *at, int error)
++{
++	if (at->active) {
++		struct uthread *ut = get_bsdthread_info(current_thread());
++
++		ut->uu_cdir = at->saved_cdir;
++		file_drop(at->fd);
++	}
++	return (error);
++}
++
++int
++openat_nocancel(proc_t p, struct openat_nocancel_args *uap, int32_t *retval)
++{
++	struct open_nocancel_args a;
++	struct rpi3_at at;
++	int error;
++
++	if ((error = rpi3_at_begin(p, uap->fd, uap->path, &at)) != 0)
++		return (error);
++	a.path = uap->path;
++	a.flags = uap->flags;
++	a.mode = uap->mode;
++	return rpi3_at_end(&at, open_nocancel(p, &a, retval));
++}
++
++int
++openat(proc_t p, struct openat_args *uap, int32_t *retval)
++{
++	__pthread_testcancel(1);
++	return openat_nocancel(p, (struct openat_nocancel_args *)uap, retval);
++}
++
++int
++renameat(proc_t p, struct renameat_args *uap, int32_t *retval)
++{
++	struct rename_args a;
++	struct rpi3_at at;
++	char c = 0;
++	int error;
++
++	/* both names must resolve from the same place */
++	if (uap->tofd != uap->fromfd && uap->tofd != RPI3_AT_FDCWD &&
++	    !(copyin(uap->to, &c, 1) == 0 && c == '/'))
++		return (ENOTSUP);
++	if ((error = rpi3_at_begin(p, uap->fromfd, uap->from, &at)) != 0)
++		return (error);
++	a.from = uap->from;
++	a.to = uap->to;
++	return rpi3_at_end(&at, rename(p, &a, retval));
++}
++
++int
++faccessat(proc_t p, struct faccessat_args *uap, int32_t *retval)
++{
++	struct access_args a;
++	struct rpi3_at at;
++	int error;
++
++	if ((error = rpi3_at_begin(p, uap->fd, uap->path, &at)) != 0)
++		return (error);
++	a.path = uap->path;
++	a.flags = uap->amode;
++	return rpi3_at_end(&at, access(p, &a, retval));
++}
++
++int
++fchmodat(proc_t p, struct fchmodat_args *uap, int32_t *retval)
++{
++	struct chmod_args a;
++	struct rpi3_at at;
++	int error;
++
++	if ((error = rpi3_at_begin(p, uap->fd, uap->path, &at)) != 0)
++		return (error);
++	a.path = uap->path;
++	a.mode = uap->mode;
++	return rpi3_at_end(&at, chmod(p, &a, retval));
++}
++
++int
++fchownat(proc_t p, struct fchownat_args *uap, int32_t *retval)
++{
++	struct rpi3_at at;
++	int error;
++
++	if ((error = rpi3_at_begin(p, uap->fd, uap->path, &at)) != 0)
++		return (error);
++	if (uap->flag & RPI3_AT_SYMLINK_NOFOLLOW) {
++		struct lchown_args a;
++
++		a.path = uap->path;
++		a.owner = uap->uid;
++		a.group = uap->gid;
++		error = lchown(p, &a, retval);
++	} else {
++		struct chown_args a;
++
++		a.path = uap->path;
++		a.uid = uap->uid;
++		a.gid = uap->gid;
++		error = chown(p, &a, retval);
++	}
++	return rpi3_at_end(&at, error);
++}
++
++int
++fstatat64(proc_t p, struct fstatat64_args *uap, int32_t *retval)
++{
++	struct rpi3_at at;
++	int error;
++
++	if ((error = rpi3_at_begin(p, uap->fd, uap->path, &at)) != 0)
++		return (error);
++	if (uap->flag & RPI3_AT_SYMLINK_NOFOLLOW) {
++		struct lstat64_args a;
++
++		a.path = uap->path;
++		a.ub = uap->ub;
++		error = lstat64(p, &a, retval);
++	} else {
++		struct stat64_args a;
++
++		a.path = uap->path;
++		a.ub = uap->ub;
++		error = stat64(p, &a, retval);
++	}
++	return rpi3_at_end(&at, error);
++}
++
++int
++fstatat(proc_t p, struct fstatat_args *uap, int32_t *retval)
++{
++	struct rpi3_at at;
++	int error;
++
++	if ((error = rpi3_at_begin(p, uap->fd, uap->path, &at)) != 0)
++		return (error);
++	if (uap->flag & RPI3_AT_SYMLINK_NOFOLLOW) {
++		struct lstat_args a;
++
++		a.path = uap->path;
++		a.ub = uap->ub;
++		error = lstat(p, &a, retval);
++	} else {
++		struct stat_args a;
++
++		a.path = uap->path;
++		a.ub = uap->ub;
++		error = stat(p, &a, retval);
++	}
++	return rpi3_at_end(&at, error);
++}
++
++int
++linkat(proc_t p, struct linkat_args *uap, int32_t *retval)
++{
++	struct link_args a;
++	struct rpi3_at at;
++	char c = 0;
++	int error;
++
++	if (uap->fd2 != uap->fd1 && uap->fd2 != RPI3_AT_FDCWD &&
++	    !(copyin(uap->link, &c, 1) == 0 && c == '/'))
++		return (ENOTSUP);
++	if ((error = rpi3_at_begin(p, uap->fd1, uap->path, &at)) != 0)
++		return (error);
++	a.path = uap->path;
++	a.link = uap->link;
++	return rpi3_at_end(&at, link(p, &a, retval));
++}
++
++int
++unlinkat(proc_t p, struct unlinkat_args *uap, int32_t *retval)
++{
++	struct rpi3_at at;
++	int error;
++
++	if ((error = rpi3_at_begin(p, uap->fd, uap->path, &at)) != 0)
++		return (error);
++	if (uap->flag & RPI3_AT_REMOVEDIR) {
++		struct rmdir_args a;
++
++		a.path = uap->path;
++		error = rmdir(p, &a, retval);
++	} else {
++		struct unlink_args a;
++
++		a.path = uap->path;
++		error = unlink(p, &a, retval);
++	}
++	return rpi3_at_end(&at, error);
++}
++
++int
++readlinkat(proc_t p, struct readlinkat_args *uap, int32_t *retval)
++{
++	struct readlink_args a;
++	struct rpi3_at at;
++	int error;
++
++	if ((error = rpi3_at_begin(p, uap->fd, uap->path, &at)) != 0)
++		return (error);
++	a.path = uap->path;
++	a.buf = uap->buf;
++	a.count = (int)uap->bufsize;
++	return rpi3_at_end(&at, readlink(p, &a, retval));
++}
++
++int
++symlinkat(proc_t p, struct symlinkat_args *uap, int32_t *retval)
++{
++	struct symlink_args a;
++	struct rpi3_at at;
++	int error;
++
++	/* path1 is the link's contents; path2 is created relative to fd */
++	if ((error = rpi3_at_begin(p, uap->fd, uap->path2, &at)) != 0)
++		return (error);
++	a.path = uap->path1;
++	a.link = uap->path2;
++	return rpi3_at_end(&at, symlink(p, &a, retval));
++}
++
++int
++mkdirat(proc_t p, struct mkdirat_args *uap, int32_t *retval)
++{
++	struct mkdir_args a;
++	struct rpi3_at at;
++	int error;
++
++	if ((error = rpi3_at_begin(p, uap->fd, uap->path, &at)) != 0)
++		return (error);
++	a.path = uap->path;
++	a.mode = uap->mode;
++	return rpi3_at_end(&at, mkdir(p, &a, retval));
++}
++
++/*
++ * iOS 10: coalitions.  launchd puts each job in one; nothing here acts
++ * on them, so create hands out fresh ids and the rest succeeds.
++ */
++int
++coalition(__unused proc_t p, struct coalition_args *uap, __unused int32_t *retval)
++{
++	static uint64_t next_cid = 1000;
++	uint64_t cid;
++
++	switch (uap->operation) {
++	case 1:		/* COALITION_OP_CREATE */
++		cid = ++next_cid;	/* uniprocessor kernel; system call context */
++		return (copyout(&cid, uap->cid, sizeof (cid)));
++	case 2:		/* COALITION_OP_TERMINATE */
++	case 3:		/* COALITION_OP_REAP */
++		return (0);
++	default:
++		return (EINVAL);
++	}
++}
++
++int
++coalition_info(__unused proc_t p, struct coalition_info_args *uap, __unused int32_t *retval)
++{
++	uint8_t zero[256];
++	uint32_t size = 0;
++	int error;
++
++	if (uap->bufsize == USER_ADDR_NULL)
++		return (EINVAL);
++	if ((error = copyin(uap->bufsize, &size, sizeof (size))) != 0)
++		return (error);
++	if (size > sizeof (zero))
++		size = sizeof (zero);
++	bzero(zero, sizeof (zero));
++	if (uap->buffer != USER_ADDR_NULL && (error = copyout(zero, uap->buffer, size)) != 0)
++		return (error);
++	return (copyout(&size, uap->bufsize, sizeof (size)));
++}
+diff --git a/xnu/bsd/kern/kern_event.c b/xnu/bsd/kern/kern_event.c
+index dd1cbf6..b948087 100644
+--- a/xnu/bsd/kern/kern_event.c
++++ b/xnu/bsd/kern/kern_event.c
+@@ -94,6 +94,9 @@
+ #include "net/net_str_id.h"
+ 
+ #include <mach/task.h>
++#include <mach/thread_status.h>
++#include <pexpert/pexpert.h>
++#include <sys/pthread_internal.h>
+ 
+ #if VM_PRESSURE_EVENTS
+ #include <kern/vm_pressure.h>
+@@ -103,6 +106,18 @@ MALLOC_DEFINE(M_KQUEUE, "kqueue", "memory for kqueue system");
+ 
+ #define KQ_EVENT NULL
+ 
++/* iOS 10 kevent_qos / workqueue support */
++extern int rpi3_ios10_layout;
++extern void *find_user_regs(thread_t);
++extern struct kqueue *rpi3_workq_kqueue(struct proc *p);
++int rpi3_kevent_data_begin(user_addr_t data_out, user_addr_t data_availp);
++void rpi3_kevent_data_set(user_addr_t data_out, user_size_t size);
++void rpi3_kevent_data_finish(void);
++int rpi3_kevent_data_get(mach_vm_address_t *addr, mach_msg_size_t *size);
++void rpi3_kevent_data_used(mach_msg_size_t used);
++int rpi3_kevent_qos_apply(struct proc *p, struct kqueue *kq, user_addr_t changelist, int nchanges);
++int rpi3_kqwq_scan(struct kqueue *kq, struct rpi3_kqscan *scan, kqueue_continue_t cont, struct proc *p);
++
+ static inline void kqlock(struct kqueue *kq);
+ static inline void kqunlock(struct kqueue *kq);
+ 
+@@ -1192,13 +1207,54 @@ kqueue(struct proc *p, __unused struct kqueue_args *uap, int32_t *retval)
+ 	return (error);
+ }
+ 
++/*
++ * iOS 10's struct kevent_qos_s (72 bytes).  The qos and xflags fields
++ * and ext[2..3] are not kept; every workq event goes to the manager.
++ */
++struct rpi3_kevent_qos {
++	uint64_t	ident;
++	int16_t		filter;
++	uint16_t	flags;
++	int32_t		qos;
++	uint64_t	udata;
++	uint32_t	fflags;
++	uint32_t	xflags;
++	int64_t		data;
++	uint64_t	ext[4];
++};
++#define KEVENT_LAYOUT_QOS	2	/* iskev64 value for kevent_qos_s */
++static int rpi3_kq_trace = -1;		/* rpi3_wqtrace=1 boot-arg */
++
++#define KEVENT_FLAG_IMMEDIATE		0x01	/* timeout to zero */
++#define KEVENT_FLAG_ERROR_EVENTS	0x02	/* only output errors */
++#define KEVENT_FLAG_STACK_DATA		0x04	/* data_out is a stack buffer */
++#define KEVENT_FLAG_WORKQ		0x20	/* use the process' workq kqueue */
++
++#define EV_UDATA_SPECIFIC	0x0100	/* knote identity includes udata */
++
+ static int
+ kevent_copyin(user_addr_t *addrp, struct kevent64_s *kevp, struct proc *p, int iskev64)
+ {
+ 	int advance;
+ 	int error;
+ 
+-	if (iskev64) {
++	if (iskev64 == KEVENT_LAYOUT_QOS) {
++		struct rpi3_kevent_qos kq64;
++
++		advance = sizeof(kq64);
++		error = copyin(*addrp, (caddr_t)&kq64, advance);
++		if (error)
++			return error;
++		bzero(kevp, sizeof(struct kevent64_s));
++		kevp->ident = kq64.ident;
++		kevp->filter = kq64.filter;
++		kevp->flags = kq64.flags;
++		kevp->fflags = kq64.fflags;
++		kevp->data = kq64.data;
++		kevp->udata = kq64.udata;
++		kevp->ext[0] = kq64.ext[0];
++		kevp->ext[1] = kq64.ext[1];
++	} else if (iskev64) {
+ 		advance = sizeof(struct kevent64_s);
+ 		error = copyin(*addrp, (caddr_t)kevp, advance);
+ 	} else if (IS_64BIT_PROCESS(p)) {
+@@ -1241,7 +1297,21 @@ kevent_copyout(struct kevent64_s *kevp, user_addr_t *addrp, struct proc *p, int
+ 	int advance;
+ 	int error;
+ 
+-	if (iskev64) {
++	if (iskev64 == KEVENT_LAYOUT_QOS) {
++		struct rpi3_kevent_qos kq64;
++
++		bzero(&kq64, sizeof(kq64));
++		kq64.ident = kevp->ident;
++		kq64.filter = kevp->filter;
++		kq64.flags = kevp->flags;
++		kq64.fflags = kevp->fflags;
++		kq64.data = kevp->data;
++		kq64.udata = kevp->udata;
++		kq64.ext[0] = kevp->ext[0];
++		kq64.ext[1] = kevp->ext[1];
++		advance = sizeof(kq64);
++		error = copyout((caddr_t)&kq64, *addrp, advance);
++	} else if (iskev64) {
+ 		advance = sizeof(struct kevent64_s);
+ 		error = copyout((caddr_t)kevp, *addrp, advance);
+ 	} else if (IS_64BIT_PROCESS(p)) {
+@@ -1300,7 +1370,9 @@ kevent_continue(__unused struct kqueue *kq, void *data, int error)
+ 	fd = cont_args->fd;
+ 	fp = cont_args->fp;
+ 
+-	fp_drop(p, fd, fp, 0);
++	if (fp != NULL)
++		fp_drop(p, fd, fp, 0);
++	rpi3_kevent_data_finish();
+ 
+ 	/* don't restart after signals... */
+ 	if (error == ERESTART)
+@@ -1342,26 +1414,68 @@ kevent64(struct proc *p, struct kevent64_args *uap, int32_t *retval)
+ 			uap->nevents,
+ 			uap->fd,
+ 			uap->timeout,
+-			uap->flags,
++			rpi3_ios10_layout ? uap->flags : 0,	/* iOS 7 never set any */
+ 			retval);
+ }
+ 
++/*
++ * Register a list of changes; errors (or receipts) go to *ueventlistp
++ * while *neventsp allows.  Returns the first copyin error, if any.
++ */
++static int
++kevent_register_list(struct proc *p, struct kqueue *kq, int iskev64,
++		     user_addr_t changelist, int nchanges,
++		     user_addr_t *ueventlistp, int *neventsp, int *noutputsp)
++{
++	struct kevent64_s kev;
++	int error = 0;
++
++	while (nchanges > 0 && error == 0) {
++		error = kevent_copyin(&changelist, &kev, p, iskev64);
++		if (error)
++			break;
++				
++		kev.flags &= ~EV_SYSFLAGS;
++		error = kevent_register(kq, &kev, p);
++		if (rpi3_kq_trace < 0 && !PE_parse_boot_argn("rpi3_wqtrace", &rpi3_kq_trace, sizeof(rpi3_kq_trace)))
++			rpi3_kq_trace = 0;
++		if (rpi3_kq_trace > 0 && iskev64 == KEVENT_LAYOUT_QOS)
++			kprintf("rpi3: %s[%d] kq register filter %d ident 0x%llx flags 0x%x fflags 0x%x udata 0x%llx -> %d\n",
++			    p->p_comm, p->p_pid, kev.filter, kev.ident, kev.flags, kev.fflags, kev.udata, error);
++		if ((error || (kev.flags & EV_RECEIPT)) && *neventsp > 0) {
++			kev.flags = EV_ERROR;
++			kev.data = error;
++			error = kevent_copyout(&kev, ueventlistp, p, iskev64);
++			if (error == 0) {
++				(*neventsp)--;
++				(*noutputsp)++;
++			}
++		}
++		nchanges--;
++	}
++	return error;
++}
++
+ static int
+ kevent_internal(struct proc *p, int iskev64, user_addr_t changelist, 
+ 		int nchanges, user_addr_t ueventlist, int nevents, int fd, 
+-		user_addr_t utimeout, __unused unsigned int flags, 
++		user_addr_t utimeout, unsigned int flags, 
+ 		int32_t *retval)
+ {
+ 	struct _kevent *cont_args;
+ 	uthread_t ut;
+ 	struct kqueue *kq;
+-	struct fileproc *fp;
+-	struct kevent64_s kev;
++	struct fileproc *fp = NULL;
+ 	int error, noutputs;
+ 	struct timeval atv;
++	int kqstate;
+ 
+ 	/* convert timeout to absolute - if we have one */
+-	if (utimeout != USER_ADDR_NULL) {
++	if (flags & KEVENT_FLAG_IMMEDIATE) {
++		getmicrouptime(&atv);
++		if (atv.tv_sec == 0 && atv.tv_usec == 0)
++			atv.tv_usec = 1;
++	} else if (utimeout != USER_ADDR_NULL) {
+ 		struct timeval rtv;
+ 		if (IS_64BIT_PROCESS(p)) {
+ 			struct user64_timespec ts;
+@@ -1386,44 +1500,36 @@ kevent_internal(struct proc *p, int iskev64, user_addr_t changelist,
+ 		atv.tv_usec = 0;
+ 	}
+ 
+-	/* get a usecount for the kq itself */
+-	if ((error = fp_getfkq(p, fd, &fp, &kq)) != 0)
+-		return(error);
++	if (flags & KEVENT_FLAG_WORKQ) {
++		/* the process' workqueue kqueue: events go to the event manager */
++		kq = rpi3_workq_kqueue(p);
++		if (kq == NULL)
++			return EINVAL;
++	} else {
++		/* get a usecount for the kq itself */
++		if ((error = fp_getfkq(p, fd, &fp, &kq)) != 0)
++			return(error);
++	}
+ 	
+ 	/* each kq should only be used for events of one type */
++	kqstate = (iskev64 == KEVENT_LAYOUT_QOS) ? KQ_KEVQOS :
++		  (iskev64 ? KQ_KEV64 : KQ_KEV32);
+ 	kqlock(kq);
+-	if (kq->kq_state & (KQ_KEV32 | KQ_KEV64)) {
+-		if (((iskev64 && (kq->kq_state & KQ_KEV32)) ||
+-			(!iskev64 && (kq->kq_state & KQ_KEV64)))) {
++	if (kq->kq_state & (KQ_KEV32 | KQ_KEV64 | KQ_KEVQOS)) {
++		if ((kq->kq_state & (KQ_KEV32 | KQ_KEV64 | KQ_KEVQOS)) != kqstate) {
+ 			error = EINVAL;
+ 			kqunlock(kq);
+ 			goto errorout;
+ 		}
+ 	} else {
+-		kq->kq_state |= (iskev64 ? KQ_KEV64 : KQ_KEV32);
++		kq->kq_state |= kqstate;
+ 	}
+ 	kqunlock(kq);
+ 
+ 	/* register all the change requests the user provided... */
+ 	noutputs = 0;
+-	while (nchanges > 0 && error == 0) {
+-		error = kevent_copyin(&changelist, &kev, p, iskev64);
+-		if (error)
+-			break;
+-				
+-		kev.flags &= ~EV_SYSFLAGS;
+-		error = kevent_register(kq, &kev, p);
+-		if ((error || (kev.flags & EV_RECEIPT)) && nevents > 0) {
+-			kev.flags = EV_ERROR;
+-			kev.data = error;
+-			error = kevent_copyout(&kev, &ueventlist, p, iskev64);
+-			if (error == 0) {
+-				nevents--;
+-				noutputs++;
+-			}
+-		}
+-		nchanges--;
+-	}
++	error = kevent_register_list(p, kq, iskev64, changelist, nchanges,
++				     &ueventlist, &nevents, &noutputs);
+ 
+ 	/* store the continuation/completion data in the uthread */
+ 	ut = (uthread_t)get_bsdthread_info(current_thread());
+@@ -1436,17 +1542,165 @@ kevent_internal(struct proc *p, int iskev64, user_addr_t changelist,
+ 	cont_args->eventout = noutputs;
+ 	cont_args->eventsize = iskev64;
+ 
+-	if (nevents > 0 && noutputs == 0 && error == 0)
++	if (nevents > 0 && noutputs == 0 && error == 0 &&
++	    (flags & KEVENT_FLAG_ERROR_EVENTS) == 0)
+ 		error = kqueue_scan(kq, kevent_callback,
+ 				    kevent_continue, cont_args,
+ 				    &atv, p);
+ 	kevent_continue(kq, cont_args, error);
+ 
+ errorout:
+-	fp_drop(p, fd, fp, 0);
++	if (fp != NULL)
++		fp_drop(p, fd, fp, 0);
++	rpi3_kevent_data_finish();
++	return error;
++}
++
++/*
++ * kevent_qos - [syscall] iOS 10's kevent with QoS-sized events.
++ *
++ * Its stub loads only arguments 5-7 into r4-r6 (after pushing r4, r5,
++ * r6 and r8); the 8th, flags, stays on the user stack just above them.
++ */
++int
++kevent_qos(struct proc *p, struct kevent_qos_args *uap, int32_t *retval)
++{
++	arm_saved_state_t *state = (arm_saved_state_t *)find_user_regs(current_thread());
++	unsigned int flags = 0;
++	int error;
++
++	error = copyin((user_addr_t)(state->sp + 4 * 4 + 3 * 4), &flags, sizeof(flags));
++	if (error)
++		return error;
++
++	error = rpi3_kevent_data_begin(uap->data_out, uap->data_available);
++	if (error)
++		return error;
++	return kevent_internal(p, KEVENT_LAYOUT_QOS,
++			uap->changelist, uap->nchanges,
++			uap->eventlist, uap->nevents,
++			uap->fd, USER_ADDR_NULL, flags, retval);
++}
++
++/*
++ * kevent_qos data_out: filters that return out-of-line data (Mach
++ * messages received for EVFILT_MACHPORT) take it from this buffer.
++ */
++int
++rpi3_kevent_data_begin(user_addr_t data_out, user_addr_t data_availp)
++{
++	uthread_t ut = (uthread_t)get_bsdthread_info(current_thread());
++	uint32_t avail = 0;
++	int error;
++
++	ut->uu_rpi3_data_out = 0;
++	ut->uu_rpi3_data_left = 0;
++	ut->uu_rpi3_data_availp = 0;
++	if (data_out == USER_ADDR_NULL || data_availp == USER_ADDR_NULL)
++		return 0;
++	error = copyin(data_availp, &avail, sizeof(avail));
++	if (error)
++		return error;
++	ut->uu_rpi3_data_out = data_out;
++	ut->uu_rpi3_data_left = avail;
++	ut->uu_rpi3_data_availp = data_availp;
++	return 0;
++}
++
++void
++rpi3_kevent_data_set(user_addr_t data_out, user_size_t size)
++{
++	uthread_t ut = (uthread_t)get_bsdthread_info(current_thread());
++
++	ut->uu_rpi3_data_out = data_out;
++	ut->uu_rpi3_data_left = size;
++	ut->uu_rpi3_data_availp = 0;
++}
++
++void
++rpi3_kevent_data_finish(void)
++{
++	uthread_t ut = (uthread_t)get_bsdthread_info(current_thread());
++
++	if (ut->uu_rpi3_data_availp != USER_ADDR_NULL) {
++		uint32_t avail = (uint32_t)ut->uu_rpi3_data_left;
++
++		(void)copyout(&avail, ut->uu_rpi3_data_availp, sizeof(avail));
++	}
++	ut->uu_rpi3_data_out = 0;
++	ut->uu_rpi3_data_left = 0;
++	ut->uu_rpi3_data_availp = 0;
++}
++
++int
++rpi3_kevent_data_get(mach_vm_address_t *addr, mach_msg_size_t *size)
++{
++	uthread_t ut = (uthread_t)get_bsdthread_info(current_thread());
++
++	if (ut->uu_rpi3_data_out == USER_ADDR_NULL || ut->uu_rpi3_data_left < 64)
++		return ENOSPC;
++	*addr = ut->uu_rpi3_data_out;
++	*size = (mach_msg_size_t)ut->uu_rpi3_data_left;
++	return 0;
++}
++
++void
++rpi3_kevent_data_used(mach_msg_size_t used)
++{
++	uthread_t ut = (uthread_t)get_bsdthread_info(current_thread());
++
++	if (used > ut->uu_rpi3_data_left)
++		used = (mach_msg_size_t)ut->uu_rpi3_data_left;
++	ut->uu_rpi3_data_out += used;
++	ut->uu_rpi3_data_left -= used;
++}
++
++/*
++ * Apply a kevent_qos change list to the workq kqueue for a returning
++ * workqueue thread; errors are written back over the list.  Returns the
++ * number of error events written.
++ */
++int
++rpi3_kevent_qos_apply(struct proc *p, struct kqueue *kq, user_addr_t changelist, int nchanges)
++{
++	user_addr_t out = changelist;
++	int nout = nchanges, noutputs = 0;
++
++	kqlock(kq);
++	kq->kq_state |= KQ_KEVQOS;
++	kqunlock(kq);
++	(void)kevent_register_list(p, kq, KEVENT_LAYOUT_QOS, changelist, nchanges,
++				   &out, &nout, &noutputs);
++	return noutputs;
++}
++
++/*
++ * The event manager's wait: deliver up to scan->max events of the workq
++ * kqueue to scan->list.  Same contract as kqueue_scan.
++ */
++static int
++rpi3_kqwq_callback(__unused struct kqueue *kq, struct kevent64_s *kevp, void *data)
++{
++	struct rpi3_kqscan *scan = (struct rpi3_kqscan *)data;
++	int error;
++
++	if (rpi3_kq_trace > 0)
++		kprintf("rpi3: %s[%d] kq deliver filter %d ident 0x%llx flags 0x%x fflags 0x%x data 0x%llx ext 0x%llx 0x%llx\n",
++		    current_proc()->p_comm, current_proc()->p_pid, kevp->filter, kevp->ident, kevp->flags,
++		    kevp->fflags, kevp->data, kevp->ext[0], kevp->ext[1]);
++	error = kevent_copyout(kevp, &scan->list, current_proc(), KEVENT_LAYOUT_QOS);
++	if (error == 0 && ++scan->out == scan->max)
++		error = EWOULDBLOCK;
+ 	return error;
+ }
+ 
++int
++rpi3_kqwq_scan(struct kqueue *kq, struct rpi3_kqscan *scan, kqueue_continue_t cont, struct proc *p)
++{
++	struct timeval atv = { 0, 0 };	/* forever */
++
++	return kqueue_scan(kq, rpi3_kqwq_callback, cont, scan, &atv, p);
++}
+ 
+ /*
+  * kevent_callback - callback for each individual event
+@@ -1556,7 +1810,9 @@ kevent_register(struct kqueue *kq, struct kevent64_s *kev, __unused struct proc
+ 		if (kev->ident < (u_int)fdp->fd_knlistsize) {
+ 			SLIST_FOREACH(kn, &fdp->fd_knlist[kev->ident], kn_link)
+ 				if (kq == kn->kn_kq &&
+-				    kev->filter == kn->kn_filter)
++				    kev->filter == kn->kn_filter &&
++				    (!(kn->kn_flags & EV_UDATA_SPECIFIC) ||
++				     kn->kn_udata == kev->udata))
+ 					break;
+ 		}
+ 	} else {
+@@ -1569,7 +1825,9 @@ kevent_register(struct kqueue *kq, struct kevent64_s *kev, __unused struct proc
+ 			SLIST_FOREACH(kn, list, kn_link)
+ 				if (kev->ident == kn->kn_id &&
+ 				    kq == kn->kn_kq &&
+-				    kev->filter == kn->kn_filter)
++				    kev->filter == kn->kn_filter &&
++				    (!(kn->kn_flags & EV_UDATA_SPECIFIC) ||
++				     kn->kn_udata == kev->udata))
+ 					break;
+ 		}
+ 	}
+@@ -2006,7 +2264,7 @@ kqueue_scan_continue(void *data, wait_result_t wait_result)
+ 	switch (wait_result) {
+ 	case THREAD_AWAKENED:
+ 		kqlock(kq);
+-		error = kqueue_process(kq, cont_args->call, cont_args, &count, current_proc());
++		error = kqueue_process(kq, cont_args->call, cont_args->data, &count, current_proc());
+ 		if (error == 0 && count == 0) {
+ 			wait_queue_assert_wait((wait_queue_t)kq->kq_wqs, KQ_EVENT, 
+ 					       THREAD_ABORTSAFE, cont_args->deadline); 
+diff --git a/xnu/bsd/kern/kern_exec.c b/xnu/bsd/kern/kern_exec.c
+index 60539b8..e560ed7 100644
+--- a/xnu/bsd/kern/kern_exec.c
++++ b/xnu/bsd/kern/kern_exec.c
+@@ -976,7 +976,7 @@ grade:
+ 
+ #ifdef DEBUG
+ 		/* Print out information. */
+-		kprintf("exec_mach_imgact: mach_header = %x, sp %llx\n", load_result.mach_header, ap);
++		kprintf("exec_mach_imgact: %s[%d] mach_header = %x, sp %llx\n", imgp->ip_strings ? imgp->ip_strings : "?", p->p_pid, load_result.mach_header, ap);
+ #endif
+ 
+ 		if (error) {
+diff --git a/xnu/bsd/kern/kern_exit.c b/xnu/bsd/kern/kern_exit.c
+index bc070dd..f1b2308 100644
+--- a/xnu/bsd/kern/kern_exit.c
++++ b/xnu/bsd/kern/kern_exit.c
+@@ -384,6 +384,13 @@ exit1_internal(proc_t p, int rv, int *retval, boolean_t thread_can_terminate, bo
+ 	p->p_xstat = rv;
+ #if BOARD_CONFIG_RASPBERRYPI3
+ 	/* Nothing on the Pi collects crash reports: say who died and how. */
++	{
++		extern int rpi3_ios10_layout;
++
++		if (rpi3_ios10_layout)
++			kprintf("rpi3: %s[%d] exit status 0x%x (code %d signal %d)\n", p->p_comm, p->p_pid,
++			    rv, WEXITSTATUS(rv), WIFSIGNALED(rv) ? WTERMSIG(rv) : 0);
++	}
+ 	if (WIFSIGNALED(rv)) {
+ 		extern void rpi3_dump_current_thread(void);
+ 		printf("rpi3: %s[%d] terminated by signal %d\n", p->p_comm, p->p_pid, WTERMSIG(rv));
+diff --git a/xnu/bsd/kern/kern_proc.c b/xnu/bsd/kern/kern_proc.c
+index 1d2b54b..7237488 100644
+--- a/xnu/bsd/kern/kern_proc.c
++++ b/xnu/bsd/kern/kern_proc.c
+@@ -1769,6 +1769,7 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 		case CS_OPS_CDHASH:
+ 		case CS_OPS_PIDOFFSET:
+ 		case CS_OPS_ENTITLEMENTS_BLOB:
++		case 11:	/* CS_OPS_IDENTITY */
+ 			break;	/* unrestricted */
+ 		default:
+ 			if (forself == 0 && kauth_cred_issuser(kauth_cred_get()) != TRUE)
+@@ -1799,6 +1800,20 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 
+ 		case CS_OPS_STATUS:
+ 			retflags = pt->p_csflags;
++#if BOARD_CONFIG_RASPBERRYPI3
++			{
++				/*
++				 * Everything here runs from the system volume: iOS 10's
++				 * launchd and xpc expect platform binaries to say so.
++				 */
++				extern int rpi3_ios10_layout;
++
++				if (rpi3_ios10_layout)
++					retflags |= 0x00000001 /* CS_VALID */ |
++					    0x04000000 /* CS_PLATFORM_BINARY */ |
++					    0x20000000 /* CS_SIGNED */;
++			}
++#endif
+ 			if (uaddr != USER_ADDR_NULL)
+ 				error = copyout(&retflags, uaddr, sizeof(uint32_t));
+ 			break;
+@@ -1937,6 +1952,36 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 			break;
+ 		}
+ 
++		case 11: {	/* CS_OPS_IDENTITY (iOS 10): blob header + identifier */
++			extern const char *cs_identity_get(proc_t p);
++			uint8_t fakeheader[8];
++			const char *identity;
++			uint32_t idlen;
++			size_t length;
++
++			if (usize < sizeof(fakeheader)) {
++				error = ERANGE;
++				break;
++			}
++			identity = cs_identity_get(pt);
++			if (identity == NULL) {
++				error = ENOENT;
++				break;
++			}
++			length = strlen(identity) + 1;
++			bzero(fakeheader, sizeof(fakeheader));
++			idlen = htonl((uint32_t)(length + sizeof(fakeheader)));
++			memcpy(&fakeheader[4], &idlen, sizeof(idlen));
++			error = copyout(fakeheader, uaddr, sizeof(fakeheader));
++			if (error)
++				break;
++			if (usize < sizeof(fakeheader) + length)
++				error = ERANGE;
++			else
++				error = copyout(identity, uaddr + sizeof(fakeheader), length);
++			break;
++		}
++
+ 		case CS_OPS_MARKRESTRICT:
+ 			proc_lock(pt);
+ 			pt->p_csflags |= CS_RESTRICT;
+diff --git a/xnu/bsd/kern/kern_xxx.c b/xnu/bsd/kern/kern_xxx.c
+index 0e4bd8f..9e8dc3f 100644
+--- a/xnu/bsd/kern/kern_xxx.c
++++ b/xnu/bsd/kern/kern_xxx.c
+@@ -104,6 +104,19 @@ reboot(struct proc *p, register struct reboot_args *uap, __unused int32_t *retva
+ 
+ 	if ((error = suser(kauth_cred_get(), &p->p_acflag)))
+ 		return(error);	
++#if BOARD_CONFIG_RASPBERRYPI3
++	{
++		/* iOS 10's launchd passes a reason string here; say who rebooted and why */
++		char why[128];
++		size_t done = 0;
++
++		why[0] = '\0';
++		if (uap->command != USER_ADDR_NULL)
++			(void)copyinstr(uap->command, why, sizeof(why), &done);
++		kprintf("rpi3: %s[%d] reboot(0x%x) \"%s\"\n", p->p_comm, p->p_pid, uap->opt, why);
++		printf("rpi3: %s[%d] reboot(0x%x) \"%s\"\n", p->p_comm, p->p_pid, uap->opt, why);
++	}
++#endif
+ 	
+ 	if (uap->opt & RB_COMMAND)
+ 		error = copyinstr(uap->command,
+diff --git a/xnu/bsd/kern/proc_info.c b/xnu/bsd/kern/proc_info.c
+index 791c1a4..e1e5aa0 100644
+--- a/xnu/bsd/kern/proc_info.c
++++ b/xnu/bsd/kern/proc_info.c
+@@ -949,6 +949,98 @@ proc_pidworkqueueinfo(proc_t p, struct proc_workqueueinfo *pwqinfo)
+ /********************************** proc_pidinfo ********************************/
+ 
+ 
++/*
++ * iOS 10 flavors: PROC_PIDUNIQIDENTIFIERINFO (17),
++ * PROC_PIDT_BSDINFOWITHUNIQID (18) and PROC_PIDARCHINFO (19).
++ */
++struct rpi3_proc_uniqidentifierinfo {
++	uint8_t		p_uuid[16];
++	uint64_t	p_uniqueid;
++	uint64_t	p_puniqueid;
++	uint64_t	p_reserve2;
++	uint64_t	p_reserve3;
++	uint64_t	p_reserve4;
++};
++
++struct rpi3_proc_bsdinfowithuniqid {
++	struct proc_bsdinfo		pbsd;
++	struct rpi3_proc_uniqidentifierinfo p_uniqidentifier;
++};
++
++struct rpi3_proc_archinfo {
++	cpu_type_t	p_cputype;
++	cpu_subtype_t	p_cpusubtype;
++};
++
++static void
++rpi3_proc_uniqinfo(proc_t p, struct rpi3_proc_uniqidentifierinfo *u)
++{
++	proc_t pp;
++
++	bzero(u, sizeof(*u));
++	bcopy(p->p_uuid, u->p_uuid, sizeof(u->p_uuid));
++	u->p_uniqueid = p->p_uniqueid;
++	pp = proc_find(p->p_ppid);
++	if (pp != PROC_NULL) {
++		u->p_puniqueid = pp->p_uniqueid;
++		proc_rele(pp);
++	}
++}
++
++static int
++rpi3_proc_pidinfo(int pid, int flavor, uint64_t arg, user_addr_t buffer, uint32_t buffersize, int32_t *retval)
++{
++	union {
++		struct rpi3_proc_uniqidentifierinfo uniq;
++		struct rpi3_proc_bsdinfowithuniqid bsd;
++		struct rpi3_proc_archinfo arch;
++	} info;
++	uint32_t size;
++	int zombie = 0;
++	int error = 0;
++	proc_t p;
++
++	switch (flavor) {
++	case 17: size = sizeof(info.uniq); break;
++	case 18: size = sizeof(info.bsd); break;
++	default: size = sizeof(info.arch); break;
++	}
++	if (buffersize < size)
++		return (ENOMEM);
++
++	p = proc_find(pid);
++	if (p == PROC_NULL && flavor == 18 && arg) {
++		p = proc_find_zombref(pid);
++		zombie = (p != PROC_NULL);
++	}
++	if (p == PROC_NULL)
++		return (ESRCH);
++
++	bzero(&info, sizeof(info));
++	switch (flavor) {
++	case 17:
++		rpi3_proc_uniqinfo(p, &info.uniq);
++		break;
++	case 18:
++		error = proc_pidbsdinfo(p, &info.bsd.pbsd, zombie);
++		rpi3_proc_uniqinfo(p, &info.bsd.p_uniqidentifier);
++		break;
++	default:
++		info.arch.p_cputype = CPU_TYPE_ARM;
++		info.arch.p_cpusubtype = CPU_SUBTYPE_ARM_V7S;
++		break;
++	}
++	if (zombie)
++		proc_drop_zombref(p);
++	else
++		proc_rele(p);
++	if (error == 0)
++		error = copyout(&info, buffer, size);
++	if (error == 0)
++		*retval = size;
++	return (error);
++}
++
+ int
+ proc_pidinfo(int pid, int flavor, uint64_t arg, user_addr_t buffer, uint32_t  buffersize, int32_t * retval)
+ {
+@@ -961,6 +1053,9 @@ proc_pidinfo(int pid, int flavor, uint64_t arg, user_addr_t buffer, uint32_t  bu
+ 	int zombie = 0;
+ 	int thuniqueid = 0;
+ 
++	if (flavor >= 17 && flavor <= 19)
++		return rpi3_proc_pidinfo(pid, flavor, arg, buffer, buffersize, retval);
++
+ 	switch (flavor) {
+ 		case PROC_PIDLISTFDS:
+ 			size = PROC_PIDLISTFD_SIZE;
+diff --git a/xnu/bsd/kern/pthread_synch.c b/xnu/bsd/kern/pthread_synch.c
+index 0c27a22..a5af104 100644
+--- a/xnu/bsd/kern/pthread_synch.c
++++ b/xnu/bsd/kern/pthread_synch.c
+@@ -103,6 +103,7 @@
+ #endif
+ 
+ #include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
+ 
+ #if 0
+ #undef KERNEL_DEBUG
+@@ -162,6 +163,63 @@ int proc_setalltargetconc(pid_t pid, int32_t * targetconcp);
+ #define	WQ_FLAG_THREAD_OVERCOMMIT	0x00010000	/* thread is with overcommit prio */
+ #define	WQ_FLAG_THREAD_REUSE		0x00020000	/* thread is being reused */
+ #define	WQ_FLAG_THREAD_NEWSPI		0x00040000	/* the call is with new SPIs */
++#define	WQ_FLAG_THREAD_KEVENT		0x00080000	/* iOS 10: thread is delivering kevents */
++#define	WQ_FLAG_THREAD_EVENT_MANAGER	0x00100000	/* iOS 10: thread is the event manager */
++
++/*
++ * iOS 10 (libpthread 218 / libdispatch 703) workqueue support, used when
++ * the Pi boots an iOS 10 root.  Thread requests carry a pthread priority
++ * (QoS bits << 8 | flags); threads are handed back a qos_class_t in the
++ * low bits of their flags.  All events of the process' workq kqueue are
++ * delivered by one event manager thread.
++ */
++#if BOARD_CONFIG_RASPBERRYPI3
++extern int rpi3_ios10_layout;
++#define RPI3_IOS10		(rpi3_ios10_layout != 0)
++#else
++#define RPI3_IOS10		0
++#endif
++
++#define RPI3_PP_OVERCOMMIT	0x80000000U
++#define RPI3_PP_EVENT_MANAGER	0x02000000U
++
++/* DISPATCHFUNC | FINEPRIO | BSDTHREADCTL | SETSELF | QOS_MAINTENANCE | KEVENT | QOS_DEFAULT */
++#define RPI3_PTHREAD_FEATURES	0x4000005F
++
++#define RPI3_KEVENT_QOS_SIZE	72		/* sizeof(struct kevent_qos_s) */
++#define RPI3_MGR_NEVENTS	16		/* events per manager upcall */
++#define RPI3_MGR_DATA		(32 * 1024)	/* Mach message space per upcall */
++#define RPI3_MGR_QOS		0x15		/* QOS_CLASS_DEFAULT */
++
++/* bucket -> qos_class_t: UI, IN, DEF, UT, BG, MT */
++static const uint16_t rpi3_bucket_qos[WORKQUEUE_NUMPRIOS] = { 0x21, 0x19, 0x15, 0x11, 0x09, 0x05 };
++
++static int
++rpi3_pp_to_bucket(uint32_t pp)
++{
++	uint32_t qos = (pp >> 8) & 0xff;
++
++	if (qos & 0x20) return 0;
++	if (qos & 0x10) return 1;
++	if (qos & 0x08) return 2;
++	if (qos & 0x04) return 3;
++	if (qos & 0x02) return 4;
++	if (qos & 0x01) return 5;
++	return 2;
++}
++
++/* background buckets get the disk/cpu throttle */
++#define WQ_IS_BG_PRIO(pri)	(RPI3_IOS10 ? ((pri) >= 4 && (pri) < WORKQUEUE_NUMPRIOS) : ((pri) == WORKQUEUE_BG_PRIOQUEUE))
++
++struct kqueue;
++extern struct kqueue *kqueue_alloc(struct proc *);
++extern void kqueue_dealloc(struct kqueue *);
++extern int rpi3_kevent_qos_apply(struct proc *p, struct kqueue *kq, user_addr_t changelist, int nchanges);
++extern int rpi3_kqwq_scan(struct kqueue *kq, struct rpi3_kqscan *scan,
++			  void (*cont)(struct kqueue *, void *, int), struct proc *p);
++extern void rpi3_kevent_data_set(user_addr_t data_out, user_size_t size);
++struct kqueue *rpi3_workq_kqueue(struct proc *p);
++static void rpi3_mgr_wait(proc_t p, struct workqueue *wq);
+ 
+ /*
+  * Flags filed passed to bsdthread_create and back in pthread_start 
+@@ -226,7 +284,8 @@ bsdthread_create(__unused struct proc *p, struct bsdthread_create_args  *uap, us
+ 	stackaddr = 0xB0000000;
+ #elif defined(__arm__)
+ #if BOARD_CONFIG_ARMPBA8 || BOARD_CONFIG_QSD8250_LEO
+-    stackaddr = 0x20000000;
++    /* iOS 10's shared region starts at 0x1A000000 */
++    stackaddr = RPI3_IOS10 ? 0x10000000 : 0x20000000;
+ #else
+     stackaddr = 0x2FD00000;
+ #endif
+@@ -486,7 +545,7 @@ bsdthread_terminate(__unused struct proc *p, struct bsdthread_terminate_args  *u
+ 
+ 
+ int
+-bsdthread_register(struct proc *p, struct bsdthread_register_args  *uap, __unused int32_t *retval)
++bsdthread_register(struct proc *p, struct bsdthread_register_args  *uap, int32_t *retval)
+ {
+ 	/* prevent multiple registrations */
+ 	if ((p->p_lflag & P_LREGISTER) != 0)
+@@ -495,6 +554,32 @@ bsdthread_register(struct proc *p, struct bsdthread_register_args  *uap, __unuse
+ 	if (uap->pthsize > MAX_PTHREAD_SIZE) {
+ 		return(EINVAL);
+ 	}
++	if (RPI3_IOS10) {
++		/*
++		 * libpthread 218 passes its registration data (and its size)
++		 * where the target concurrency pointer used to be; the kernel
++		 * fills in the main thread's QoS and returns its features.
++		 */
++		uint8_t data[64];
++		user_addr_t dptr = uap->dummy_value;
++		uint32_t dsize = (uint32_t)uap->targetconc_ptr;
++
++		if (dptr != USER_ADDR_NULL && dsize >= 24 && dsize <= sizeof(data) &&
++		    copyin(dptr, data, dsize) == 0) {
++			uint64_t main_qos = 0x08ff;	/* pthread priority: QoS default */
++
++			bcopy(&main_qos, &data[16], sizeof(main_qos));
++			(void)copyout(data, dptr, dsize);
++		}
++		p->p_threadstart = uap->threadstart;
++		p->p_wqthread = uap->wqthread;
++		p->p_pthsize = uap->pthsize;
++		p->p_targconc = 0;
++		p->p_dispatchqueue_offset = uap->dispatchqueue_offset;
++		proc_setregister(p);
++		*retval = RPI3_PTHREAD_FEATURES;
++		return(0);
++	}
+ 	p->p_threadstart = uap->threadstart;
+ 	p->p_wqthread = uap->wqthread;
+ 	p->p_pthsize = uap->pthsize;
+@@ -1080,7 +1165,8 @@ workqueue_addnewthread(struct workqueue *wq, boolean_t oc_thread)
+ 	stackaddr = 0xB0000000;
+ #elif defined(__arm__)
+ #if BOARD_CONFIG_ARMPBA8 || BOARD_CONFIG_QSD8250_LEO
+-    stackaddr = 0x20000000;
++    /* iOS 10's shared region starts at 0x1A000000 */
++    stackaddr = RPI3_IOS10 ? 0x10000000 : 0x20000000;
+ #else
+     stackaddr = 0x2FE00000;
+ #endif
+@@ -1275,7 +1361,7 @@ out:
+ 
+ 
+ int
+-workq_kernreturn(struct proc *p, struct workq_kernreturn_args  *uap, __unused int32_t *retval)
++workq_kernreturn(struct proc *p, struct workq_kernreturn_args  *uap, int32_t *retval)
+ {
+         struct workqueue *wq;
+ 	int error	= 0;
+@@ -1283,6 +1369,59 @@ workq_kernreturn(struct proc *p, struct workq_kernreturn_args  *uap, __unused in
+ 	if ((p->p_lflag & P_LREGISTER) == 0)
+ 		return(EINVAL);
+ 
++	if (RPI3_IOS10) {
++		thread_t th = current_thread();
++
++		switch (uap->options) {
++		case WQOPS_QUEUE_REQTHREADS:
++		case WQOPS_QUEUE_REQTHREADS2: {
++			uint32_t pp = (uint32_t)uap->prio;
++
++			if (pp & RPI3_PP_EVENT_MANAGER) {
++				/* the manager runs whenever its kqueue has events */
++				(void)rpi3_workq_kqueue(p);
++				return (0);
++			}
++			uap->prio = rpi3_pp_to_bucket(pp) |
++			    ((pp & RPI3_PP_OVERCOMMIT) ? WORKQUEUE_OVERCOMMIT : 0);
++			uap->options = WQOPS_QUEUE_REQTHREADS;
++			break;
++		}
++		case WQOPS_SET_EVENT_MANAGER_PRIORITY:
++			return (0);
++
++		case WQOPS_THREAD_KEVENT_RETURN:
++		case WQOPS_THREAD_RETURN:
++			wq = (struct workqueue *)p->p_wqptr;
++			if (wq != NULL && wq->wq_rpi3_kq != NULL &&
++			    uap->options == WQOPS_THREAD_KEVENT_RETURN &&
++			    uap->item != USER_ADDR_NULL && uap->affinity > 0) {
++				int nerr;
++
++				nerr = rpi3_kevent_qos_apply(p, wq->wq_rpi3_kq, uap->item,
++				    uap->affinity);
++				if (nerr > 0) {
++					/* libpthread hands the errors back to libdispatch */
++					*retval = nerr;
++					return (0);
++				}
++			}
++			if (wq != NULL && th == wq->wq_rpi3_mgr) {
++				struct uthread *uth = get_bsdthread_info(th);
++
++				if (uth->uu_sigmask != (sigset_t)(~workq_threadmask)) {
++					proc_lock(p);
++					uth->uu_sigmask = ~workq_threadmask;
++					proc_unlock(p);
++				}
++				rpi3_mgr_wait(p, wq);
++				/* NOTREACHED */
++			}
++			uap->options = WQOPS_THREAD_RETURN;
++			break;
++		}
++	}
++
+ 	switch (uap->options) {
+ 
+ 		case WQOPS_QUEUE_NEWSPISUPP:
+@@ -1491,6 +1630,11 @@ workqueue_exit(struct proc *p)
+ 		}
+ 		thread_call_free(wq->wq_atimer_call);
+ 
++		if (wq->wq_rpi3_kq != NULL)
++			kqueue_dealloc(wq->wq_rpi3_kq);
++		if (wq->wq_rpi3_mgr != THREAD_NULL)
++			thread_deallocate(wq->wq_rpi3_mgr);
++
+ 		kfree(wq, wq_size);
+ 
+ 		KERNEL_DEBUG(0x900808c | DBG_FUNC_END, 0, 0, 0, 0, 0);
+@@ -1500,14 +1644,23 @@ workqueue_exit(struct proc *p)
+ 
+ static int workqueue_importance[WORKQUEUE_NUMPRIOS] = 
+ {
+-	2, 0, -2, INT_MIN,
++	2, 0, -2, INT_MIN, INT_MIN, INT_MIN,
++};
++
++/* iOS 10 buckets: UI, IN, DEF, UT, BG, MT */
++static int rpi3_ios10_importance[WORKQUEUE_NUMPRIOS] =
++{
++	4, 2, 0, -2, INT_MIN, INT_MIN,
+ };
+ 
++#define WQ_IMPORTANCE(pri)	(RPI3_IOS10 ? rpi3_ios10_importance[pri] : workqueue_importance[pri])
++
+ #define WORKQ_POLICY_TIMESHARE 1
+ 
+ static int workqueue_policy[WORKQUEUE_NUMPRIOS] = 
+ {
+-	WORKQ_POLICY_TIMESHARE, WORKQ_POLICY_TIMESHARE, WORKQ_POLICY_TIMESHARE, WORKQ_POLICY_TIMESHARE
++	WORKQ_POLICY_TIMESHARE, WORKQ_POLICY_TIMESHARE, WORKQ_POLICY_TIMESHARE, WORKQ_POLICY_TIMESHARE,
++	WORKQ_POLICY_TIMESHARE, WORKQ_POLICY_TIMESHARE
+ };
+ 
+ 
+@@ -1917,20 +2070,20 @@ pick_up_work:
+ 		int retval = 0;
+ 
+ 		/* sets the saved importance for apple ios daemon if backgrounded. else returns 0 */
+-		retval = proc_setthread_saved_importance(th_to_run, workqueue_importance[priority]);
++		retval = proc_setthread_saved_importance(th_to_run, WQ_IMPORTANCE(priority));
+ 		if (retval == 0) {
+ #endif /* CONFIG_EMBEDDED */
+ 		policy = workqueue_policy[priority];
+ 		
+ 		KERNEL_DEBUG(0xefffd120 | DBG_FUNC_START, wq, orig_priority, tl->th_policy, 0, 0);
+ 
+-		if ((orig_priority == WORKQUEUE_BG_PRIOQUEUE) || (priority == WORKQUEUE_BG_PRIOQUEUE)) {
+-			if (orig_priority == WORKQUEUE_BG_PRIOQUEUE) {
++		if (WQ_IS_BG_PRIO(orig_priority) || WQ_IS_BG_PRIO(priority)) {
++			if (WQ_IS_BG_PRIO(orig_priority)) {
+ 				/* remove the disk throttle, importance will be reset in anycase */
+ 				proc_restore_workq_bgthreadpolicy(th_to_run);
+ 			} 
+ 
+-			if (priority == WORKQUEUE_BG_PRIOQUEUE) {
++			if (WQ_IS_BG_PRIO(priority)) {
+ 				proc_apply_workq_bgthreadpolicy(th_to_run);
+ 			}
+ 		}
+@@ -1942,7 +2095,7 @@ pick_up_work:
+ 			tl->th_policy = policy;
+ 		}
+ 
+-                precedinfo.importance = workqueue_importance[priority];
++                precedinfo.importance = WQ_IMPORTANCE(priority);
+                 (void)thread_policy_set_internal(th_to_run, THREAD_PRECEDENCE_POLICY, (thread_policy_t)&precedinfo, THREAD_PRECEDENCE_POLICY_COUNT);
+ 
+ 
+@@ -2254,7 +2407,10 @@ setup_wqthread(proc_t p, thread_t th, boolean_t overcommit, uint32_t priority, i
+ 	if (overcommit == TRUE)
+ 		flags |= WQ_FLAG_THREAD_OVERCOMMIT;
+ 
+-	flags |= priority;
++	if (RPI3_IOS10 && priority < WORKQUEUE_NUMPRIOS)
++		flags |= rpi3_bucket_qos[priority];
++	else
++		flags |= priority;
+ 
+ #if defined(__i386__) || defined(__x86_64__)
+ 	int isLP64 = 0;
+@@ -2480,6 +2636,340 @@ int thread_selfid(__unused struct proc *p, __unused struct thread_selfid_args *u
+ 	return KERN_SUCCESS;
+ }
+ 
++/*
++ * iOS 10 event manager.
++ *
++ * libdispatch registers its kevents on the process' workq kqueue
++ * (kevent_qos with KEVENT_FLAG_WORKQ) and expects the kernel to bring
++ * them to a workqueue thread.  One manager thread per process waits on
++ * that kqueue in the kernel and enters _pthread_wqthread with
++ * WQ_FLAG_THREAD_KEVENT | WQ_FLAG_THREAD_EVENT_MANAGER and the events on
++ * its stack.  It comes back with WQOPS_THREAD_KEVENT_RETURN, carrying
++ * the changes libdispatch deferred, and waits again.
++ *
++ * Its stack is laid out like any workqueue thread's, with the event list
++ * just below the pthread structure and the Mach message area below that:
++ *
++ *   pthread_addr - 16 * 72        event list
++ *   event list   - 32 KiB         received messages (filled upward)
++ *   below that                    the thread's stack
++ */
++static user_addr_t
++rpi3_mgr_pthread_addr(struct workqueue *wq)
++{
++	return (user_addr_t)(wq->wq_rpi3_mgr_stack + PTH_DEFAULT_STACKSIZE + PTH_DEFAULT_GUARDSIZE);
++}
++
++static user_addr_t
++rpi3_mgr_evlist(struct workqueue *wq)
++{
++	return rpi3_mgr_pthread_addr(wq) - RPI3_MGR_NEVENTS * RPI3_KEVENT_QOS_SIZE;
++}
++
++static int rpi3_wq_trace = -1;	/* rpi3_wqtrace=1 boot-arg */
++
++static void
++rpi3_mgr_continue(__unused struct kqueue *kq, __unused void *data, int error)
++{
++	/* data is the scan state (shared with the callback), not the workqueue */
++	proc_t p = current_proc();
++	struct workqueue *wq = (struct workqueue *)p->p_wqptr;
++	thread_t th = current_thread();
++	arm_thread_state_t state;
++	user_addr_t pthread_addr, evlist;
++	uint32_t flags;
++	int n;
++
++	rpi3_kevent_data_set(USER_ADDR_NULL, 0);
++	if (wq == NULL) {
++		/* the process is exiting */
++		thread_exception_return();
++	}
++	n = wq->wq_rpi3_scan.out;
++
++	if (n == 0) {
++		if (error != 0 && error != EWOULDBLOCK &&
++		    (thread_should_abort(th) || (wq->wq_flags & WQ_EXITING))) {
++			/* the process is going away: let the AST take us */
++			thread_exception_return();
++		}
++		rpi3_mgr_wait(p, wq);
++		/* NOTREACHED */
++	}
++
++	if (rpi3_wq_trace < 0 && !PE_parse_boot_argn("rpi3_wqtrace", &rpi3_wq_trace, sizeof(rpi3_wq_trace)))
++		rpi3_wq_trace = 0;
++	if (rpi3_wq_trace > 0) {
++		kprintf("rpi3: %s[%d] event manager: %d events\n", p->p_comm, p->p_pid, n);
++	}
++	pthread_addr = rpi3_mgr_pthread_addr(wq);
++	evlist = rpi3_mgr_evlist(wq);
++	flags = WQ_FLAG_THREAD_NEWSPI | WQ_FLAG_THREAD_KEVENT |
++	    WQ_FLAG_THREAD_EVENT_MANAGER | RPI3_MGR_QOS;
++	if (wq->wq_rpi3_mgr_reuse)
++		flags |= WQ_FLAG_THREAD_REUSE;
++	wq->wq_rpi3_mgr_reuse = 1;
++
++	bzero(&state, sizeof(state));
++	state.r[0] = (uint32_t)pthread_addr;
++	state.r[1] = (uint32_t)wq->wq_rpi3_mgr_port;
++	state.r[2] = (uint32_t)(wq->wq_rpi3_mgr_stack + PTH_DEFAULT_GUARDSIZE);
++	state.r[3] = (uint32_t)evlist;
++	state.r[4] = flags;
++	state.r[5] = (uint32_t)n;
++	state.sp = (uint32_t)((evlist - RPI3_MGR_DATA - C_32_STK_ALIGN) & ~(C_32_STK_ALIGN - 1));
++	state.pc = (uint32_t)p->p_wqthread & ~1U;
++	state.cpsr = 0x10U | (((uint32_t)p->p_wqthread & 1U) ? 0x20U : 0);
++	thread_set_wq_state32(th, (thread_state_t)&state);
++
++	thread_exception_return();
++	/* NOTREACHED */
++}
++
++static void
++rpi3_mgr_wait(proc_t p, struct workqueue *wq)
++{
++	int error;
++
++	wq->wq_rpi3_scan.list = rpi3_mgr_evlist(wq);
++	wq->wq_rpi3_scan.max = RPI3_MGR_NEVENTS;
++	wq->wq_rpi3_scan.out = 0;
++	rpi3_kevent_data_set(rpi3_mgr_evlist(wq) - RPI3_MGR_DATA, RPI3_MGR_DATA);
++
++	error = rpi3_kqwq_scan(wq->wq_rpi3_kq, &wq->wq_rpi3_scan, rpi3_mgr_continue, p);
++	rpi3_mgr_continue(wq->wq_rpi3_kq, wq, error);
++	/* NOTREACHED */
++}
++
++static void
++rpi3_mgr_start(void)
++{
++	proc_t p = current_proc();
++	struct workqueue *wq = (struct workqueue *)p->p_wqptr;
++
++	if (wq == NULL || wq->wq_rpi3_kq == NULL || (wq->wq_flags & WQ_EXITING)) {
++		thread_terminate(current_thread());
++		thread_exception_return();
++	}
++	rpi3_mgr_wait(p, wq);
++	/* NOTREACHED */
++}
++
++static int
++rpi3_mgr_create(proc_t p, struct workqueue *wq)
++{
++	mach_vm_offset_t stackaddr = 0x10000000;
++	mach_vm_size_t allocsize;
++	kern_return_t kret;
++	struct uthread *uth;
++	void *sright;
++	thread_t th;
++
++	kret = thread_create_workq(wq->wq_task, (thread_continue_t)rpi3_mgr_start, &th);
++	if (kret != KERN_SUCCESS)
++		return (ENOMEM);
++
++	allocsize = PTH_DEFAULT_STACKSIZE + PTH_DEFAULT_GUARDSIZE + p->p_pthsize;
++	kret = mach_vm_map(wq->wq_map, &stackaddr, allocsize, page_size - 1,
++	    VM_MAKE_TAG(VM_MEMORY_STACK) | VM_FLAGS_ANYWHERE, NULL, 0, FALSE,
++	    VM_PROT_DEFAULT, VM_PROT_ALL, VM_INHERIT_DEFAULT);
++	if (kret == KERN_SUCCESS) {
++		kret = mach_vm_protect(wq->wq_map, stackaddr, PTH_DEFAULT_GUARDSIZE, FALSE, VM_PROT_NONE);
++		if (kret != KERN_SUCCESS)
++			(void)mach_vm_deallocate(wq->wq_map, stackaddr, allocsize);
++	}
++	if (kret != KERN_SUCCESS) {
++		(void)thread_terminate(th);
++		thread_deallocate(th);
++		return (ENOMEM);
++	}
++	thread_reference(th);
++	sright = (void *)convert_thread_to_port(th);	/* consumes a reference */
++
++	wq->wq_rpi3_mgr_stack = stackaddr;
++	wq->wq_rpi3_mgr_allocsize = allocsize;
++	wq->wq_rpi3_mgr_port = ipc_port_copyout_send(sright, get_task_ipcspace(wq->wq_task));
++	wq->wq_rpi3_mgr_reuse = 0;
++
++	thread_static_param(th, TRUE);
++	uth = get_bsdthread_info(th);
++	uth->uu_sigmask = ~workq_threadmask;
++
++	wq->wq_rpi3_mgr = th;
++	kprintf("rpi3: %s[%d] workqueue event manager, stack 0x%llx\n", p->p_comm, p->p_pid,
++	    (unsigned long long)stackaddr);
++	thread_resume(th);
++	return (0);
++}
++
++/*
++ * The process' workq kqueue, created (with its event manager) on first
++ * use.
++ */
++struct kqueue *
++rpi3_workq_kqueue(struct proc *p)
++{
++	struct workqueue *wq;
++	struct kqueue *kq;
++
++	if ((p->p_lflag & P_LREGISTER) == 0)
++		return (NULL);
++	if (p->p_wqptr == NULL)
++		(void)workq_open(p, NULL, NULL);
++	if ((wq = (struct workqueue *)p->p_wqptr) == NULL)
++		return (NULL);
++	if (wq->wq_rpi3_kq != NULL)
++		return (wq->wq_rpi3_kq);
++
++	kq = kqueue_alloc(p);
++	if (kq == NULL)
++		return (NULL);
++	if (!OSCompareAndSwapPtr(NULL, kq, &wq->wq_rpi3_kq)) {
++		kqueue_dealloc(kq);
++		return (wq->wq_rpi3_kq);
++	}
++	if (rpi3_mgr_create(p, wq) != 0)
++		printf("rpi3: %s[%d]: no workqueue event manager\n", p->p_comm, p->p_pid);
++	return (kq);
++}
++
++/*
++ * bsdthread_ctl: QoS overrides and the like.  There is one CPU and no
++ * QoS scheduling here, so all of it succeeds without effect.
++ */
++#define BSDTHREAD_CTL_QOS_MAX_PARALLELISM	0x800
++
++int
++bsdthread_ctl(__unused struct proc *p, struct bsdthread_ctl_args *uap, int32_t *retval)
++{
++	if (uap->cmd == BSDTHREAD_CTL_QOS_MAX_PARALLELISM)
++		*retval = 1;
++	else
++		*retval = 0;
++	return (0);
++}
++
++int
++memorystatus_control(__unused struct proc *p, __unused struct memorystatus_control_args *uap, int32_t *retval)
++{
++	*retval = 0;
++	return (0);
++}
++
++/*
++ * ulock_wait / ulock_wake (os_unfair_lock, os_once and friends).
++ * Waiters on the same (process, address) share a slot; ulock_wait
++ * returns how many others are still waiting there.
++ */
++#define UL_OPCODE_MASK		0x000000ff
++#define ULF_WAKE_ALL		0x00000100
++#define ULF_NO_ERRNO		0x01000000
++#define RPI3_ULOCK_SLOTS	64
++
++struct rpi3_ulock {
++	proc_t		ul_proc;
++	user_addr_t	ul_addr;
++	int		ul_waiters;
++};
++static struct rpi3_ulock rpi3_ulocks[RPI3_ULOCK_SLOTS];
++static lck_mtx_t *rpi3_ulock_mtx;
++
++static struct rpi3_ulock *
++rpi3_ulock_find(proc_t p, user_addr_t addr, int create)
++{
++	struct rpi3_ulock *ul, *free_ul = NULL;
++	int i;
++
++	for (i = 0; i < RPI3_ULOCK_SLOTS; i++) {
++		ul = &rpi3_ulocks[i];
++		if (ul->ul_waiters > 0 && ul->ul_proc == p && ul->ul_addr == addr)
++			return (ul);
++		if (ul->ul_waiters == 0 && free_ul == NULL)
++			free_ul = ul;
++	}
++	if (create && free_ul != NULL) {
++		free_ul->ul_proc = p;
++		free_ul->ul_addr = addr;
++	}
++	return (create ? free_ul : NULL);
++}
++
++static int
++rpi3_ulock_ret(uint32_t op, int error, int32_t *retval)
++{
++	if (error != 0 && (op & ULF_NO_ERRNO)) {
++		*retval = -error;
++		return (0);
++	}
++	return (error);
++}
++
++int
++ulock_wait(struct proc *p, struct ulock_wait_args *uap, int32_t *retval)
++{
++	struct rpi3_ulock *ul;
++	uint32_t value;
++	uint64_t deadline = 0;
++	wait_result_t wr;
++	int error = 0;
++
++	*retval = 0;
++	if (uap->addr == USER_ADDR_NULL)
++		return rpi3_ulock_ret(uap->operation, EINVAL, retval);
++
++	lck_mtx_lock(rpi3_ulock_mtx);
++	if (copyin(uap->addr, &value, sizeof(value)) != 0) {
++		lck_mtx_unlock(rpi3_ulock_mtx);
++		return rpi3_ulock_ret(uap->operation, EFAULT, retval);
++	}
++	if (value != uap->value_lo) {
++		/* already changed: nothing to wait for */
++		lck_mtx_unlock(rpi3_ulock_mtx);
++		return (0);
++	}
++	ul = rpi3_ulock_find(p, uap->addr, 1);
++	if (ul == NULL) {
++		/* out of slots: let the caller spin */
++		lck_mtx_unlock(rpi3_ulock_mtx);
++		return (0);
++	}
++	ul->ul_waiters++;
++	if (uap->timeout != 0)
++		clock_interval_to_deadline(uap->timeout, NSEC_PER_USEC, &deadline);
++	wr = lck_mtx_sleep_deadline(rpi3_ulock_mtx, LCK_SLEEP_DEFAULT, (event_t)ul,
++	    THREAD_ABORTSAFE, deadline);
++	ul->ul_waiters--;
++	*retval = ul->ul_waiters;
++	lck_mtx_unlock(rpi3_ulock_mtx);
++
++	if (wr == THREAD_INTERRUPTED)
++		error = EINTR;
++	else if (wr == THREAD_TIMED_OUT)
++		error = ETIMEDOUT;
++	if (error)
++		*retval = 0;
++	return rpi3_ulock_ret(uap->operation, error, retval);
++}
++
++int
++ulock_wake(struct proc *p, struct ulock_wake_args *uap, int32_t *retval)
++{
++	struct rpi3_ulock *ul;
++	int error = 0;
++
++	*retval = 0;
++	lck_mtx_lock(rpi3_ulock_mtx);
++	ul = rpi3_ulock_find(p, uap->addr, 0);
++	if (ul == NULL)
++		error = ENOENT;
++	else if (uap->operation & ULF_WAKE_ALL)
++		thread_wakeup((event_t)ul);
++	else
++		thread_wakeup_one((event_t)ul);
++	lck_mtx_unlock(rpi3_ulock_mtx);
++	return rpi3_ulock_ret(uap->operation, error, retval);
++}
++
+ void
+ pthread_init(void)
+ {
+@@ -2490,6 +2980,7 @@ pthread_init(void)
+ 	 * allocate the lock attribute for pthread synchronizers
+ 	 */
+ 	pthread_lck_attr = lck_attr_alloc_init();
++	rpi3_ulock_mtx = lck_mtx_alloc_init(pthread_lck_grp, pthread_lck_attr);
+ 
+ 	workqueue_init_lock((proc_t) get_bsdtask_info(kernel_task));
+ #if PSYNCH
+diff --git a/xnu/bsd/kern/subr_xxx.c b/xnu/bsd/kern/subr_xxx.c
+index 386d2b2..f951770 100644
+--- a/xnu/bsd/kern/subr_xxx.c
++++ b/xnu/bsd/kern/subr_xxx.c
+@@ -186,6 +186,11 @@ nosys(struct proc *p, __unused struct nosys_args *args, __unused int32_t *retval
+ 		/* Which unimplemented call (r12, or r0 for syscall(0, ...)). */
+ 		extern void rpi3_dump_current_thread(void);
+ 		static unsigned logs;
++		extern void *find_user_regs(thread_t);
++		uint32_t *regs = (uint32_t *)find_user_regs(current_thread());
++
++		kprintf("rpi3: %s[%d] unimplemented system call %d (r0 %x)\n",
++		    p->p_comm, p->p_pid, regs ? (int)regs[12] : -1, regs ? regs[0] : 0);
+ 		if (logs++ < 12) {
+ 		printf("rpi3: %s[%d] called an unimplemented system call (SIGSYS)\n",
+ 		       p->p_comm, p->p_pid);
+diff --git a/xnu/bsd/kern/syscalls.master b/xnu/bsd/kern/syscalls.master
+index d51e863..35a15dd 100644
+--- a/xnu/bsd/kern/syscalls.master
++++ b/xnu/bsd/kern/syscalls.master
+@@ -575,7 +575,7 @@
+ #endif
+ 372	AUE_NULL	ALL	{ uint64_t thread_selfid (void) NO_SYSCALL_STUB; } 
+ 373	AUE_LEDGER	ALL	{ int ledger(int cmd, caddr_t arg1, caddr_t arg2, caddr_t arg3); } 
+-374	AUE_NULL	ALL	{ int nosys(void); } 
++374	AUE_NULL	ALL	{ int kevent_qos(int fd, user_addr_t changelist, int nchanges, user_addr_t eventlist, int nevents, user_addr_t data_out, user_addr_t data_available) NO_SYSCALL_STUB; }
+ 375	AUE_NULL	ALL	{ int nosys(void); } 
+ 376	AUE_NULL	ALL	{ int nosys(void); } 
+ 377	AUE_NULL	ALL	{ int nosys(void); } 
+@@ -670,45 +670,45 @@
+ 437	AUE_NULL	ALL	{ int nosys(void); } { old shared_region_slide_np }
+ 438	AUE_NULL	ALL	{ int shared_region_map_and_slide_np(int fd, uint32_t count, const struct shared_file_mapping_np *mappings, uint32_t slide, uint64_t* slide_start, uint32_t slide_size) NO_SYSCALL_STUB; }
+ 439	AUE_NULL	ALL	{ int kas_info(int selector, void *value, size_t *size); }
+-440	AUE_NULL	ALL	{ int nosys(void); } { memorystatus_control }
++440	AUE_NULL	ALL	{ int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, user_addr_t buffer, uint32_t buffersize) NO_SYSCALL_STUB; }
+ 441	AUE_OPEN_RWTC	ALL	{ int guarded_open_np(user_addr_t path, user_addr_t guard, u_int guardflags, int flags, int mode) NO_SYSCALL_STUB; }
+ 442	AUE_CLOSE	ALL	{ int guarded_close_np(int fd, user_addr_t guard); }
+ 443	AUE_KQUEUE	ALL	{ int guarded_kqueue_np(user_addr_t guard, u_int guardflags); }
+ 444	AUE_NULL	ALL	{ int change_fdguard_np(int fd, user_addr_t guard, u_int guardflags, user_addr_t nguard, u_int nguardflags, user_addr_t fdflagsp); }
+-445	AUE_NULL	ALL	{ int nosys(void); }
+-446	AUE_NULL	ALL	{ int nosys(void); }
++445	AUE_NULL	ALL	{ int rpi3_usrctl(void) NO_SYSCALL_STUB; }
++446	AUE_NULL	ALL	{ int rpi3_proc_rlimit_control(void) NO_SYSCALL_STUB; }
+ 447	AUE_NULL	ALL	{ int nosys(void); }
+ 448	AUE_NULL	ALL	{ int nosys(void); }
+ 449	AUE_NULL	ALL	{ int nosys(void); }
+ 450	AUE_NULL	ALL	{ int nosys(void); }
+-451	AUE_NULL	ALL	{ int nosys(void); }
+-452	AUE_NULL	ALL	{ int nosys(void); }
+-453	AUE_NULL	ALL	{ int nosys(void); }
+-454	AUE_NULL	ALL	{ int nosys(void); }
+-455	AUE_NULL	ALL	{ int nosys(void); }
++451	AUE_NULL	ALL	{ int rpi3_telemetry(void) NO_SYSCALL_STUB; }
++452	AUE_NULL	ALL	{ int rpi3_proc_uuid_policy(void) NO_SYSCALL_STUB; }
++453	AUE_NULL	ALL	{ int memorystatus_get_level(user_addr_t level) NO_SYSCALL_STUB; }
++454	AUE_NULL	ALL	{ int rpi3_system_override(void) NO_SYSCALL_STUB; }
++455	AUE_NULL	ALL	{ int rpi3_vfs_purge(void) NO_SYSCALL_STUB; }
+ 456	AUE_NULL	ALL	{ int nosys(void); }
+ 457	AUE_NULL	ALL	{ int nosys(void); }
+-458	AUE_NULL	ALL	{ int nosys(void); }
+-459	AUE_NULL	ALL	{ int nosys(void); }
++458	AUE_NULL	ALL	{ int coalition(uint32_t operation, user_addr_t cid, uint32_t flags) NO_SYSCALL_STUB; }
++459	AUE_NULL	ALL	{ int coalition_info(uint32_t flavor, user_addr_t cid, user_addr_t buffer, user_addr_t bufsize) NO_SYSCALL_STUB; }
+ 460	AUE_NULL	ALL	{ int nosys(void); }
+ 461	AUE_NULL	ALL	{ int nosys(void); }
+ 462	AUE_NULL	ALL	{ int nosys(void); }
+-463	AUE_NULL	ALL	{ int nosys(void); }
+-464	AUE_NULL	ALL	{ int nosys(void); }
+-465	AUE_NULL	ALL	{ int nosys(void); }
+-466	AUE_NULL	ALL	{ int nosys(void); }
+-467	AUE_NULL	ALL	{ int nosys(void); }
+-468	AUE_NULL	ALL	{ int nosys(void); }
+-469	AUE_NULL	ALL	{ int nosys(void); }
+-470	AUE_NULL	ALL	{ int nosys(void); }
+-471	AUE_NULL	ALL	{ int nosys(void); }
+-472	AUE_NULL	ALL	{ int nosys(void); }
+-473	AUE_NULL	ALL	{ int nosys(void); }
+-474	AUE_NULL	ALL	{ int nosys(void); }
+-475	AUE_NULL	ALL	{ int nosys(void); }
++463	AUE_NULL	ALL	{ int openat(int fd, user_addr_t path, int flags, int mode) NO_SYSCALL_STUB; }
++464	AUE_NULL	ALL	{ int openat_nocancel(int fd, user_addr_t path, int flags, int mode) NO_SYSCALL_STUB; }
++465	AUE_NULL	ALL	{ int renameat(int fromfd, user_addr_t from, int tofd, user_addr_t to) NO_SYSCALL_STUB; }
++466	AUE_NULL	ALL	{ int faccessat(int fd, user_addr_t path, int amode, int flag) NO_SYSCALL_STUB; }
++467	AUE_NULL	ALL	{ int fchmodat(int fd, user_addr_t path, int mode, int flag) NO_SYSCALL_STUB; }
++468	AUE_NULL	ALL	{ int fchownat(int fd, user_addr_t path, uid_t uid, gid_t gid, int flag) NO_SYSCALL_STUB; }
++469	AUE_NULL	ALL	{ int fstatat(int fd, user_addr_t path, user_addr_t ub, int flag) NO_SYSCALL_STUB; }
++470	AUE_NULL	ALL	{ int fstatat64(int fd, user_addr_t path, user_addr_t ub, int flag) NO_SYSCALL_STUB; }
++471	AUE_NULL	ALL	{ int linkat(int fd1, user_addr_t path, int fd2, user_addr_t link, int flag) NO_SYSCALL_STUB; }
++472	AUE_NULL	ALL	{ int unlinkat(int fd, user_addr_t path, int flag) NO_SYSCALL_STUB; }
++473	AUE_NULL	ALL	{ int readlinkat(int fd, user_addr_t path, user_addr_t buf, size_t bufsize) NO_SYSCALL_STUB; }
++474	AUE_NULL	ALL	{ int symlinkat(user_addr_t path1, int fd, user_addr_t path2) NO_SYSCALL_STUB; }
++475	AUE_NULL	ALL	{ int mkdirat(int fd, user_addr_t path, int mode) NO_SYSCALL_STUB; }
+ 476	AUE_NULL	ALL	{ int nosys(void); }
+-477	AUE_NULL	ALL	{ int nosys(void); }
+-478	AUE_NULL	ALL	{ int nosys(void); }
++477	AUE_NULL	ALL	{ int rpi3_proc_trace_log(void) NO_SYSCALL_STUB; }
++478	AUE_NULL	ALL	{ int bsdthread_ctl(user_addr_t cmd, user_addr_t arg1, user_addr_t arg2, user_addr_t arg3) NO_SYSCALL_STUB; }
+ 479	AUE_NULL	ALL	{ int nosys(void); }
+ 480	AUE_NULL	ALL	{ int nosys(void); }
+ 481	AUE_NULL	ALL	{ int nosys(void); }
+@@ -745,8 +745,8 @@
+ 512	AUE_NULL	ALL	{ int nosys(void); }
+ 513	AUE_NULL	ALL	{ int nosys(void); }
+ 514	AUE_NULL	ALL	{ int nosys(void); }
+-515	AUE_NULL	ALL	{ int nosys(void); }
+-516	AUE_NULL	ALL	{ int nosys(void); }
++515	AUE_NULL	ALL	{ int ulock_wait(uint32_t operation, user_addr_t addr, uint32_t value_lo, uint32_t value_hi, uint32_t timeout) NO_SYSCALL_STUB; }
++516	AUE_NULL	ALL	{ int ulock_wake(uint32_t operation, user_addr_t addr, uint32_t wake_lo, uint32_t wake_hi) NO_SYSCALL_STUB; }
+ 517	AUE_NULL	ALL	{ int nosys(void); }
+ 518	AUE_NULL	ALL	{ int nosys(void); }
+ 519	AUE_NULL	ALL	{ int nosys(void); }
+diff --git a/xnu/bsd/kern/ubc_subr.c b/xnu/bsd/kern/ubc_subr.c
+index 3245a16..b8b1875 100644
+--- a/xnu/bsd/kern/ubc_subr.c
++++ b/xnu/bsd/kern/ubc_subr.c
+@@ -369,6 +369,46 @@ hashes(
+  * Routines to navigate entitlements in the kernel.
+  */
+ 
++/*
++ * cs_identity_get
++ *
++ * The signing identifier of a process' main executable (from its
++ * CodeDirectory), or NULL.  Points into the vnode's signature blob.
++ */
++const char *
++cs_identity_get(proc_t p)
++{
++	struct cs_blob *blob_list_entry;
++	CS_SuperBlob *super_blob;
++	CS_CodeDirectory *code_dir;
++	CS_GenericBlob *blob;
++	unsigned int i, count;
++	uint32_t ident;
++
++	if (NULL == p->p_textvp)
++		return NULL;
++	if (NULL == (blob_list_entry = ubc_cs_blob_get(p->p_textvp, -1,
++	    p->p_textoff)))
++		return NULL;
++	super_blob = (void *)blob_list_entry->csb_mem_kaddr;
++	if (CSMAGIC_EMBEDDED_SIGNATURE != ntohl(super_blob->magic))
++		return NULL;
++	count = ntohl(super_blob->count);
++	for (i = 0; i < count; ++i) {
++		if (ntohl(super_blob->index[i].type) != CSSLOT_CODEDIRECTORY)
++			continue;
++		blob = (void *)((char *)super_blob + ntohl(super_blob->index[i].offset));
++		if (CSMAGIC_CODEDIRECTORY != ntohl(blob->magic))
++			return NULL;
++		code_dir = (void *)blob;
++		ident = ntohl(code_dir->identOffset);
++		if (ident == 0 || ident >= ntohl(code_dir->length))
++			return NULL;
++		return (const char *)code_dir + ident;
++	}
++	return NULL;
++}
++
+ /* Retrieve the entitlements blob for a process.
+  * Returns:
+  *   EINVAL	no text vnode associated with the process
+diff --git a/xnu/bsd/sys/eventvar.h b/xnu/bsd/sys/eventvar.h
+index 26d3af6..df3c3f7 100644
+--- a/xnu/bsd/sys/eventvar.h
++++ b/xnu/bsd/sys/eventvar.h
+@@ -80,6 +80,7 @@ struct kqueue {
+ #define KQ_PROCWAIT	0x04
+ #define KQ_KEV32	0x08
+ #define KQ_KEV64	0x10
++#define KQ_KEVQOS	0x20		/* iOS 10 kevent_qos_s events */
+ };
+ 
+ extern struct kqueue *kqueue_alloc(struct proc *);
+diff --git a/xnu/bsd/sys/pthread_internal.h b/xnu/bsd/sys/pthread_internal.h
+index 1c87a36..d9f4ec6 100644
+--- a/xnu/bsd/sys/pthread_internal.h
++++ b/xnu/bsd/sys/pthread_internal.h
+@@ -55,10 +55,21 @@ typedef struct ksyn_waitq_element * ksyn_waitq_element_t;
+ #define WORKQUEUE_LOW_PRIOQUEUE     2       /* low priority queue */
+ #define WORKQUEUE_BG_PRIOQUEUE      3       /* background priority queue */
+ 
+-#define WORKQUEUE_NUMPRIOS 4
++/*
++ * iOS 10's libpthread asks for threads by QoS class (six of them); the
++ * extra two buckets are only used when the Pi runs an iOS 10 root.
++ */
++#define WORKQUEUE_NUMPRIOS 6
+ 
+ #define WORKQUEUE_OVERCOMMIT	0x10000
+ 
++/* the iOS 10 event manager's kqueue scan state (kern_event.c) */
++struct rpi3_kqscan {
++	user_addr_t	list;	/* next kevent_qos_s slot */
++	int		max;
++	int		out;
++};
++
+ struct threadlist {
+ 	TAILQ_ENTRY(threadlist) th_entry;
+ 	thread_t th_thread;
+@@ -105,6 +116,14 @@ struct workqueue {
+         uint16_t	*wq_thscheduled_count[WORKQUEUE_NUMPRIOS];
+         uint32_t	*wq_thactive_count[WORKQUEUE_NUMPRIOS];		/* must be uint32_t since we OSAddAtomic on these */
+         uint64_t	*wq_lastblocked_ts[WORKQUEUE_NUMPRIOS];
++	/* iOS 10 kevent workqueue (Pi) */
++	struct kqueue	*wq_rpi3_kq;		/* the process' workq kqueue */
++	thread_t	wq_rpi3_mgr;		/* event manager thread */
++	mach_vm_offset_t wq_rpi3_mgr_stack;
++	mach_vm_size_t	wq_rpi3_mgr_allocsize;
++	mach_port_name_t wq_rpi3_mgr_port;
++	int		wq_rpi3_mgr_reuse;	/* manager has been to user space */
++	struct rpi3_kqscan wq_rpi3_scan;	/* manager's pending kqueue scan */
+ };
+ #define WQ_LIST_INITED		0x01
+ #define WQ_ATIMER_RUNNING	0x02
+@@ -140,6 +159,9 @@ struct workqueue {
+ #define WQOPS_THREAD_SETCONC  8
+ #define WQOPS_QUEUE_NEWSPISUPP  0x10	/* this is to check for newer SPI support */
+ #define WQOPS_QUEUE_REQTHREADS  0x20	/* request number of threads of a prio */
++#define WQOPS_QUEUE_REQTHREADS2 0x30	/* iOS 10: request threads, pthread priority */
++#define WQOPS_THREAD_KEVENT_RETURN 0x40	/* iOS 10: kevent thread returns, with changes */
++#define WQOPS_SET_EVENT_MANAGER_PRIORITY 0x80
+ 
+ #define PTH_DEFAULT_STACKSIZE 512*1024
+ #define PTH_DEFAULT_GUARDSIZE 4*1024
+diff --git a/xnu/bsd/sys/user.h b/xnu/bsd/sys/user.h
+index 08f1ea3..5184b01 100644
+--- a/xnu/bsd/sys/user.h
++++ b/xnu/bsd/sys/user.h
+@@ -245,6 +245,10 @@ struct uthread {
+ 	void *		t_dtrace_syscall_args;
+ #endif /* CONFIG_DTRACE */
+ 	void *		uu_threadlist;
++	/* iOS 10 kevent_qos: where filters may place out-of-line data (next free byte) */
++	user_addr_t	uu_rpi3_data_out;	/* next free byte of the buffer */
++	user_size_t	uu_rpi3_data_left;	/* bytes still available above it */
++	user_addr_t	uu_rpi3_data_availp;	/* caller's data_available, updated on return */
+ 	char *		pth_name;
+ 	struct ksyn_waitq_element  uu_kwe;		/* user for pthread synch */
+ 	struct label *	uu_label;	/* MAC label */
+diff --git a/xnu/bsd/vm/vm_unix.c b/xnu/bsd/vm/vm_unix.c
+index 136d49c..82fe505 100644
+--- a/xnu/bsd/vm/vm_unix.c
++++ b/xnu/bsd/vm/vm_unix.c
+@@ -1552,6 +1552,8 @@ shared_region_map_and_slide_np(
+ #define SFM_MAX_STACK	8
+ 	struct shared_file_mapping_np	stack_mappings[SFM_MAX_STACK];
+ 
++	kprintf("rpi3: %s[%d] shared cache slide 0x%x\n", p->p_comm, p->p_pid, slide);
++
+ 	/* Is the process chrooted?? */
+ 	if (p->p_fd->fd_rdir != NULL) {
+ 		kr = EINVAL;
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
+index 903df74..a7a494f 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
+@@ -45,6 +45,7 @@ static void phase(unsigned value,int locator=0,IOReturn io=kIOReturnSuccess)
+  if(io!=kIOReturnSuccess&&rootStatus.io_error==kIOReturnSuccess)rootStatus.io_error=io;
+  IOSimpleLockUnlockEnableInterrupt(statusLock,saved);
+ }
++extern "C" void kprintf(const char *fmt, ...);
+ extern "C" void ios7leo_root_file_status(void)
+ {
+  if(!statusLock){IOLog("Leo storage: NOT_ENTERED (no file mapper preparation observed)\n");return;}
+@@ -318,6 +319,8 @@ IOReturn IOS7LeoHFSFile::doAsyncReadWrite(IOMemoryDescriptor *buffer,UInt64 bloc
+  cowStatus(result,wrote,false);bool cacheShow=readCacheStatus();bool show=wrote&&(rootStatus.cow_writes<=2U);
+  UInt64 cacheHits=readCache?readCache->hits:0,cacheMisses=readCache?readCache->misses:0,cacheBaseReads=readCache?readCache->base_reads:0;
+  IOLockUnlock(mutex);
++ if(result!=kIOReturnSuccess){static unsigned errorNotes;if(errorNotes++<16)kprintf("Leo root I/O: %s block=%llu count=%llu completed=%llu result=%08x faulted=%d cow-used=%u cap=%u\n",
++   direction==kIODirectionIn?"read":"write",(unsigned long long)block,(unsigned long long)count,(unsigned long long)completed,(unsigned)result,(int)faulted,rootStatus.cow_used,rootStatus.cow_cap);}
+  if(faulted)phase(StorageFailed,0,result);if(show||result!=kIOReturnSuccess)ios7leo_root_file_status();
+  if(cacheShow)IOLog("Leo READCACHE demand: hits=%llu misses=%llu base-reads=%llu bytes=%u\n",(unsigned long long)cacheHits,(unsigned long long)cacheMisses,(unsigned long long)cacheBaseReads,(unsigned)sizeof(*readCache));
+  IOStorage::complete(&saved,result,completed);return kIOReturnSuccess;
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index 35d2c70..ad2af3f 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -748,6 +748,9 @@ void sleh_abort(void *context, int reason)
+                     /*
+                      * Debug only.
+                      */
++                    kprintf("rpi3: %s[%d] prefetch abort pc 0x%08x lr 0x%08x sp 0x%08x vm_fault %d\n",
++                         proc_name_address(thread->task->bsd_info),
++                         proc_pid(thread->task->bsd_info), arm_ctx->pc, arm_ctx->lr, arm_ctx->sp, code);
+                     printf
+                         (ANSI_COLOR_RED "%s[%d]: " ANSI_COLOR_YELLOW "usermode prefetch abort, EXC_BAD_ACCESS at 0x%08x in map %p (pmap %p) (%s)" ANSI_COLOR_RESET" \n",
+                          proc_name_address(thread->task->bsd_info),
+diff --git a/xnu/osfmk/ipc/ipc_pset.c b/xnu/osfmk/ipc/ipc_pset.c
+index fb31903..2f4d49f 100644
+--- a/xnu/osfmk/ipc/ipc_pset.c
++++ b/xnu/osfmk/ipc/ipc_pset.c
+@@ -331,41 +331,71 @@ struct filterops machport_filtops = {
+ 	.f_peek = filt_machportpeek,
+ };
+ 
++/*
++ * The knote watches either a port set (iOS 7 and older) or, as iOS 10's
++ * libdispatch does, a receive right directly.  kn_hookid says which, and
++ * kn_ptr.p_pset holds a reference on the object either way.
++ */
++#define FILT_MACHPORT_PSET	1
++#define FILT_MACHPORT_PORT	2
++#define FILT_MACHPORT_KBUF	0x100	/* last event used a kernel-provided buffer */
++
++/* bsd/kern/kern_event.c: kevent_qos data_out space of the current call */
++extern int rpi3_kevent_data_get(mach_vm_address_t *addr, mach_msg_size_t *size);
++extern void rpi3_kevent_data_used(mach_msg_size_t used);
++
++static ipc_mqueue_t
++filt_machport_mqueue(struct knote *kn)
++{
++	ipc_object_t object = (ipc_object_t)kn->kn_ptr.p_pset;
++
++	if ((kn->kn_hookid & 0xff) == FILT_MACHPORT_PORT)
++		return &((ipc_port_t)object)->ip_messages;
++	return &((ipc_pset_t)object)->ips_messages;
++}
++
+ static int
+ filt_machportattach(
+         struct knote *kn)
+ {
+         mach_port_name_t        name = (mach_port_name_t)kn->kn_kevent.ident;
+ 	wait_queue_link_t	wql = wait_queue_link_allocate();
+-        ipc_pset_t              pset = IPS_NULL;
++        ipc_object_t            object = IO_NULL;
+         int                     result = ENOSYS;
++        int                     type = FILT_MACHPORT_PSET;
+         kern_return_t           kr;
+ 
+         kr = ipc_object_translate(current_space(), name,
+-                                  MACH_PORT_RIGHT_PORT_SET,
+-                                  (ipc_object_t *)&pset);
++                                  MACH_PORT_RIGHT_PORT_SET, &object);
++        if (kr != KERN_SUCCESS) {
++		type = FILT_MACHPORT_PORT;
++		kr = ipc_object_translate(current_space(), name,
++					  MACH_PORT_RIGHT_RECEIVE, &object);
++	}
+         if (kr != KERN_SUCCESS) {
+ 		wait_queue_link_free(wql);
+                 return (kr == KERN_INVALID_NAME ? ENOENT : ENOTSUP);
+         }
+-        /* We've got a lock on pset */
++        /* We've got a lock on the object */
++	kn->kn_hookid = type;
++	kn->kn_ptr.p_pset = (ipc_pset_t)object;
+ 
+ 	/* 
+-	 * Bind the portset wait queue directly to knote/kqueue.
++	 * Bind the message queue's wait queue directly to knote/kqueue.
+ 	 * This allows us to just use wait_queue foo to effect a wakeup,
+ 	 * rather than having to call knote() from the Mach code on each
+ 	 * message.
+ 	 */
+-	result = knote_link_wait_queue(kn, &pset->ips_messages.imq_wait_queue, wql);
++	result = knote_link_wait_queue(kn, &filt_machport_mqueue(kn)->imq_wait_queue, wql);
+ 	if (result == 0) {
+ 		/* keep a reference for the knote */
+-		kn->kn_ptr.p_pset = pset; 
+-		ips_reference(pset);
+-		ips_unlock(pset);
++		io_reference(object);
++		io_unlock(object);
+ 		return 0;
+ 	}
+ 
+-	ips_unlock(pset);
++	kn->kn_ptr.p_pset = IPS_NULL;
++	io_unlock(object);
+ 	wait_queue_link_free(wql);
+ 	return result;
+ }
+@@ -374,18 +404,18 @@ static void
+ filt_machportdetach(
+         struct knote *kn)
+ {
+-        ipc_pset_t              pset = kn->kn_ptr.p_pset;
++        ipc_object_t            object = (ipc_object_t)kn->kn_ptr.p_pset;
+ 	wait_queue_link_t	wql = WAIT_QUEUE_LINK_NULL;
+ 
+ 	/*
+-	 * Unlink the portset wait queue from knote/kqueue,
+-	 * and release our reference on the portset.
++	 * Unlink the message queue's wait queue from knote/kqueue,
++	 * and release our reference on the object.
+ 	 */
+-	ips_lock(pset);
+-	(void)knote_unlink_wait_queue(kn, &pset->ips_messages.imq_wait_queue, &wql);
++	io_lock(object);
++	(void)knote_unlink_wait_queue(kn, &filt_machport_mqueue(kn)->imq_wait_queue, &wql);
+ 	kn->kn_ptr.p_pset = IPS_NULL;
+-	ips_unlock(pset);
+-	ips_release(pset);
++	io_unlock(object);
++	io_release(object);
+ 	if (wql != WAIT_QUEUE_LINK_NULL)
+ 		wait_queue_link_free(wql);
+ }
+@@ -396,12 +426,14 @@ filt_machport(
+         __unused long hint)
+ {
+         mach_port_name_t        name = (mach_port_name_t)kn->kn_kevent.ident;
+-        ipc_pset_t              pset = IPS_NULL;
++        ipc_object_t            object = IO_NULL;
+ 	wait_result_t		wresult;
+ 	thread_t		self = current_thread();
+         kern_return_t           kr;
+ 	mach_msg_option_t	option;
+ 	mach_msg_size_t		size;
++	int			kbuf = 0;
++	int			is_port = ((kn->kn_hookid & 0xff) == FILT_MACHPORT_PORT);
+ 
+ 	/* never called from below */
+ 	assert(hint == 0);
+@@ -411,30 +443,48 @@ filt_machport(
+ 	 * name.  If it changed, we have an EOF situation.
+ 	 */
+ 	kr = ipc_object_translate(current_space(), name,
+-				  MACH_PORT_RIGHT_PORT_SET,
+-				  (ipc_object_t *)&pset);
+-	if (kr != KERN_SUCCESS || pset != kn->kn_ptr.p_pset || !ips_active(pset)) {
++				  is_port ? MACH_PORT_RIGHT_RECEIVE : MACH_PORT_RIGHT_PORT_SET,
++				  &object);
++	if (kr != KERN_SUCCESS || object != (ipc_object_t)kn->kn_ptr.p_pset || !io_active(object)) {
+ 		kn->kn_data = 0;
+ 		kn->kn_flags |= (EV_EOF | EV_ONESHOT);
+-		if (pset != IPS_NULL) {
+-			ips_unlock(pset);
++		if (object != IO_NULL) {
++			io_unlock(object);
+ 		}
+ 		return(1);
+         }
+ 
+ 	/* just use the reference from here on out */
+-	ips_reference(pset);
+-	ips_unlock(pset); 
++	io_reference(object);
++	io_unlock(object); 
+ 
+ 	/*
+ 	 * Only honor supported receive options. If no options are
+ 	 * provided, just force a MACH_RCV_TOO_LARGE to detect the
+ 	 * name of the port and sizeof the waiting message.
+ 	 */
++	kn->kn_hookid &= ~FILT_MACHPORT_KBUF;
+ 	option = kn->kn_sfflags & (MACH_RCV_MSG|MACH_RCV_LARGE|MACH_RCV_TRAILER_MASK);
+ 	if (option & MACH_RCV_MSG) {
+ 		self->ith_msg_addr = (mach_vm_address_t) kn->kn_ext[0];
+ 		size = (mach_msg_size_t)kn->kn_ext[1];
++		if (self->ith_msg_addr == 0) {
++			/* iOS 10: receive into the caller's kevent_qos data_out space */
++			mach_vm_address_t addr;
++			mach_msg_size_t avail;
++
++			if (rpi3_kevent_data_get(&addr, &avail) == 0) {
++				if (size == 0 || size > avail)
++					size = avail;
++				self->ith_msg_addr = addr;
++				kn->kn_hook = (void *)(uintptr_t)kn->kn_ext[1];
++				kbuf = 1;
++			} else {
++				/* no buffer: just report the waiting message's size */
++				option = (option & ~MACH_RCV_MSG) | MACH_RCV_LARGE;
++				size = 0;
++			}
++		}
+ 	} else {
+ 		option = MACH_RCV_LARGE;
+ 		self->ith_msg_addr = 0;
+@@ -448,7 +498,7 @@ filt_machport(
+ 	 * options, pass those through here.  But we don't support
+ 	 * scatter lists through this interface.
+ 	 */
+-	self->ith_object = (ipc_object_t)pset;
++	self->ith_object = object;
+ 	self->ith_msize = size;
+ 	self->ith_option = option;
+ 	self->ith_scatter_list_size = 0;
+@@ -458,7 +508,7 @@ filt_machport(
+ 	assert((self->ith_state = MACH_RCV_IN_PROGRESS) == MACH_RCV_IN_PROGRESS);
+ 
+ 	wresult = ipc_mqueue_receive_on_thread(
+-			&pset->ips_messages,
++			filt_machport_mqueue(kn),
+ 			option,
+ 			size, /* max_size */
+ 			0, /* immediate timeout */
+@@ -469,10 +519,10 @@ filt_machport(
+ 
+ 	/*
+ 	 * If we timed out, just release the reference on the
+-	 * portset and return zero.
++	 * object and return zero.
+ 	 */
+ 	if (self->ith_state == MACH_RCV_TIMED_OUT) {
+-		ips_release(pset);
++		io_release(object);
+ 		return 0;
+ 	}
+ 
+@@ -485,7 +535,11 @@ filt_machport(
+ 		assert(self->ith_state == MACH_RCV_TOO_LARGE);
+ 		assert(self->ith_kmsg == IKM_NULL);
+ 		kn->kn_data = self->ith_receiver_name;
+-		ips_release(pset);
++		if (kn->kn_sfflags & MACH_RCV_MSG) {
++			kn->kn_fflags = MACH_RCV_TOO_LARGE;
++			kn->kn_ext[1] = self->ith_msize;
++		}
++		io_release(object);
+ 		return 1;
+ 	}
+ 
+@@ -497,7 +551,16 @@ filt_machport(
+         kn->kn_data = MACH_PORT_NULL;
+ 	kn->kn_ext[1] = self->ith_msize;
+ 	kn->kn_fflags = mach_msg_receive_results();
+-	/* kmsg and pset reference consumed */
++	/* kmsg and object reference consumed */
++	if (kbuf) {
++		kn->kn_hookid |= FILT_MACHPORT_KBUF;
++		kn->kn_ext[0] = self->ith_msg_addr;
++		if (kn->kn_fflags == MACH_MSG_SUCCESS) {
++			/* message plus the largest trailer, kept 16-byte aligned */
++			rpi3_kevent_data_used((mach_msg_size_t)
++			    ((kn->kn_ext[1] + MAX_TRAILER_SIZE + 15) & ~15ULL));
++		}
++	}
+ 	return 1;
+ }
+ 
+@@ -508,9 +571,17 @@ filt_machporttouch(struct knote *kn, struct kevent64_s *kev, long type)
+         case EVENT_REGISTER:
+                 kn->kn_sfflags = kev->fflags;
+                 kn->kn_sdata = kev->data;
++		kn->kn_ext[0] = kev->ext[0];
++		kn->kn_ext[1] = kev->ext[1];
+                 break;
+         case EVENT_PROCESS:
+                 *kev = kn->kn_kevent;
++		if (kn->kn_hookid & FILT_MACHPORT_KBUF) {
++			/* the buffer was ours for this one event only */
++			kn->kn_hookid &= ~FILT_MACHPORT_KBUF;
++			kn->kn_ext[0] = 0;
++			kn->kn_ext[1] = (uint64_t)(uintptr_t)kn->kn_hook;
++		}
+                 if (kn->kn_flags & EV_CLEAR) {
+ 			kn->kn_data = 0;
+ 			kn->kn_fflags = 0;
+@@ -523,8 +594,8 @@ filt_machporttouch(struct knote *kn, struct kevent64_s *kev, long type)
+ }
+ 
+ /*
+- * Peek to see if the portset associated with the knote has any
+- * events. This pre-hook is called when a filter uses the stay-
++ * Peek to see if the port or portset associated with the knote has
++ * any events. This pre-hook is called when a filter uses the stay-
+  * on-queue mechanism (as the knote_link_wait_queue mechanism
+  * does).
+  *
+@@ -532,7 +603,7 @@ filt_machporttouch(struct knote *kn, struct kevent64_s *kev, long type)
+  * locked (thus holding a reference on the knote, but restricting
+  * also restricting our ability to take other locks).
+  *
+- * Just peek at the pre-post status of the portset's wait queue
++ * Just peek at the pre-post status of the message queue
+  * to determine if it has anything interesting.  We can do it
+  * without holding the lock, as it is just a snapshot in time
+  * (if this is used as part of really waiting for events, we
+@@ -542,8 +613,5 @@ filt_machporttouch(struct knote *kn, struct kevent64_s *kev, long type)
+ static unsigned
+ filt_machportpeek(struct knote *kn)
+ {
+-        ipc_pset_t              pset = kn->kn_ptr.p_pset;
+-	ipc_mqueue_t		set_mq = &pset->ips_messages;
+-
+-	return (ipc_mqueue_peek(set_mq));
++	return (ipc_mqueue_peek(filt_machport_mqueue(kn)));
+ }
+diff --git a/xnu/osfmk/kern/host.c b/xnu/osfmk/kern/host.c
+index cd5ca7f..53978cb 100644
+--- a/xnu/osfmk/kern/host.c
++++ b/xnu/osfmk/kern/host.c
+@@ -865,8 +865,11 @@ host_set_special_port(
+ {
+ 	if (host_priv == HOST_PRIV_NULL ||
+ 	    id <= HOST_MAX_SPECIAL_KERNEL_PORT || id > HOST_MAX_SPECIAL_PORT ) {
+-		if (IP_VALID(port))
+-			ipc_port_release_send(port);
++		/*
++		 * Do not release the right here: on an error return the MIG
++		 * server destroys the request, right included, and releasing
++		 * it twice frees a live port.
++		 */
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+ 
+diff --git a/xnu/osfmk/kern/ipc_host.c b/xnu/osfmk/kern/ipc_host.c
+index cc11364..7db5438 100644
+--- a/xnu/osfmk/kern/ipc_host.c
++++ b/xnu/osfmk/kern/ipc_host.c
+@@ -550,6 +550,8 @@ host_set_exception_ports(
+ 
+ 	assert(host_priv == &realhost);
+ 
++	exception_mask &= ~EXC_MASK_IGNORED;
++
+ 	if (exception_mask & ~EXC_MASK_VALID) {
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+@@ -627,6 +629,8 @@ host_get_exception_ports(
+ 	if (host_priv == HOST_PRIV_NULL)
+ 		return KERN_INVALID_ARGUMENT;
+ 
++	exception_mask &= ~EXC_MASK_IGNORED;
++
+ 	if (exception_mask & ~EXC_MASK_VALID) {
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+@@ -692,6 +696,8 @@ host_swap_exception_ports(
+ 	if (host_priv == HOST_PRIV_NULL)
+ 		return KERN_INVALID_ARGUMENT;
+ 
++	exception_mask &= ~EXC_MASK_IGNORED;
++
+ 	if (exception_mask & ~EXC_MASK_VALID) {
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+diff --git a/xnu/osfmk/kern/ipc_tt.c b/xnu/osfmk/kern/ipc_tt.c
+index 73e9606..7437bd5 100644
+--- a/xnu/osfmk/kern/ipc_tt.c
++++ b/xnu/osfmk/kern/ipc_tt.c
+@@ -863,6 +863,12 @@ task_get_special_port(
+ 	    case TASK_ACCESS_PORT:
+ 		port = ipc_port_copy_send(task->itk_task_access);
+ 		break;
++
++	    case 10:	/* iOS 10 TASK_DEBUG_CONTROL_PORT */
++	    case 11:	/* iOS 10 TASK_RESOURCE_NOTIFY_PORT */
++		/* not kept here: report "none" rather than an invalid argument */
++		port = IP_NULL;
++		break;
+ 			
+ 	    default:
+                itk_unlock(task);
+@@ -922,6 +928,13 @@ task_set_special_port(
+ 	    case TASK_ACCESS_PORT:
+ 		whichp = &task->itk_task_access;
+ 		break;
++
++	    case 10:	/* iOS 10 TASK_DEBUG_CONTROL_PORT */
++	    case 11:	/* iOS 10 TASK_RESOURCE_NOTIFY_PORT */
++		/* accepted and dropped (the right is consumed on success) */
++		if (IP_VALID(port))
++			ipc_port_release_send(port);
++		return KERN_SUCCESS;
+ 		
+ 	    default:
+ 		return KERN_INVALID_ARGUMENT;
+@@ -1485,6 +1498,8 @@ thread_set_exception_ports(
+ 	if (thread == THREAD_NULL)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
++	exception_mask &= ~EXC_MASK_IGNORED;
++
+ 	if (exception_mask & ~EXC_MASK_VALID)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
+@@ -1556,6 +1571,8 @@ task_set_exception_ports(
+ 	if (task == TASK_NULL)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
++	exception_mask &= ~EXC_MASK_IGNORED;
++
+ 	if (exception_mask & ~EXC_MASK_VALID)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
+@@ -1652,6 +1669,8 @@ thread_swap_exception_ports(
+ 	if (thread == THREAD_NULL)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
++	exception_mask &= ~EXC_MASK_IGNORED;
++
+ 	if (exception_mask & ~EXC_MASK_VALID)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
+@@ -1748,6 +1767,8 @@ task_swap_exception_ports(
+ 	if (task == TASK_NULL)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
++	exception_mask &= ~EXC_MASK_IGNORED;
++
+ 	if (exception_mask & ~EXC_MASK_VALID)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
+@@ -1857,6 +1878,8 @@ thread_get_exception_ports(
+ 	if (thread == THREAD_NULL)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
++	exception_mask &= ~EXC_MASK_IGNORED;
++
+ 	if (exception_mask & ~EXC_MASK_VALID)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
+@@ -1919,6 +1942,8 @@ task_get_exception_ports(
+ 	if (task == TASK_NULL)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
++	exception_mask &= ~EXC_MASK_IGNORED;
++
+ 	if (exception_mask & ~EXC_MASK_VALID)
+ 		return (KERN_INVALID_ARGUMENT);
+ 
+diff --git a/xnu/osfmk/kern/syscall_sw.c b/xnu/osfmk/kern/syscall_sw.c
+index e9efdc7..841d122 100644
+--- a/xnu/osfmk/kern/syscall_sw.c
++++ b/xnu/osfmk/kern/syscall_sw.c
+@@ -200,7 +200,7 @@ const mach_trap_t	mach_trap_table[MACH_TRAP_TABLE_COUNT] = {
+ /* 67 */	MACH_TRAP(kern_invalid, 0, NULL, NULL),
+ /* 68 */	MACH_TRAP(kern_invalid, 0, NULL, NULL),
+ /* 69 */	MACH_TRAP(kern_invalid, 0, NULL, NULL),
+-/* 70 */	MACH_TRAP(kern_invalid, 0, NULL, NULL),
++/* 70 */	MACH_TRAP(rpi3_host_create_mach_voucher_trap, 4, NULL, NULL),
+ /* 71 */	MACH_TRAP(kern_invalid, 0, NULL, NULL),
+ /* 72 */	MACH_TRAP(kern_invalid, 0, NULL, NULL),
+ /* 73 */	MACH_TRAP(kern_invalid, 0, NULL, NULL),
+@@ -401,6 +401,23 @@ const char * mach_syscall_name_table[MACH_TRAP_TABLE_COUNT] = {
+ 
+ int	mach_trap_count = (sizeof(mach_trap_table) / sizeof(mach_trap_table[0]));
+ 
++/*
++ * iOS 10: host_create_mach_voucher_trap.  There are no vouchers here;
++ * hand back MACH_VOUCHER_NULL ("no voucher"), which libdispatch accepts,
++ * rather than an error it treats as fatal.
++ */
++kern_return_t
++rpi3_host_create_mach_voucher_trap(struct rpi3_host_create_mach_voucher_args *args)
++{
++	mach_port_name_t none = MACH_PORT_NULL;
++
++	if (args->voucher == 0)
++		return KERN_INVALID_ARGUMENT;
++	if (copyout(&none, (user_addr_t)args->voucher, sizeof(none)))
++		return KERN_INVALID_ADDRESS;
++	return KERN_SUCCESS;
++}
++
+ kern_return_t
+ kern_invalid(
+ 	__unused struct kern_invalid_args *args)
+diff --git a/xnu/osfmk/mach/exception_types.h b/xnu/osfmk/mach/exception_types.h
+index df2c7c2..2ade7f9 100644
+--- a/xnu/osfmk/mach/exception_types.h
++++ b/xnu/osfmk/mach/exception_types.h
+@@ -151,6 +151,12 @@
+ 
+ #ifdef	KERNEL_PRIVATE
+ #define EXC_MASK_VALID	(EXC_MASK_ALL | EXC_MASK_CRASH)
++/*
++ * iOS 10 also names EXC_GUARD (12) and EXC_CORPSE_NOTIFY (13).  Neither
++ * is ever raised by this kernel, so ports for them are accepted and
++ * ignored rather than rejecting the whole request.
++ */
++#define EXC_MASK_IGNORED	((1 << 12) | (1 << 13))
+ #endif /* KERNEL_PRIVATE */
+ 
+ #define FIRST_EXCEPTION		1	/* ZERO is illegal */
+diff --git a/xnu/osfmk/mach/host_special_ports.h b/xnu/osfmk/mach/host_special_ports.h
+index 4948ee2..2b0626d 100644
+--- a/xnu/osfmk/mach/host_special_ports.h
++++ b/xnu/osfmk/mach/host_special_ports.h
+@@ -92,7 +92,9 @@
+ #define HOST_UNFREED_PORT		(10 + HOST_MAX_SPECIAL_KERNEL_PORT)
+ #define HOST_AMFID_PORT			(11 + HOST_MAX_SPECIAL_KERNEL_PORT)
+ #define HOST_GSSD_PORT			(12 + HOST_MAX_SPECIAL_KERNEL_PORT)
+-#define HOST_MAX_SPECIAL_PORT           (13 + HOST_MAX_SPECIAL_KERNEL_PORT)
++/* iOS 10 adds telemetry, ATM, coalition, sysdiagnose, XPC exception,
++ * containerd, node and resource-notify ports (up to 20 + 7): room for them */
++#define HOST_MAX_SPECIAL_PORT           (24 + HOST_MAX_SPECIAL_KERNEL_PORT)
+                                         /* room to grow here as well */
+ 
+ /*
+diff --git a/xnu/osfmk/mach/mach_traps.h b/xnu/osfmk/mach/mach_traps.h
+index 9b41b9f..9315f97 100644
+--- a/xnu/osfmk/mach/mach_traps.h
++++ b/xnu/osfmk/mach/mach_traps.h
+@@ -664,6 +664,15 @@ struct _kernelrpc_mach_port_insert_right_args {
+ extern kern_return_t _kernelrpc_mach_port_insert_right_trap(
+ 				struct _kernelrpc_mach_port_insert_right_args *args);
+ 
++struct rpi3_host_create_mach_voucher_args {
++	PAD_ARG_(uint32_t, host);
++	PAD_ARG_(uint32_t, recipes);
++	PAD_ARG_(uint32_t, recipes_size);
++	PAD_ARG_(uint32_t, voucher);
++};
++extern kern_return_t rpi3_host_create_mach_voucher_trap(
++				struct rpi3_host_create_mach_voucher_args *args);
++
+ struct _kernelrpc_mach_port_insert_member_args {
+ 	PAD_ARG_(mach_port_name_t, target);
+ 	PAD_ARG_(mach_port_name_t, name);
+-- 
+2.43.0
+
