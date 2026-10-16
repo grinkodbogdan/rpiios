@@ -1,0 +1,663 @@
+From 7099aac55c08cd93507267fd4c43602628e04a30 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 07:11:09 +0000
+Subject: [PATCH] iOS 10 (32-bit) userland bring-up: address layout, slide info
+ v2, syscalls
+
+With these, iOS 10.3.4 (iPhone 5, armv7s) launchd maps its shared cache,
+initializes libSystem and runs until libdispatch's root queue setup
+(needs kevent workqueues, not implemented). iOS 7 is unchanged (tested).
+- Root has an armv7s cache: shared region 0x1A000000..0x40000000 and the
+  main stack below it (iOS 10's 32-bit layout), detected after mountroot.
+- Shared cache slide info version 2 (iOS 9/10 caches).
+- Commpage: user/kernel page shift (0x24, 0x25, 0x37); left at 0, iOS 10
+  malloc used 1-byte pages.
+- fcntl F_ADDFILESIGS_RETURN (whole file reported signed; not enforced)
+  and F_CHECK_LV.
+- Syscalls: sysctlbyname (274; was sem_getvalue, which only returned
+  ENOSYS), getentropy (500), abort_with_payload / terminate_with_payload
+  (521/520: print the reason, then kill), table up to 530.
+- sysctl hw.targettype (N41) and kern.minimalboot.
+- Bring-up aids: rpi3_systrace=PID logs that process's failing syscalls
+  to serial; vm_allocate failures are logged.
+---
+ xnu/bsd/dev/arm/unix_syscalls.c   |  23 ++++++
+ xnu/bsd/kern/bsd_init.c           |  17 +++++
+ xnu/bsd/kern/kern_descrip.c       |  95 +++++++++++++++++++++++
+ xnu/bsd/kern/kern_mib.c           |  11 +++
+ xnu/bsd/kern/kern_newsysctl.c     |  12 +++
+ xnu/bsd/kern/kern_sysctl.c        |  47 +++++++++++-
+ xnu/bsd/kern/syscalls.master      |  88 +++++++++++++++++++++-
+ xnu/bsd/sys/sysent.h              |   2 +-
+ xnu/osfmk/arm/commpage/commpage.c |  11 +++
+ xnu/osfmk/arm/status.c            |   6 ++
+ xnu/osfmk/ipc/mach_kernelrpc.c    |   8 ++
+ xnu/osfmk/vm/vm_shared_region.c   | 121 ++++++++++++++++++++++++++++++
+ 12 files changed, 438 insertions(+), 3 deletions(-)
+
+diff --git a/xnu/bsd/dev/arm/unix_syscalls.c b/xnu/bsd/dev/arm/unix_syscalls.c
+index 72d840a..0f6a220 100644
+--- a/xnu/bsd/dev/arm/unix_syscalls.c
++++ b/xnu/bsd/dev/arm/unix_syscalls.c
+@@ -442,6 +442,29 @@ void unix_syscall(arm_saved_state_t * state)
+ #endif
+     error = (*(callp->sy_call)) (p, (void *) uthread->uu_arg, &(uthread->uu_rval[0]));
+     AUDIT_SYSCALL_EXIT(code, p, uthread, error);
++#if BOARD_CONFIG_RASPBERRYPI3
++    {
++        /*
++         * Bring-up aid: boot-arg rpi3_systrace=PID logs that process's
++         * failing BSD syscalls to the serial port (first 400).
++         */
++        static int trace_pid = -2;
++        static unsigned traced;
++        if (trace_pid == -2) {
++            int v = -1;
++            trace_pid = PE_parse_boot_argn("rpi3_systrace", &v, sizeof(v)) ? v : -1;
++        }
++        boolean_t always = (code == 360 || code == 366 || code == 367 || code == 368 ||
++                            code == 374 || code == 478);
++        if ((error || always) && error != ERESTART && error != EJUSTRETURN && p->p_pid == trace_pid && traced < 400) {
++            uint32_t *a = (uint32_t *)uthread->uu_arg;
++            traced++;
++            kprintf("rpi3 systrace: %s[%d] syscall %u error %d ret %x args %x %x %x %x %x %x\n",
++                    p->p_comm, p->p_pid, code, error, (unsigned)uthread->uu_rval[0],
++                    a[0], a[1], a[2], a[3], a[4], a[5]);
++        }
++    }
++#endif
+ #if BOARD_CONFIG_ARMPBA8
+     if (lab_syslog_io_index)
+         printf("IOS7LAB SYSLOGIO EXIT call=%u pid=%d code=%u error=%d result0=%08x result1=%08x\n",
+diff --git a/xnu/bsd/kern/bsd_init.c b/xnu/bsd/kern/bsd_init.c
+index 64ccc6b..6bbb133 100644
+--- a/xnu/bsd/kern/bsd_init.c
++++ b/xnu/bsd/kern/bsd_init.c
+@@ -918,6 +918,23 @@ bsd_init(void)
+ 	(void)vnode_ref(rootvnode);
+ 	(void)vnode_put(rootvnode);
+ 	filedesc0.fd_cdir = rootvnode;
++#if BOARD_CONFIG_RASPBERRYPI3
++	{
++		/*
++		 * iOS 10's 32-bit userland (armv7s shared cache) needs iOS 10's
++		 * address layout: shared region at 0x1A000000..0x40000000, stack
++		 * below it. iOS 7's (armv7 cache) keeps the HD2 layout.
++		 */
++		extern int rpi3_ios10_layout;
++		vnode_t cvp = NULLVP;
++		if (vnode_lookup("/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv7s",
++		    0, &cvp, &context) == 0) {
++			vnode_put(cvp);
++			rpi3_ios10_layout = 1;
++			printf("rpi3: armv7s shared cache found: iOS 10 address layout\n");
++		}
++	}
++#endif
+ 
+ #if NFSCLIENT
+ 	if (netboot) {
+diff --git a/xnu/bsd/kern/kern_descrip.c b/xnu/bsd/kern/kern_descrip.c
+index f4ec2a9..99dfd54 100644
+--- a/xnu/bsd/kern/kern_descrip.c
++++ b/xnu/bsd/kern/kern_descrip.c
+@@ -74,6 +74,7 @@
+  */
+ 
+ #include <sys/param.h>
++#include <sys/random.h>
+ #include <arm/ios7_compat.h>
+ #include <sys/systm.h>
+ #include <sys/filedesc.h>
+@@ -1496,6 +1497,35 @@ fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
+ 
+ 	}
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++	case 97:	/* F_ADDFILESIGS_RETURN (iOS 9+ dyld) */
++	{
++		/*
++		 * dyld registers a file's code signature and checks that the
++		 * returned signed length covers what it maps. Signatures are not
++		 * enforced on this port: report the whole file as covered.
++		 */
++		off_t end;
++
++		if (fp->f_type != DTYPE_VNODE) {
++			error = EBADF;
++			goto out;
++		}
++		vp = (struct vnode *)fp->f_data;
++		proc_fdunlock(p);
++		error = vnode_getwithref(vp);
++		if (error)
++			goto outdrop;
++		error = vnode_size(vp, &end, &context);
++		vnode_put(vp);
++		if (!error)
++			error = copyout(&end, argp, sizeof (end));
++		goto outdrop;
++	}
++	case 98:	/* F_CHECK_LV: library validation, not enforced here */
++		error = 0;
++		goto out;
++#endif
+ 	case F_ADDSIGS:
+ 	case F_ADDFILESIGS:
+ 	{
+@@ -5421,3 +5451,68 @@ change_fdguard_np(proc_t p, struct change_fdguard_np_args *uap, __unused int32_t
+ 		error = copyout(&flags, uap->fdflagsp, sizeof (flags));
+ 	return (error);
+ }
++
++/* iOS 10: getentropy(2), up to 256 bytes from the kernel's generator. */
++int
++getentropy(__unused proc_t p, struct getentropy_args *uap, __unused int32_t *retval)
++{
++	uint8_t buf[256];
++	int error;
++
++	if (uap->size > sizeof (buf))
++		return (EINVAL);
++	read_random(buf, (u_int)uap->size);
++	error = copyout(buf, uap->buffer, uap->size);
++	bzero(buf, sizeof (buf));
++	return (error);
++}
++
++/*
++ * iOS 10: abort_with_payload / terminate_with_payload. Print the reason
++ * (any argument that points to a readable string) and kill the process.
++ */
++static void
++rpi3_payload_reason(proc_t p, const char *what, int *a)
++{
++	int i;
++
++	printf("rpi3: %s[%d] %s args %x %x %x %x %x %x %x %x\n", p->p_comm, p->p_pid, what,
++	    a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
++	for (i = 0; i < 8; i++) {
++		char text[200];
++		size_t done = 0;
++
++		if ((uint32_t)a[i] < 0x1000)
++			continue;
++		if (copyinstr((user_addr_t)(uint32_t)a[i], text, sizeof (text), &done) == 0 &&
++		    done > 4) {
++			printf("rpi3:   arg%d: \"%s\"\n", i, text);
++			kprintf("rpi3: %s[%d] %s arg%d: \"%s\"\n", p->p_comm, p->p_pid, what, i, text);
++		}
++	}
++}
++
++int
++abort_with_payload(proc_t p, struct abort_with_payload_args *uap, __unused int32_t *retval)
++{
++	int a[8] = { uap->a0, uap->a1, uap->a2, uap->a3, uap->a4, uap->a5, uap->a6, uap->a7 };
++
++	rpi3_payload_reason(p, "abort_with_payload", a);
++	psignal(p, SIGABRT);
++	return (0);
++}
++
++int
++terminate_with_payload(proc_t p, struct terminate_with_payload_args *uap, __unused int32_t *retval)
++{
++	int a[8] = { uap->a0, uap->a1, uap->a2, uap->a3, uap->a4, uap->a5, uap->a6, uap->a7 };
++	proc_t target;
++
++	rpi3_payload_reason(p, "terminate_with_payload", a);
++	target = proc_find(uap->a0);
++	if (target == PROC_NULL)
++		return (ESRCH);
++	psignal(target, SIGKILL);
++	proc_rele(target);
++	return (0);
++}
+diff --git a/xnu/bsd/kern/kern_mib.c b/xnu/bsd/kern/kern_mib.c
+index 0e72964..aeea120 100644
+--- a/xnu/bsd/kern/kern_mib.c
++++ b/xnu/bsd/kern/kern_mib.c
+@@ -400,6 +400,17 @@ SYSCTL_PROC(_hw, HW_L3CACHESIZE,  l3cachesize_compat, CTLTYPE_INT | CTLFLAG_RD |
+ SYSCTL_COMPAT_INT (_hw, HW_TB_FREQ,      tbfrequency_compat, CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, &gPEClockFrequencyInfo.timebase_frequency_hz, 0, "");
+ SYSCTL_PROC(_hw, HW_MACHINE,      machine, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, HW_MACHINE, sysctl_hw_generic, "A", "");
+ SYSCTL_PROC(_hw, HW_MODEL,        model, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, HW_MODEL, sysctl_hw_generic, "A", "");
++#if BOARD_CONFIG_RASPBERRYPI3
++/*
++ * iOS 10's launchd aborts without hw.targettype ("sysctl hw.targettype was
++ * not set") and reads kern.minimalboot. The userland in use is the iPhone 5
++ * (N41) build; iOS 7 never asks.
++ */
++static char rpi3_targettype[] = "N41";
++SYSCTL_STRING(_hw, OID_AUTO, targettype, CTLFLAG_RD | CTLFLAG_KERN | CTLFLAG_LOCKED, rpi3_targettype, 0, "");
++static int rpi3_minimalboot = 0;
++SYSCTL_INT(_kern, OID_AUTO, minimalboot, CTLFLAG_RD | CTLFLAG_KERN | CTLFLAG_LOCKED, &rpi3_minimalboot, 0, "");
++#endif
+ SYSCTL_COMPAT_UINT(_hw, HW_PHYSMEM,      physmem, CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, &mem_size, 0, "");
+ SYSCTL_PROC(_hw, HW_USERMEM,      usermem, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, HW_USERMEM,	sysctl_hw_generic, "I", "");
+ SYSCTL_PROC(_hw, HW_EPOCH,        epoch, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MASKED | CTLFLAG_LOCKED, 0, HW_EPOCH, sysctl_hw_generic, "I", "");
+diff --git a/xnu/bsd/kern/kern_newsysctl.c b/xnu/bsd/kern/kern_newsysctl.c
+index a93bcb9..050c5d4 100644
+--- a/xnu/bsd/kern/kern_newsysctl.c
++++ b/xnu/bsd/kern/kern_newsysctl.c
+@@ -1686,3 +1686,15 @@ sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t n
+ 	return(error);
+ }
+ 
++
++/* For the sysctlbyname system call (iOS 10): name to OID under the geometry lock. */
++int
++rpi3_sysctl_name2oid(char *name, int *oid, int *len)
++{
++	int error;
++
++	lck_rw_lock_shared(sysctl_geometry_lock);
++	error = name2oid(name, oid, len);
++	lck_rw_done(sysctl_geometry_lock);
++	return (error);
++}
+diff --git a/xnu/bsd/kern/kern_sysctl.c b/xnu/bsd/kern/kern_sysctl.c
+index 1d0fcb3..e8b7f9d 100644
+--- a/xnu/bsd/kern/kern_sysctl.c
++++ b/xnu/bsd/kern/kern_sysctl.c
+@@ -372,9 +372,50 @@ sysctl_mem_lock(__unused user_addr_t old_addr, __unused user_size_t old_len, __u
+  * Locking and stats
+  */
+ 
++static int __sysctl_body(proc_t p, struct __sysctl_args *uap, int *kname);
++
+ /* sysctl() syscall */
+ int
+ __sysctl(proc_t p, struct __sysctl_args *uap, __unused int32_t *retval)
++{
++	return (__sysctl_body(p, uap, NULL));
++}
++
++/*
++ * sysctlbyname() system call (274 on iOS 10; this kernel's 274 was
++ * sem_getvalue, which only ever returned ENOSYS).
++ */
++int
++sysctlbyname_np(proc_t p, struct sysctlbyname_np_args *uap, __unused int32_t *retval)
++{
++	extern int rpi3_sysctl_name2oid(char *name, int *oid, int *len);
++	struct __sysctl_args a;
++	int oid[CTL_MAXNAME], oidlen = 0, error;
++	char *name;
++
++	if (uap->namelen == 0 || uap->namelen > MAXPATHLEN)
++		return (EINVAL);
++	MALLOC(name, char *, uap->namelen + 1, M_TEMP, M_WAITOK);
++	if (name == NULL)
++		return (ENOMEM);
++	error = copyin(uap->name, name, uap->namelen);
++	name[uap->namelen] = '\0';
++	if (!error)
++		error = rpi3_sysctl_name2oid(name, oid, &oidlen);
++	FREE(name, M_TEMP);
++	if (error)
++		return (error);
++	bzero(&a, sizeof (a));
++	a.namelen = oidlen;
++	a.old = uap->old;
++	a.oldlenp = uap->oldlenp;
++	a.new = uap->new;
++	a.newlen = uap->newlen;
++	return (__sysctl_body(p, &a, oid));
++}
++
++static int
++__sysctl_body(proc_t p, struct __sysctl_args *uap, int *kname)
+ {
+ 	boolean_t funnel_state = FALSE;		/* not held if unknown */
+ 	int error;
+@@ -392,7 +433,11 @@ __sysctl(proc_t p, struct __sysctl_args *uap, __unused int32_t *retval)
+ 	 */
+ 	if (uap->namelen > CTL_MAXNAME || uap->namelen < 2)
+ 		return (EINVAL);
+-	error = copyin(uap->name, &name[0], uap->namelen * sizeof(int));
++	if (kname) {
++		bcopy(kname, &name[0], uap->namelen * sizeof(int));
++		error = 0;
++	} else
++		error = copyin(uap->name, &name[0], uap->namelen * sizeof(int));
+ 	if (error)
+ 		return (error);
+ 		
+diff --git a/xnu/bsd/kern/syscalls.master b/xnu/bsd/kern/syscalls.master
+index 7c459a1..d51e863 100644
+--- a/xnu/bsd/kern/syscalls.master
++++ b/xnu/bsd/kern/syscalls.master
+@@ -425,7 +425,7 @@
+ 271	AUE_SEMWAIT	ALL	{ int sem_wait(sem_t *sem); } 
+ 272	AUE_SEMTRYWAIT	ALL	{ int sem_trywait(sem_t *sem); } 
+ 273	AUE_SEMPOST	ALL	{ int sem_post(sem_t *sem); } 
+-274	AUE_SEMGETVALUE	ALL	{ int sem_getvalue(sem_t *sem, int *sval); } 
++274	AUE_SYSCTL	ALL	{ int sysctlbyname_np(user_addr_t name, size_t namelen, user_addr_t old, user_addr_t oldlenp, user_addr_t new, size_t newlen); } 
+ 275	AUE_SEMINIT	ALL	{ int sem_init(sem_t *sem, int phsared, u_int value); } 
+ 276	AUE_SEMDESTROY	ALL	{ int sem_destroy(sem_t *sem); } 
+ 277	AUE_OPEN_EXTENDED_RWTC	ALL	{ int open_extended(user_addr_t path, int flags, uid_t uid, gid_t gid, int mode, user_addr_t xsecurity) NO_SYSCALL_STUB; } 
+@@ -675,3 +675,89 @@
+ 442	AUE_CLOSE	ALL	{ int guarded_close_np(int fd, user_addr_t guard); }
+ 443	AUE_KQUEUE	ALL	{ int guarded_kqueue_np(user_addr_t guard, u_int guardflags); }
+ 444	AUE_NULL	ALL	{ int change_fdguard_np(int fd, user_addr_t guard, u_int guardflags, user_addr_t nguard, u_int nguardflags, user_addr_t fdflagsp); }
++445	AUE_NULL	ALL	{ int nosys(void); }
++446	AUE_NULL	ALL	{ int nosys(void); }
++447	AUE_NULL	ALL	{ int nosys(void); }
++448	AUE_NULL	ALL	{ int nosys(void); }
++449	AUE_NULL	ALL	{ int nosys(void); }
++450	AUE_NULL	ALL	{ int nosys(void); }
++451	AUE_NULL	ALL	{ int nosys(void); }
++452	AUE_NULL	ALL	{ int nosys(void); }
++453	AUE_NULL	ALL	{ int nosys(void); }
++454	AUE_NULL	ALL	{ int nosys(void); }
++455	AUE_NULL	ALL	{ int nosys(void); }
++456	AUE_NULL	ALL	{ int nosys(void); }
++457	AUE_NULL	ALL	{ int nosys(void); }
++458	AUE_NULL	ALL	{ int nosys(void); }
++459	AUE_NULL	ALL	{ int nosys(void); }
++460	AUE_NULL	ALL	{ int nosys(void); }
++461	AUE_NULL	ALL	{ int nosys(void); }
++462	AUE_NULL	ALL	{ int nosys(void); }
++463	AUE_NULL	ALL	{ int nosys(void); }
++464	AUE_NULL	ALL	{ int nosys(void); }
++465	AUE_NULL	ALL	{ int nosys(void); }
++466	AUE_NULL	ALL	{ int nosys(void); }
++467	AUE_NULL	ALL	{ int nosys(void); }
++468	AUE_NULL	ALL	{ int nosys(void); }
++469	AUE_NULL	ALL	{ int nosys(void); }
++470	AUE_NULL	ALL	{ int nosys(void); }
++471	AUE_NULL	ALL	{ int nosys(void); }
++472	AUE_NULL	ALL	{ int nosys(void); }
++473	AUE_NULL	ALL	{ int nosys(void); }
++474	AUE_NULL	ALL	{ int nosys(void); }
++475	AUE_NULL	ALL	{ int nosys(void); }
++476	AUE_NULL	ALL	{ int nosys(void); }
++477	AUE_NULL	ALL	{ int nosys(void); }
++478	AUE_NULL	ALL	{ int nosys(void); }
++479	AUE_NULL	ALL	{ int nosys(void); }
++480	AUE_NULL	ALL	{ int nosys(void); }
++481	AUE_NULL	ALL	{ int nosys(void); }
++482	AUE_NULL	ALL	{ int nosys(void); }
++483	AUE_NULL	ALL	{ int nosys(void); }
++484	AUE_NULL	ALL	{ int nosys(void); }
++485	AUE_NULL	ALL	{ int nosys(void); }
++486	AUE_NULL	ALL	{ int nosys(void); }
++487	AUE_NULL	ALL	{ int nosys(void); }
++488	AUE_NULL	ALL	{ int nosys(void); }
++489	AUE_NULL	ALL	{ int nosys(void); }
++490	AUE_NULL	ALL	{ int nosys(void); }
++491	AUE_NULL	ALL	{ int nosys(void); }
++492	AUE_NULL	ALL	{ int nosys(void); }
++493	AUE_NULL	ALL	{ int nosys(void); }
++494	AUE_NULL	ALL	{ int nosys(void); }
++495	AUE_NULL	ALL	{ int nosys(void); }
++496	AUE_NULL	ALL	{ int nosys(void); }
++497	AUE_NULL	ALL	{ int nosys(void); }
++498	AUE_NULL	ALL	{ int nosys(void); }
++499	AUE_NULL	ALL	{ int nosys(void); }
++500	AUE_NULL	ALL	{ int getentropy(user_addr_t buffer, size_t size); }
++501	AUE_NULL	ALL	{ int nosys(void); }
++502	AUE_NULL	ALL	{ int nosys(void); }
++503	AUE_NULL	ALL	{ int nosys(void); }
++504	AUE_NULL	ALL	{ int nosys(void); }
++505	AUE_NULL	ALL	{ int nosys(void); }
++506	AUE_NULL	ALL	{ int nosys(void); }
++507	AUE_NULL	ALL	{ int nosys(void); }
++508	AUE_NULL	ALL	{ int nosys(void); }
++509	AUE_NULL	ALL	{ int nosys(void); }
++510	AUE_NULL	ALL	{ int nosys(void); }
++511	AUE_NULL	ALL	{ int nosys(void); }
++512	AUE_NULL	ALL	{ int nosys(void); }
++513	AUE_NULL	ALL	{ int nosys(void); }
++514	AUE_NULL	ALL	{ int nosys(void); }
++515	AUE_NULL	ALL	{ int nosys(void); }
++516	AUE_NULL	ALL	{ int nosys(void); }
++517	AUE_NULL	ALL	{ int nosys(void); }
++518	AUE_NULL	ALL	{ int nosys(void); }
++519	AUE_NULL	ALL	{ int nosys(void); }
++520	AUE_NULL	ALL	{ int terminate_with_payload(int a0, int a1, int a2, int a3, int a4, int a5, int a6, int a7); }
++521	AUE_NULL	ALL	{ int abort_with_payload(int a0, int a1, int a2, int a3, int a4, int a5, int a6, int a7); }
++522	AUE_NULL	ALL	{ int nosys(void); }
++523	AUE_NULL	ALL	{ int nosys(void); }
++524	AUE_NULL	ALL	{ int nosys(void); }
++525	AUE_NULL	ALL	{ int nosys(void); }
++526	AUE_NULL	ALL	{ int nosys(void); }
++527	AUE_NULL	ALL	{ int nosys(void); }
++528	AUE_NULL	ALL	{ int nosys(void); }
++529	AUE_NULL	ALL	{ int nosys(void); }
++530	AUE_NULL	ALL	{ int nosys(void); }
+diff --git a/xnu/bsd/sys/sysent.h b/xnu/bsd/sys/sysent.h
+index 1d2dcc0..2ed7c7e 100644
+--- a/xnu/bsd/sys/sysent.h
++++ b/xnu/bsd/sys/sysent.h
+@@ -57,7 +57,7 @@ extern struct sysent sysent[];
+ #endif	/* __INIT_SYSENT_C__ */
+ 
+ extern int nsysent;
+-#define NUM_SYSENT	445	/* Current number of defined syscalls */
++#define NUM_SYSENT	531	/* Current number of defined syscalls */
+ 
+ /* sy_funnel flags bits */
+ #define FUNNEL_MASK	0x07f
+diff --git a/xnu/osfmk/arm/commpage/commpage.c b/xnu/osfmk/arm/commpage/commpage.c
+index e9c81c8..dcecac3 100644
+--- a/xnu/osfmk/arm/commpage/commpage.c
++++ b/xnu/osfmk/arm/commpage/commpage.c
+@@ -112,6 +112,17 @@ void commpage_populate(void)
+            *(uint8_t*)(_COMM_PAGE_BASE_ADDRESS + 0x36));
+ #endif
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++    /*
++     * iOS 8+ libsystem_kernel takes vm_page_shift (user, 32- and 64-bit) and
++     * vm_kernel_page_shift from here (0x24, 0x25, 0x37). Left at 0, iOS 10's
++     * malloc believed pages were 1 byte and its guard pages failed.
++     */
++    *(uint8_t*)(_COMM_PAGE_BASE_ADDRESS + 0x24) = PAGE_SHIFT;
++    *(uint8_t*)(_COMM_PAGE_BASE_ADDRESS + 0x25) = PAGE_SHIFT;
++    *(uint8_t*)(_COMM_PAGE_BASE_ADDRESS + 0x37) = PAGE_SHIFT;
++#endif
++
+     if(*(uint32_t*)_COMM_PAGE_NCPUS == 0) {
+     	panic("commpage number_of_cpus == 0");
+     }
+diff --git a/xnu/osfmk/arm/status.c b/xnu/osfmk/arm/status.c
+index da76501..dade4f5 100644
+--- a/xnu/osfmk/arm/status.c
++++ b/xnu/osfmk/arm/status.c
+@@ -62,6 +62,12 @@
+ #if IOS7_COMPAT_PLATFORM
+ static mach_vm_offset_t ios7lab_user_stack(void)
+ {
++#if BOARD_CONFIG_RASPBERRYPI3
++    extern int rpi3_ios10_layout;
++    /* iOS 10 layout: the shared region starts at 0x1A000000. */
++    if (rpi3_ios10_layout)
++        return 0x1A000000U;
++#endif
+     /* Runtime ABI selector is shared. */
+     if (ios7_compat_vmabi_enabled())
+         return 0x2BE00000U;
+diff --git a/xnu/osfmk/ipc/mach_kernelrpc.c b/xnu/osfmk/ipc/mach_kernelrpc.c
+index cd0605f..ef57838 100644
+--- a/xnu/osfmk/ipc/mach_kernelrpc.c
++++ b/xnu/osfmk/ipc/mach_kernelrpc.c
+@@ -390,6 +390,14 @@ done:
+     if (logged++ < 8)
+         printf("Leo vm_allocate64 size=%08x:%08x flags=%x result=%d address=%08x\n",
+                wire->size_high, wire->size_low, wire->flags, rv, address32);
++#if BOARD_CONFIG_RASPBERRYPI3
++    {
++        static unsigned failures;
++        if (rv != KERN_SUCCESS && failures++ < 16)
++            kprintf("rpi3: vm_allocate failed %d size=%08x:%08x flags=%x\n",
++                    rv, wire->size_high, wire->size_low, wire->flags);
++    }
++#endif
+     if (task)
+         task_deallocate(task);
+     return rv;
+diff --git a/xnu/osfmk/vm/vm_shared_region.c b/xnu/osfmk/vm/vm_shared_region.c
+index 09fc707..89ee93e 100644
+--- a/xnu/osfmk/vm/vm_shared_region.c
++++ b/xnu/osfmk/vm/vm_shared_region.c
+@@ -114,6 +114,10 @@
+ #include <machine/commpage.h>
+ #include <machine/cpu_capabilities.h>
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++int rpi3_ios10_layout;	/* set by bsd_init when the root has an armv7s cache */
++#endif
++
+ /* "dyld" uses this to figure out what the kernel supports */
+ int shared_region_version = 3;
+ 
+@@ -626,6 +630,13 @@ vm_shared_region_create(
+ #if IOS7_COMPAT_PLATFORM
+             {
+                 /* Runtime ABI selector is shared. */
++#if BOARD_CONFIG_RASPBERRYPI3
++                if (rpi3_ios10_layout) {
++                    base_address = 0x1A000000U;
++                    size = 0x26000000U;
++                    printf("rpi3: shared region 0x1a000000..0x40000000 (iOS 10)\n");
++                } else
++#endif
+                 if (ios7_compat_vmabi_enabled()) {
+                     /* Original iOS7 cache starts at 0x2c000000. Keep the
+                      * existing aligned nesting range at 0x30000000;
+@@ -1544,6 +1555,97 @@ vm_shared_region_get_slide_info_entry(void) {
+ }
+ 
+ 
++/*
++ * dyld shared cache slide info version 2 (iOS 9/10 caches): per page a
++ * 16-bit start (offset/4 of the first pointer to slide, or an index into
++ * page_extras for several chains, or "no rebase"); each pointer holds the
++ * delta to the next one in its delta_mask bits.
++ */
++struct vm_shared_region_slide_info_entry_v2 {
++	uint32_t	version;
++	uint32_t	page_size;
++	uint32_t	page_starts_offset;
++	uint32_t	page_starts_count;
++	uint32_t	page_extras_offset;
++	uint32_t	page_extras_count;
++	uint64_t	delta_mask;
++	uint64_t	value_add;
++};
++#define SR_V2_PAGE_ATTR_EXTRA		0x8000
++#define SR_V2_PAGE_ATTR_NO_REBASE	0x4000
++#define SR_V2_PAGE_ATTR_END		0x8000
++#define SR_V2_PAGE_VALUE		0x3FFF
++#define SR_V2_PAGE_OFFSET_SHIFT		2
++
++static kern_return_t
++vm_shared_region_v2_sanity(struct vm_shared_region_slide_info_entry_v2 *s, mach_vm_size_t size)
++{
++	if (s->page_size != PAGE_SIZE ||
++	    s->page_starts_offset > size ||
++	    s->page_starts_count > (size - s->page_starts_offset) / sizeof (uint16_t) ||
++	    s->page_extras_offset > size ||
++	    s->page_extras_count > (size - s->page_extras_offset) / sizeof (uint16_t) ||
++	    (uint32_t)s->delta_mask == 0)
++		return KERN_FAILURE;
++	return KERN_SUCCESS;
++}
++
++static kern_return_t
++vm_shared_region_v2_chain(uint8_t *page, uint32_t offset, uint32_t slide,
++    struct vm_shared_region_slide_info_entry_v2 *s)
++{
++	const uint32_t last = PAGE_SIZE - sizeof (uint32_t);
++	const uint32_t delta_mask = (uint32_t)s->delta_mask;
++	const uint32_t value_mask = ~delta_mask;
++	const uint32_t value_add = (uint32_t)s->value_add;
++	const uint32_t delta_shift = __builtin_ctzll(s->delta_mask) - 2;
++	uint32_t delta = 1;
++
++	while (delta != 0 && offset <= last) {
++		uint32_t value;
++
++		memcpy(&value, page + offset, sizeof (value));
++		delta = (value & delta_mask) >> delta_shift;
++		value &= value_mask;
++		if (value != 0)
++			value += value_add + slide;
++		memcpy(page + offset, &value, sizeof (value));
++		offset += delta;
++	}
++	return (offset > last && delta != 0) ? KERN_FAILURE : KERN_SUCCESS;
++}
++
++static kern_return_t
++vm_shared_region_slide_v2(vm_offset_t vaddr, uint32_t pageIndex)
++{
++	struct vm_shared_region_slide_info_entry_v2 *s =
++	    (struct vm_shared_region_slide_info_entry_v2 *)vm_shared_region_get_slide_info_entry();
++	const uint16_t *starts = (const uint16_t *)((uintptr_t)s + s->page_starts_offset);
++	const uint16_t *extras = (const uint16_t *)((uintptr_t)s + s->page_extras_offset);
++	uint16_t entry;
++
++	if (pageIndex >= s->page_starts_count)
++		return KERN_FAILURE;
++	entry = starts[pageIndex];
++	if (entry == SR_V2_PAGE_ATTR_NO_REBASE)
++		return KERN_SUCCESS;
++	if (entry & SR_V2_PAGE_ATTR_EXTRA) {
++		uint16_t index = entry & SR_V2_PAGE_VALUE, info;
++		do {
++			if (index >= s->page_extras_count)
++				return KERN_FAILURE;
++			info = extras[index++];
++			if (vm_shared_region_v2_chain((uint8_t *)vaddr,
++			    (uint32_t)(info & SR_V2_PAGE_VALUE) << SR_V2_PAGE_OFFSET_SHIFT,
++			    slide_info.slide, s) != KERN_SUCCESS)
++				return KERN_FAILURE;
++		} while (!(info & SR_V2_PAGE_ATTR_END));
++		return KERN_SUCCESS;
++	}
++	return vm_shared_region_v2_chain((uint8_t *)vaddr,
++	    (uint32_t)entry << SR_V2_PAGE_OFFSET_SHIFT, slide_info.slide, s);
++}
++
+ kern_return_t
+ vm_shared_region_slide_sanity_check(void)
+ {
+@@ -1564,6 +1666,18 @@ vm_shared_region_slide_sanity_check(void)
+ 		panic("vm_shared_region_slide_sanity_check: vm_protect() error 0x%x\n", kr);
+ 	}
+ 
++	if (s_info->version == 2) {
++		if (vm_shared_region_v2_sanity((struct vm_shared_region_slide_info_entry_v2 *)s_info,
++		    slide_info.slide_info_size) == KERN_SUCCESS)
++			return KERN_SUCCESS;
++		printf("vm_shared_region_slide_sanity_check: bad v2 slide info\n");
++		goto fail;
++	}
++	if (s_info->version != 1) {
++		printf("vm_shared_region_slide_sanity_check: slide info version %u\n", s_info->version);
++		goto fail;
++	}
++
+ 	for (;pageIndex < s_info->toc_count; pageIndex++) {
+ 
+ 		entryIndex =  (uint16_t)(toc[pageIndex]);
+@@ -1603,6 +1717,13 @@ vm_shared_region_slide(vm_offset_t vaddr, uint32_t pageIndex)
+ 	int is_64 = task_has_64BitAddr(current_task());
+ 
+ 	vm_shared_region_slide_info_entry_t s_info = vm_shared_region_get_slide_info_entry();
++
++	if (s_info->version == 2) {
++		kern_return_t kr2 = vm_shared_region_slide_v2(vaddr, pageIndex);
++		if (kr2 != KERN_SUCCESS)
++			printf("vm_shared_region_slide: v2 page %u failed\n", pageIndex);
++		return kr2;
++	}
+ 	toc = (uint16_t*)((uintptr_t)s_info + s_info->toc_offset);
+ 	
+ 	if (pageIndex >= s_info->toc_count) {
+-- 
+2.43.0
+
