@@ -1,0 +1,107 @@
+From a24354786df7817fc2f1e65de65641366a652062 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 14:37:42 +0000
+Subject: [PATCH] rpi3: syscall trace options (rpi3_systrace_all, paths);
+ message trace filters
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                 |  2 +-
+ xnu/bsd/dev/arm/unix_syscalls.c | 16 +++++++++++++++-
+ xnu/osfmk/ipc/mach_msg.c        | 13 ++++++++-----
+ 3 files changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 58c8c10..4e5312d 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-c427ba6634d00576
++fe59c2c09a2be75d
+diff --git a/xnu/bsd/dev/arm/unix_syscalls.c b/xnu/bsd/dev/arm/unix_syscalls.c
+index 7510ecc..d4ad439 100644
+--- a/xnu/bsd/dev/arm/unix_syscalls.c
++++ b/xnu/bsd/dev/arm/unix_syscalls.c
+@@ -454,13 +454,27 @@ void unix_syscall(arm_saved_state_t * state)
+             int v = -1;
+             trace_pid = PE_parse_boot_argn("rpi3_systrace", &v, sizeof(v)) ? v : -1;
+         }
+-        boolean_t always = FALSE;
++        static int trace_all = -1;
++        if (trace_all < 0) {
++            int v = 0;
++            trace_all = PE_parse_boot_argn("rpi3_systrace_all", &v, sizeof(v)) ? v : 0;
++        }
++        boolean_t always = trace_all != 0;
+         if ((error || always) && error != ERESTART && error != EJUSTRETURN && p->p_pid == trace_pid && traced < 6000) {
+             uint32_t *a = (uint32_t *)uthread->uu_arg;
+             traced++;
+             kprintf("rpi3 systrace: %s[%d] syscall %u error %d ret %x args %x %x %x %x %x %x\n",
+                     p->p_comm, p->p_pid, code, error, (unsigned)uthread->uu_rval[0],
+                     a[0], a[1], a[2], a[3], a[4], a[5]);
++            if (code == 5 || code == 338 || code == 340 || code == 220 ||
++                code == 463 || code == 469 || code == 470 || code == 475) {
++                char path[96];
++                size_t len = 0;
++                user_addr_t pa = (code >= 463) ? a[1] : a[0];
++
++                if (copyinstr(pa, path, sizeof(path), &len) == 0)
++                    kprintf("rpi3 systrace path: %s\n", path);
++            }
+         }
+     }
+ #endif
+diff --git a/xnu/osfmk/ipc/mach_msg.c b/xnu/osfmk/ipc/mach_msg.c
+index be69e00..e06b0b8 100644
+--- a/xnu/osfmk/ipc/mach_msg.c
++++ b/xnu/osfmk/ipc/mach_msg.c
+@@ -622,7 +622,7 @@ rpi3_msg_dump(ipc_kmsg_t kmsg)
+ 	unsigned i, n = 0, size = kmsg->ikm_header->msgh_size;
+ 	const unsigned char *b = (const unsigned char *)kmsg->ikm_header;
+ 
+-	if (!name[0] || !sp || logs > 4000 || !IP_VALID(dest))
++	if (!name[0] || !sp || logs > 30000 || !IP_VALID(dest))
+ 		return;
+ 	ip_lock(dest);
+ 	if (ip_active(dest) && dest->ip_receiver_name && dest->ip_receiver)
+@@ -630,7 +630,7 @@ rpi3_msg_dump(ipc_kmsg_t kmsg)
+ 	ip_unlock(dest);
+ 	if (rt == TASK_NULL || (rp = rt->bsd_info) == NULL) {
+ 		if (!strncmp(proc_name_address(sp), name, strlen(name)) &&
+-		    kmsg->ikm_header->msgh_id == 0x10000000 && logs++ < 4000) {
++		    kmsg->ikm_header->msgh_id == 0x10000000 && logs++ < 30000) {
+ 			kprintf("rpi3 send: %s -> kernel id=%d size=%u\n", proc_name_address(sp),
+ 			    kmsg->ikm_header->msgh_id, size);
+ 			if (kmsg->ikm_header->msgh_id == 0x10000000 && size <= 1024) {
+@@ -655,13 +655,16 @@ rpi3_msg_dump(ipc_kmsg_t kmsg)
+ 		}
+ 		return;
+ 	}
++	if (!strcmp(proc_name_address(rp), "notifyd") || !strcmp(proc_name_address(rp), "logd") ||
++	    !strcmp(proc_name_address(sp), "notifyd"))
++		return;
+ 	if (proc_pid(sp) != 1 && !strncmp(proc_name_address(rp), name, strlen(name)) &&
+ 	    strncmp(proc_name_address(sp), name, strlen(name))) {
+-		if (logs++ < 4000)
++		if (logs++ < 30000)
+ 			kprintf("rpi3 recv: %s[%d] -> %s id=%d size=%u bits=%x\n", proc_name_address(sp),
+ 			    proc_pid(sp), proc_name_address(rp), kmsg->ikm_header->msgh_id, size,
+ 			    kmsg->ikm_header->msgh_bits);
+-		if (size <= 512 && logs < 4000) {
++		if (size <= 512 && logs < 30000) {
+ 			for (i = sizeof(mach_msg_header_t), n = 0; i < size && n < sizeof(line) - 1; i++) {
+ 				unsigned char c = b[i];
+ 
+@@ -683,7 +686,7 @@ rpi3_msg_dump(ipc_kmsg_t kmsg)
+ 		return;
+ 	}
+ 	if (proc_pid(rp) != 1 && !strncmp(proc_name_address(sp), name, strlen(name))) {
+-		if (logs++ < 4000)
++		if (logs++ < 30000)
+ 			kprintf("rpi3 send: %s -> %s[%d] id=%d size=%u bits=%x\n", proc_name_address(sp),
+ 			    proc_name_address(rp), proc_pid(rp), kmsg->ikm_header->msgh_id, size,
+ 			    kmsg->ikm_header->msgh_bits);
+-- 
+2.43.0
+
