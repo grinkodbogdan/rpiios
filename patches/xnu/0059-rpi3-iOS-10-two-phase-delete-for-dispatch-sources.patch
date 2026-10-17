@@ -1,0 +1,95 @@
+From 5755fe44abd32f2a3aecfc5897f8a83e98d2f613 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 17:15:40 +0000
+Subject: [PATCH] rpi3: iOS 10 two-phase delete for dispatch sources
+
+An enabled EV_DISPATCH|EV_UDATA_SPECIFIC knote deleted with
+EV_DELETE|EV_ENABLE now answers EINPROGRESS and is delivered once more
+flagged EV_DELETE|EV_ONESHOT, then dropped. libdispatch waits for that
+last event before freeing the source; deleting at once let an event
+already on its way reach a freed source (backboardd crashed in
+libdispatch and SpringBoard lost its connection).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/bsd/kern/kern_event.c | 43 +++++++++++++++++++++++++++++++++++++++
+ xnu/bsd/sys/event.h       |  1 +
+ 2 files changed, 44 insertions(+)
+
+diff --git a/xnu/bsd/kern/kern_event.c b/xnu/bsd/kern/kern_event.c
+index bd20ddb..de7247a 100644
+--- a/xnu/bsd/kern/kern_event.c
++++ b/xnu/bsd/kern/kern_event.c
+@@ -1957,6 +1957,27 @@ kevent_register(struct kqueue *kq, struct kevent64_s *kev, __unused struct proc
+ 		proc_fdunlock(p);
+ 		
+ 		if (kev->flags & EV_DELETE) {
++#if BOARD_CONFIG_RASPBERRYPI3
++			/*
++			 * iOS 10 two-phase delete: an enabled EV_DISPATCH +
++			 * EV_UDATA_SPECIFIC source may already have an event on
++			 * its way to a thread, so libdispatch keeps it alive until
++			 * the kernel answers EINPROGRESS and later delivers one
++			 * last event flagged EV_DELETE. Deleting at once let it
++			 * free the source under an in-flight event (backboardd
++			 * crashed in its event manager).
++			 */
++			if ((kev->flags & EV_ENABLE) &&
++			    (kn->kn_flags & (EV_DISPATCH | EV_UDATA_SPECIFIC)) == (EV_DISPATCH | EV_UDATA_SPECIFIC) &&
++			    (kn->kn_status & KN_DISABLED) == 0) {
++				kn->kn_status |= KN_DEFERDELETE;
++				knote_activate(kn, 0);
++				kqueue_wakeup(kq, 0);
++				kqunlock(kq);
++				error = EINPROGRESS;
++				goto done;
++			}
++#endif
+ 			knote_dequeue(kn);
+ 			kn->kn_status |= KN_DISABLED;
+ 			if (kqlock2knotedrop(kq, kn)) {
+@@ -2069,6 +2090,28 @@ knote_process(struct knote 	*kn,
+ 	int result;
+ 	int error;
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++	if (kn->kn_status & KN_DEFERDELETE) {
++		/* the last delivery of a deferred delete, then drop it */
++		kev = kn->kn_kevent;
++		kev.flags |= EV_DELETE | EV_ONESHOT;
++		kev.fflags = 0;
++		kev.data = 0;
++		kev.ext[0] = kev.ext[1] = 0;
++		assert(kn->kn_tq == &kq->kq_head);
++		TAILQ_REMOVE(&kq->kq_head, kn, kn_tqe);
++		kn->kn_tq = inprocessp;
++		TAILQ_INSERT_TAIL(inprocessp, kn, kn_tqe);
++		knote_deactivate(kn);
++		if (kqlock2knotedrop(kq, kn)) {
++			kn->kn_fop->f_detach(kn);
++			knote_drop(kn, p);
++		}
++		error = (callback)(kq, &kev, data);
++		kqlock(kq);
++		return error;
++	}
++#endif
+ #if BOARD_CONFIG_RASPBERRYPI3
+ 	/*
+ 	 * iOS 10 watches hundreds of individual Mach ports (launchd: ~550)
+diff --git a/xnu/bsd/sys/event.h b/xnu/bsd/sys/event.h
+index f0330d1..84fd3f7 100644
+--- a/xnu/bsd/sys/event.h
++++ b/xnu/bsd/sys/event.h
+@@ -380,6 +380,7 @@ struct knote {
+ #define KN_USEWAIT	0x10			/* wait for knote use */
+ #define KN_ATTACHING	0x20			/* event is pending attach */
+ #define KN_STAYQUEUED	0x40			/* force event to stay on queue */
++#define KN_DEFERDELETE	0x80			/* iOS 10: delete after one last delivery */
+ 
+ #define kn_id		kn_kevent.ident
+ #define kn_filter	kn_kevent.filter
+-- 
+2.43.0
+
