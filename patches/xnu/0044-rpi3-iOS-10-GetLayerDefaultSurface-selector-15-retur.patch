@@ -1,0 +1,84 @@
+From 318ec32d36cf39e59f41f300119c0ec511d8dfe9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 05:58:29 +0000
+Subject: [PATCH] rpi3: iOS 10 GetLayerDefaultSurface (selector 15) returns the
+ screen surface
+
+Also log iOS 10 framebuffer call arguments, and backtrace launchd in
+the watchdog.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                               |  2 +-
+ .../ARM/AppleARMPlatform/IOS7LeoDisplay.cpp   | 26 +++++++++++++++++++
+ xnu/osfmk/arm/trap.c                          |  2 ++
+ 3 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index ac97715..fb07b53 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-da0180f57d8e7105
++7b9b07c724d4dcae
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+index 95ce89e..7fcb185 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+@@ -1588,6 +1588,32 @@ IOReturn IOS7LabFramebufferClient::performExternalMethod(uint32_t selector,
+             result==kIOReturnSuccess?LEO_GRAPHICS_REASON_NONE:LEO_GRAPHICS_REASON_TIMER;
+         return result;
+     }
++#if BOARD_CONFIG_RASPBERRYPI3
++    {
++        extern int rpi3_ios10_layout;
++        static unsigned argLogs;
++
++        if (rpi3_ios10_layout && argLogs++ < 200) {
++            kprintf("rpi3: framebuffer args sel=%u in:", selector);
++            for (uint32_t i = 0; i < args->scalarInputCount && i < 6; i++)
++                kprintf(" %llx", (unsigned long long)args->scalarInput[i]);
++            if (args->structureInput && args->structureInputSize) {
++                const uint32_t *w = (const uint32_t *)args->structureInput;
++                kprintf(" struct:");
++                for (uint32_t i = 0; i < args->structureInputSize / 4 && i < 24; i++)
++                    kprintf(" %x", w[i]);
++            }
++            kprintf("\n");
++        }
++        /* iOS 10 GetLayerDefaultSurface(layer, options): the shared screen surface */
++        if (rpi3_ios10_layout && selector == 15 && args->scalarInputCount == 2 &&
++            args->scalarOutput && args->scalarOutputCount == 1 && !args->structureInputSize) {
++            if (!ios7lab_primary_ready()) return kIOReturnNoMemory;
++            args->scalarOutput[0] = primarySurfaceID;
++            return kIOReturnSuccess;
++        }
++    }
++#endif
+     if (args->scalarInputCount || args->structureInputSize || args->structureOutputSize)
+         return kIOReturnUnsupported;
+     if (selector == 4 && args->scalarOutput && args->scalarOutputCount == 1) {
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index baeef5e..f0277e4 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -406,6 +406,7 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                 if ((round % 6) == 5 &&
+                     (!strncmp(proc_name_address(task->bsd_info), "backboardd", 10) ||
+                      !strcmp(proc_name_address(task->bsd_info), "logd") ||
++                     proc_pid(task->bsd_info) == 1 ||
+                      (rpi3_dtlog_name()[0] && !strcmp(proc_name_address(task->bsd_info), rpi3_dtlog_name())) ||
+                      !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11)))
+                     kprintf("rpi3 wd: %s[%d].%u st=%x ev=%08x k=%08x pc=%08x lr=%08x sp=%08x r12=%x r0=%x\n",
+@@ -415,6 +416,7 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                 if ((round % 6) == 5 &&
+                     (!strncmp(proc_name_address(task->bsd_info), "backboardd", 10) ||
+                      !strcmp(proc_name_address(task->bsd_info), "logd") ||
++                     proc_pid(task->bsd_info) == 1 ||
+                      (rpi3_dtlog_name()[0] && !strcmp(proc_name_address(task->bsd_info), rpi3_dtlog_name())) ||
+                      !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11))) {
+                     uint32_t fp = s->r[7], frame[2];
+-- 
+2.43.0
+
