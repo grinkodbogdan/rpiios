@@ -43,8 +43,7 @@ class Gdb:
     def __init__(self, host, port):
         self.s = socket.create_connection((host, port))
         self.buf = b''
-        self.s.sendall(b'\x03')  # stop the guest
-        self.cmd('?')
+        self.interrupt()
 
     def _read_packet(self):
         while True:
@@ -60,19 +59,46 @@ class Gdb:
                 raise SystemExit('cow-harvest: GDB stub closed the connection')
             self.buf += data
 
+    def interrupt(self):
+        """Stop the guest and wait for its stop notice. An interrupt that
+        reaches QEMU before a preceding continue took effect is dropped,
+        so repeat it until the guest reports a stop."""
+        self.s.settimeout(1.0)
+        try:
+            self.s.sendall(b'\x03')
+            while True:
+                try:
+                    r = self._read_packet()
+                except socket.timeout:
+                    # no stop notice: either the guest was stopped already
+                    # (an interrupt then gets no answer) or the interrupt was
+                    # dropped; '?' answers in the first case, then retry
+                    self.s.sendall(b'$?#3f')
+                    try:
+                        r = self._read_packet()
+                    except socket.timeout:
+                        self.s.sendall(b'\x03')
+                        continue
+                if r.startswith((b'T', b'S')):
+                    return
+        finally:
+            self.s.settimeout(None)
+
     def cmd(self, text):
         body = text.encode()
         self.s.sendall(b'$%s#%02x' % (body, sum(body) & 0xff))
         while True:
             reply = self._read_packet()
             # skip console output and the stop notice the interrupt causes
-            if not reply.startswith((b'O', b'T', b'S')) or text == '?':
+            if reply == b'OK' or text == '?' or not reply.startswith((b'O', b'T', b'S')):
                 return reply
 
     def resume(self, monitor=None):
         """Let the guest run on. QEMU can leave it paused after a GDB
         detach, so with the HMP monitor also send 'cont' there."""
-        self.cmd('D')
+        import time
+        self.s.sendall(b'$D#44')  # its OK can go missing; don't wait on it
+        time.sleep(0.5)
         self.s.close()
         if monitor:
             import time
@@ -90,13 +116,20 @@ class Gdb:
 
     def settle(self, addr, stop_at=None):
         """Stop the guest in privileged mode: QEMU's debug reads use the
-        current mode, and kernel pages are not readable from user mode."""
-        if not self.cmd('m%x,4' % addr).startswith(b'E'):
-            return
+        current mode, and kernel pages are not readable from user mode.
+        Interrupt it at random moments until one lands in the kernel; a
+        hardware breakpoint (--stop-at) is the fallback."""
+        import random
+        import time
+        for _ in range(400):
+            if not self.cmd('m%x,4' % addr).startswith(b'E'):
+                return
+            self.s.sendall(b'$c#63')
+            time.sleep(random.uniform(0.005, 0.05))
+            self.interrupt()
         if stop_at is None:
-            raise SystemExit('cow-harvest: guest stopped in user mode; pass --stop-at '
-                             'with the address of a busy kernel function '
-                             '(thread_block_reason from the kernel\'s symbols)')
+            raise SystemExit('cow-harvest: guest never stopped in the kernel; pass --stop-at '
+                             'with the address of a busy kernel function')
         self.cmd('Z1,%x,2' % stop_at)
         for _ in range(20):
             self.s.sendall(b'$c#63')
@@ -105,6 +138,27 @@ class Gdb:
                 self.cmd('z1,%x,2' % stop_at)
                 return
         raise SystemExit('cow-harvest: kernel memory at %#x never readable' % addr)
+
+    def read_pipelined(self, addr, n, chunk=2048, depth=64):
+        """read() with up to `depth` requests in flight: GDB-stub reads
+        are bound by round trips, not bandwidth."""
+        reqs = [(a, min(chunk, addr + n - a)) for a in range(addr, addr + n, chunk)]
+        out = bytearray()
+        for i in range(0, len(reqs), depth):
+            batch = reqs[i:i + depth]
+            pkt = b''
+            for a, k in batch:
+                body = b'm%x,%x' % (a, k)
+                pkt += b'$%s#%02x' % (body, sum(body) & 0xff)
+            self.s.sendall(pkt)
+            for a, k in batch:
+                r = self._read_packet()
+                while r != b'OK' and r.startswith((b'O', b'T', b'S')):
+                    r = self._read_packet()
+                if r.startswith(b'E') or len(r) != 2 * k:
+                    raise SystemExit('cow-harvest: cannot read %#x (%r)' % (a, r[:8]))
+                out += bytes.fromhex(r.decode())
+        return bytes(out)
 
     def read(self, addr, n):
         out = bytearray()
@@ -232,8 +286,7 @@ def main():
         for _ in range(60):
             g.s.sendall(b'$c#63')
             time.sleep(3)
-            g.s.sendall(b'\x03')
-            g._read_packet()
+            g.interrupt()
             g.settle(addr, stop_at)
             if struct.unpack('<I', g.read(flag, 4))[0] == 2:
                 break
@@ -278,7 +331,11 @@ def main():
 
             def where(off):
                 return off
-        blob = memsave(monitor, arena, capacity * PAGE) if monitor else None
+        if monitor:
+            blob = memsave(monitor, arena, capacity * PAGE)
+        else:
+            # only the used part of the arena: slots are handed out in order
+            blob = g.read_pipelined(arena, max(slot for _, slot in pages) * PAGE + PAGE)
         for n, (page, slot) in enumerate(pages):
             if blob is not None:
                 data = blob[slot * PAGE:(slot + 1) * PAGE]
