@@ -1,0 +1,39 @@
+From a8e9e79f4475ca38584ffbe898114610ffa4f621 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 17:59:52 +0000
+Subject: [PATCH] rpi3: accept builtin sandbox profile query and apply calls
+
+sandbox_init() with a named profile asks Sandbox call 22 whether the
+profile is built in, then applies it with call 1; answer both.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/security/mac_base.c | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/xnu/security/mac_base.c b/xnu/security/mac_base.c
+index 9f60465..15cfd14 100644
+--- a/xnu/security/mac_base.c
++++ b/xnu/security/mac_base.c
+@@ -2139,11 +2139,13 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
+ 		if (rpi3_ios10_layout && uap->call == 2 && strcmp(target, "Sandbox") == 0)
+ 			return (0);
+ 		/*
+-		 * Call 0: sandbox_init() applying a named profile. Daemons
+-		 * that sandbox themselves (tccd, mDNSResponder) abort or exit
+-		 * when it fails; with no Sandbox to enforce it, succeed.
++		 * sandbox_init(): call 22 asks whether a named profile is
++		 * built in, then call 1 applies it (call 0 applies a compiled
++		 * one). Daemons that sandbox themselves (tccd, mDNSResponder)
++		 * abort or exit when it fails; with no Sandbox, succeed.
+ 		 */
+-		if (rpi3_ios10_layout && uap->call == 0 && strcmp(target, "Sandbox") == 0)
++		if (rpi3_ios10_layout && (uap->call == 0 || uap->call == 1 || uap->call == 22) &&
++		    strcmp(target, "Sandbox") == 0)
+ 			return (0);
+ 		/*
+ 		 * Call 15: containermanagerd telling the Sandbox where a
+-- 
+2.43.0
+
