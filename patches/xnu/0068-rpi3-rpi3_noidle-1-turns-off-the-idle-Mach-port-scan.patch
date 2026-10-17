@@ -1,0 +1,34 @@
+From 6237b930ef2da813e83722e3c6afb0e37a82ad06 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 23:58:09 +0000
+Subject: [PATCH] rpi3: rpi3_noidle=1 turns off the idle Mach port scan
+ shortcut
+
+For checking whether the shortcut ever hides a pending message.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/bsd/kern/kern_event.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/xnu/bsd/kern/kern_event.c b/xnu/bsd/kern/kern_event.c
+index e252767..3b63083 100644
+--- a/xnu/bsd/kern/kern_event.c
++++ b/xnu/bsd/kern/kern_event.c
+@@ -2193,8 +2193,11 @@ knote_process(struct knote 	*kn,
+ 	 */
+ 	{
+ 		extern int rpi3_machport_idle(struct knote *kn);
++		static int rpi3_noidle = -1;	/* rpi3_noidle=1: always ask the filter */
+ 
+-		if (kn->kn_kevent.filter == EVFILT_MACHPORT &&
++		if (rpi3_noidle < 0 && !PE_parse_boot_argn("rpi3_noidle", &rpi3_noidle, sizeof(rpi3_noidle)))
++			rpi3_noidle = 0;
++		if (!rpi3_noidle && kn->kn_kevent.filter == EVFILT_MACHPORT &&
+ 		    (kn->kn_status & (KN_STAYQUEUED | KN_DISABLED)) == KN_STAYQUEUED &&
+ 		    rpi3_machport_idle(kn)) {
+ 			assert(kn->kn_tq == &kq->kq_head);
+-- 
+2.43.0
+
