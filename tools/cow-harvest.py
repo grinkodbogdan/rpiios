@@ -62,6 +62,25 @@ class Gdb:
             if not reply.startswith((b'O', b'T', b'S')) or text == '?':
                 return reply
 
+    def resume(self, monitor=None):
+        """Let the guest run on. QEMU can leave it paused after a GDB
+        detach, so with the HMP monitor also send 'cont' there."""
+        self.cmd('D')
+        self.s.close()
+        if monitor:
+            import time
+            time.sleep(1)  # let QEMU finish the detach first
+            m = socket.socket(socket.AF_UNIX)
+            m.connect(monitor)
+            m.sendall(b'cont\ninfo status\n')
+            out = b''
+            while b'VM status' not in out:
+                data = m.recv(65536)
+                if not data:
+                    break
+                out += data
+            m.close()
+
     def settle(self, addr, stop_at=None):
         """Stop the guest in privileged mode: QEMU's debug reads use the
         current mode, and kernel pages are not readable from user mode."""
@@ -215,7 +234,7 @@ def main():
     print('cow-harvest: %d pages (%.1f MiB) to save' % (len(pages), len(pages) * PAGE / 1048576))
     if dry:
         if resume:
-            g.s.sendall(b'$c#63')
+            g.resume(monitor)
         return
 
     with open(target, 'r+b') as f:
@@ -248,7 +267,7 @@ def main():
                 print('cow-harvest: %d/%d' % (n + 1, len(pages)))
     print('cow-harvest: wrote %d pages into %s' % (len(pages), target))
     if resume:
-        g.s.sendall(b'$c#63')
+        g.resume(monitor)
 
 
 if __name__ == '__main__':
