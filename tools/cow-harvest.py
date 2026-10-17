@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Save what a running iOS wrote to its root image, so later boots keep it.
 
-Usage: cow-harvest.py OVERLAY_ADDR TARGET [--gdb HOST:PORT] [--dry-run]
+Usage: cow-harvest.py OVERLAY_ADDR TARGET [--gdb HOST:PORT] [--dry-run] [--resume]
 
 The kernel mounts IOS7/ROOTFS.HFS read-only with a copy-on-write overlay in
 RAM, so every boot is a first boot: lsd rebuilds its app database, installd
@@ -19,7 +19,7 @@ page through the GDB stub and writes it into TARGET:
     the pages go through the file's cluster chain.
 
 Copy TARGET first if you want to keep the pristine image. The guest is left
-stopped; kill QEMU afterwards (the harvested state is what a clean shutdown
+stopped (--resume lets it run on); kill QEMU afterwards (the harvested state is what a clean shutdown
 would have left, with HFS's journal replayed at the next mount).
 """
 import socket
@@ -55,7 +55,8 @@ class Gdb:
         self.s.sendall(b'$%s#%02x' % (body, sum(body) & 0xff))
         while True:
             reply = self._read_packet()
-            if not reply.startswith(b'O'):  # skip console output packets
+            # skip console output and the stop notice the interrupt causes
+            if not reply.startswith((b'O', b'T', b'S')) or text == '?':
                 return reply
 
     def read(self, addr, n):
@@ -131,6 +132,7 @@ def main():
         host, port = opts[opts.index('--gdb') + 1].rsplit(':', 1)
         port = int(port)
     dry = '--dry-run' in opts
+    resume = '--resume' in opts
 
     g = Gdb(host, port)
     hdr = g.read(addr, 40)
@@ -146,6 +148,8 @@ def main():
     pages.sort()
     print('cow-harvest: %d pages (%.1f MiB) to save' % (len(pages), len(pages) * PAGE / 1048576))
     if dry:
+        if resume:
+            g.s.sendall(b'$c#63')
         return
 
     with open(target, 'r+b') as f:
@@ -173,6 +177,8 @@ def main():
             if n % 1000 == 999:
                 print('cow-harvest: %d/%d' % (n + 1, len(pages)))
     print('cow-harvest: wrote %d pages into %s' % (len(pages), target))
+    if resume:
+        g.s.sendall(b'$c#63')
 
 
 if __name__ == '__main__':
