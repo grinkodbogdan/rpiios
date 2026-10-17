@@ -1,0 +1,48 @@
+From 33e3520275ddffd4808c5abd5b660673226ff4a5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 16:10:49 +0000
+Subject: [PATCH] rpi3: syscall trace by process name and workqueue-only mode
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                 |  2 +-
+ xnu/bsd/dev/arm/unix_syscalls.c | 15 +++++++++++++--
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 4e5312d..dbddc51 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-fe59c2c09a2be75d
++a345623c2b167951
+diff --git a/xnu/bsd/dev/arm/unix_syscalls.c b/xnu/bsd/dev/arm/unix_syscalls.c
+index d4ad439..8b2ea6d 100644
+--- a/xnu/bsd/dev/arm/unix_syscalls.c
++++ b/xnu/bsd/dev/arm/unix_syscalls.c
+@@ -459,8 +459,19 @@ void unix_syscall(arm_saved_state_t * state)
+             int v = 0;
+             trace_all = PE_parse_boot_argn("rpi3_systrace_all", &v, sizeof(v)) ? v : 0;
+         }
+-        boolean_t always = trace_all != 0;
+-        if ((error || always) && error != ERESTART && error != EJUSTRETURN && p->p_pid == trace_pid && traced < 6000) {
++        /* rpi3_systrace_all=1: every call; =2: only the workqueue/kevent calls */
++        boolean_t always = trace_all == 1 ||
++            (trace_all == 2 && (code == 368 || code == 374 || code == 369));
++        static char trace_name[20];
++        static int trace_name_loaded;
++        if (!trace_name_loaded) {
++            trace_name_loaded = 1;
++            if (!PE_parse_boot_argn("rpi3_systrace_name", trace_name, sizeof(trace_name)))
++                trace_name[0] = 0;
++        }
++        boolean_t traced_proc = p->p_pid == trace_pid ||
++            (trace_name[0] && !strcmp(p->p_comm, trace_name));
++        if ((error || always) && error != EJUSTRETURN && traced_proc && traced < 6000) {
+             uint32_t *a = (uint32_t *)uthread->uu_arg;
+             traced++;
+             kprintf("rpi3 systrace: %s[%d] syscall %u error %d ret %x args %x %x %x %x %x %x\n",
+-- 
+2.43.0
+
