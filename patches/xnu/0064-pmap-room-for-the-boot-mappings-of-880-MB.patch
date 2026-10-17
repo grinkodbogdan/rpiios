@@ -1,0 +1,30 @@
+From f0ec610517997faa9ab05c2c8559a89b0929597c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 19:43:49 +0000
+Subject: [PATCH] pmap: room for the boot mappings of 880 MB
+
+The bootstrap provenance table held 4096 pairs, enough for the 444 MB
+the HD2 kernel ran with; rpi3_mem_mb=880 panicked at its capacity.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/osfmk/arm/pmap.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/xnu/osfmk/arm/pmap.c b/xnu/osfmk/arm/pmap.c
+index 66ac704..401b5ee 100644
+--- a/xnu/osfmk/arm/pmap.c
++++ b/xnu/osfmk/arm/pmap.c
+@@ -1517,7 +1517,7 @@ void compute_pmap_gc_throttle(void *arg __unused)
+ #if BOARD_CONFIG_QSD8250_LEO
+ /* PMAP statistics account tracked aliases, not total physical VM wiring.
+  * Bootstrap pairs/ranges are exact untracked provenance, never guessed wiring. */
+-#define LEO_BOOT_PAIRS 4096U
++#define LEO_BOOT_PAIRS 12288U /* scales with memory; 4096 covered 444 MB */
+ #define LEO_BOOT_RANGES 64U
+ struct leo_boot_pair { uint32_t va; uint32_t pn; };
+ struct leo_boot_range { vm_map_offset_t start,end; vm_offset_t physical; };
+-- 
+2.43.0
+
