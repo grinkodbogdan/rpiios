@@ -1,0 +1,91 @@
+From e7b4af4cdfd603854613c1d0996aab5bec8d4e48 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 09:39:41 +0000
+Subject: [PATCH] rpi3: watchdog dumps a traced process' workqueue kqueue state
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches              |  2 +-
+ xnu/bsd/kern/kern_event.c    | 29 +++++++++++++++++++++++++++++
+ xnu/bsd/kern/pthread_synch.c |  4 ++++
+ xnu/osfmk/arm/trap.c         |  1 +
+ 4 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 40337f2..bb70449 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-2a214b939ca56332
++8e24053a12ea1852
+diff --git a/xnu/bsd/kern/kern_event.c b/xnu/bsd/kern/kern_event.c
+index 89bf6fc..f8ec9cc 100644
+--- a/xnu/bsd/kern/kern_event.c
++++ b/xnu/bsd/kern/kern_event.c
+@@ -1644,6 +1644,35 @@ rpi3_kevent_data_get(mach_vm_address_t *addr, mach_msg_size_t *size)
+ 	return 0;
+ }
+ 
++/* watchdog aid: a kqueue's queued and disabled knotes */
++void
++rpi3_kq_debug(struct kqueue *kq, const char *who)
++{
++	struct knote *kn;
++	int n = 0, dis = 0, act = 0, shown = 0;
++	char line[160];
++	int l = 0;
++
++	if (kq == NULL)
++		return;
++	kqlock(kq);
++	TAILQ_FOREACH(kn, &kq->kq_head, kn_tqe) {
++		n++;
++		if (kn->kn_status & KN_ACTIVE)
++			act++;
++		if (kn->kn_status & KN_DISABLED) {
++			dis++;
++			if (shown++ < 12 && l < (int)sizeof(line) - 20)
++				l += snprintf(line + l, sizeof(line) - l, " %x/%d/%x",
++				    (unsigned)kn->kn_kevent.ident, kn->kn_kevent.filter, kn->kn_status);
++		}
++	}
++	kqunlock(kq);
++	line[l] = 0;
++	kprintf("rpi3 kq: %s queued=%d active=%d disabled=%d (count %d nprocess %d state %x):%s\n",
++	    who, n, act, dis, kq->kq_count, kq->kq_nprocess, kq->kq_state, line);
++}
++
+ /* EVFILT_MACHPORT left a message queued for want of space in this scan */
+ void
+ rpi3_kevent_deferred(void)
+diff --git a/xnu/bsd/kern/pthread_synch.c b/xnu/bsd/kern/pthread_synch.c
+index d6d23f9..1fe37bc 100644
+--- a/xnu/bsd/kern/pthread_synch.c
++++ b/xnu/bsd/kern/pthread_synch.c
+@@ -2689,6 +2689,10 @@ rpi3_wq_debug(void *pp)
+ 		    wq->wq_reqconc[i], wq->wq_thscheduled_count[i] ? wq->wq_thscheduled_count[i][0] : 0,
+ 		    wq->wq_thactive_count[i] ? wq->wq_thactive_count[i][0] : 0);
+ 	kprintf("\n");
++	{
++		extern void rpi3_kq_debug(struct kqueue *kq, const char *who);
++		rpi3_kq_debug(wq->wq_rpi3_kq, p->p_comm);
++	}
+ }
+ 
+ static void
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index a77d405..6ab72cb 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -461,6 +461,7 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                 }
+                 if (k == 1 && (round % 6) == 5 &&
+                     (proc_pid(task->bsd_info) == 1 ||
++                     rpi3_wdbt_match(proc_name_address(task->bsd_info)) ||
+                      !strncmp(proc_name_address(task->bsd_info), "backboardd", 10))) {
+                     extern void rpi3_wq_debug(void *p);
+                     rpi3_wq_debug(task->bsd_info);
+-- 
+2.43.0
+
