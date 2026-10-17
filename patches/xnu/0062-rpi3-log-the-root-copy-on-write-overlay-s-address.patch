@@ -1,0 +1,32 @@
+From ad56b735cf86b7b490d8afafada5ef74e3c8ad85 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 18:09:06 +0000
+Subject: [PATCH] rpi3: log the root copy-on-write overlay's address
+
+tools/cow-harvest.py reads the overlay through QEMU's GDB stub to save
+a booted system's writes into the root image.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .../KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp     | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
+index a7a494f..e320d68 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
+@@ -226,6 +226,10 @@ bool IOS7LeoHFSFile::initializeCow()
+  if((uint64_t)vm_page_free_count<guard)return false;
+  if(leo_cow_init(&cow,image.image_sectors,cap,slots,cowArena,cowEntries,cowPending,this,readCowBase)!=LEO_COW_OK)return false;
+  cowReady=true;
++#if BOARD_CONFIG_RASPBERRYPI3
++ /* Lets tools/cow-harvest.py find the overlay through QEMU's GDB stub. */
++ kprintf("rpi3: cow overlay %p\n",&cow);
++#endif
+  IOInterruptState saved=IOSimpleLockLockDisableInterrupt(statusLock);cowStatusOwner=this;rootStatus.cow_ready=1;rootStatus.cow_cap=cap;
+  IOSimpleLockUnlockEnableInterrupt(statusLock,saved);return true;
+ }
+-- 
+2.43.0
+
