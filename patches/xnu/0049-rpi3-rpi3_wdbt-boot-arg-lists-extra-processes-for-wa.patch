@@ -1,0 +1,73 @@
+From c90c5a896338998b7dc518dedcc6a86f6258d177 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 08:21:21 +0000
+Subject: [PATCH] rpi3: rpi3_wdbt boot-arg lists extra processes for watchdog
+ backtraces
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches      |  2 +-
+ xnu/osfmk/arm/trap.c | 25 +++++++++++++++++++++++++
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 711f718..0e2823f 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-9e8312ef6e7cddb2
++8cd4b6e8c6c7fa41
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index f0277e4..a77d405 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -377,6 +377,29 @@ extern uint32_t rpi3_sd_stat_fail_block, rpi3_sd_stat_fail_irq, rpi3_sd_stat_fai
+ extern uint64_t rpi3_sd_stat_us;
+ static int rpi3_watchdog_event;
+ extern const char *rpi3_dtlog_name(void);
++
++/* rpi3_wdbt=a,b,c: also backtrace processes whose name starts with a, b or c */
++static int rpi3_wdbt_match(const char *name)
++{
++    static char list[128];
++    static int loaded;
++    const char *s;
++
++    if (!loaded) {
++        loaded = 1;
++        if (!PE_parse_boot_argn("rpi3_wdbt", list, sizeof(list)))
++            list[0] = 0;
++    }
++    for (s = list; *s; ) {
++        const char *e = s;
++        while (*e && *e != ',')
++            e++;
++        if (e > s && !strncmp(name, s, e - s))
++            return 1;
++        s = *e ? e + 1 : e;
++    }
++    return 0;
++}
+ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+ {
+     unsigned round;
+@@ -407,6 +430,7 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                     (!strncmp(proc_name_address(task->bsd_info), "backboardd", 10) ||
+                      !strcmp(proc_name_address(task->bsd_info), "logd") ||
+                      proc_pid(task->bsd_info) == 1 ||
++                     rpi3_wdbt_match(proc_name_address(task->bsd_info)) ||
+                      (rpi3_dtlog_name()[0] && !strcmp(proc_name_address(task->bsd_info), rpi3_dtlog_name())) ||
+                      !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11)))
+                     kprintf("rpi3 wd: %s[%d].%u st=%x ev=%08x k=%08x pc=%08x lr=%08x sp=%08x r12=%x r0=%x\n",
+@@ -417,6 +441,7 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                     (!strncmp(proc_name_address(task->bsd_info), "backboardd", 10) ||
+                      !strcmp(proc_name_address(task->bsd_info), "logd") ||
+                      proc_pid(task->bsd_info) == 1 ||
++                     rpi3_wdbt_match(proc_name_address(task->bsd_info)) ||
+                      (rpi3_dtlog_name()[0] && !strcmp(proc_name_address(task->bsd_info), rpi3_dtlog_name())) ||
+                      !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11))) {
+                     uint32_t fp = s->r[7], frame[2];
+-- 
+2.43.0
+
