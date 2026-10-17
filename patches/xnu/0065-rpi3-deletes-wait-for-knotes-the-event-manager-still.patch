@@ -1,0 +1,202 @@
+From 729b9f638c6d822e0559ed5cc8685d1ae0984db9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 19:56:27 +0000
+Subject: [PATCH] rpi3: deletes wait for knotes the event manager still holds
+
+libdispatch frees a source as soon as its knote's EV_DELETE returns.
+The kernel handed events to the workqueue event manager and forgot
+them, so a source cancelled on another thread could be freed while
+the manager was still merging its event: backboardd crashed in
+libdispatch (vtable of a freed source) and SpringBoard terminated with
+it. Knotes delivered to the manager are now in flight until it returns
+(WQOPS_THREAD_KEVENT_RETURN), and an EV_DELETE from any other thread
+waits for that, as iOS 10's kernel does for knotes being processed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/bsd/kern/kern_event.c    | 83 ++++++++++++++++++++++++++++++++++++
+ xnu/bsd/kern/pthread_synch.c |  6 +++
+ xnu/bsd/sys/event.h          |  1 +
+ xnu/bsd/sys/eventvar.h       |  7 +++
+ 4 files changed, 97 insertions(+)
+
+diff --git a/xnu/bsd/kern/kern_event.c b/xnu/bsd/kern/kern_event.c
+index de7247a..e252767 100644
+--- a/xnu/bsd/kern/kern_event.c
++++ b/xnu/bsd/kern/kern_event.c
+@@ -117,6 +117,9 @@ int rpi3_kevent_data_get(mach_vm_address_t *addr, mach_msg_size_t *size);
+ void rpi3_kevent_data_used(mach_msg_size_t used);
+ int rpi3_kevent_qos_apply(struct proc *p, struct kqueue *kq, user_addr_t changelist, int nchanges);
+ int rpi3_kqwq_scan(struct kqueue *kq, struct rpi3_kqscan *scan, kqueue_continue_t cont, struct proc *p);
++static int rpi3_kqwq_callback(struct kqueue *kq, struct kevent64_s *kevp, void *data);
++static void rpi3_kq_inflight_add(struct kqueue *kq, struct knote *kn);
++static void rpi3_kq_inflight_forget(struct kqueue *kq, struct knote *kn);
+ 
+ static inline void kqlock(struct kqueue *kq);
+ static inline void kqunlock(struct kqueue *kq);
+@@ -1732,6 +1735,58 @@ rpi3_kqwq_callback(__unused struct kqueue *kq, struct kevent64_s *kevp, void *da
+ 	return error;
+ }
+ 
++/* kq locked */
++static void
++rpi3_kq_inflight_add(struct kqueue *kq, struct knote *kn)
++{
++	if (kn->kn_status & KN_INFLIGHT)
++		return;
++	if (kq->kq_ninflight == (int)(sizeof(kq->kq_inflight) / sizeof(kq->kq_inflight[0])))
++		return;		/* the manager takes at most 16 events */
++	kn->kn_status |= KN_INFLIGHT;
++	kq->kq_inflight[kq->kq_ninflight++] = kn;
++	kq->kq_servicer = (void *)current_thread();
++}
++
++/* kq locked: a knote going away must not stay listed */
++static void
++rpi3_kq_inflight_forget(struct kqueue *kq, struct knote *kn)
++{
++	int i;
++
++	if (!(kn->kn_status & KN_INFLIGHT))
++		return;
++	kn->kn_status &= ~KN_INFLIGHT;
++	for (i = 0; i < kq->kq_ninflight; i++)
++		if (kq->kq_inflight[i] == kn) {
++			kq->kq_inflight[i] = kq->kq_inflight[--kq->kq_ninflight];
++			break;
++		}
++}
++
++/* The event manager came back: its events are handled. */
++void
++rpi3_kq_inflight_done(struct kqueue *kq)
++{
++	int i, wake = 0;
++
++	kqlock(kq);
++	for (i = 0; i < kq->kq_ninflight; i++) {
++		struct knote *kn = kq->kq_inflight[i];
++
++		kn->kn_status &= ~KN_INFLIGHT;
++		if (kn->kn_status & KN_USEWAIT) {
++			kn->kn_status &= ~KN_USEWAIT;
++			wait_queue_wakeup_all((wait_queue_t)kq->kq_wqs, &kn->kn_status, THREAD_AWAKENED);
++		}
++		wake = 1;
++	}
++	kq->kq_ninflight = 0;
++	kq->kq_servicer = NULL;
++	kqunlock(kq);
++	(void)wake;
++}
++
+ int
+ rpi3_kqwq_scan(struct kqueue *kq, struct rpi3_kqscan *scan, kqueue_continue_t cont, struct proc *p)
+ {
+@@ -1957,6 +2012,23 @@ kevent_register(struct kqueue *kq, struct kevent64_s *kev, __unused struct proc
+ 		proc_fdunlock(p);
+ 		
+ 		if (kev->flags & EV_DELETE) {
++#if BOARD_CONFIG_RASPBERRYPI3
++			/*
++			 * The event manager still holds an event of this knote:
++			 * libdispatch frees the source once the delete returns,
++			 * so wait until the manager is done with it, as iOS 10's
++			 * kernel does for knotes being processed.
++			 */
++			if ((kn->kn_status & KN_INFLIGHT) &&
++			    kq->kq_servicer != (void *)current_thread()) {
++				kn->kn_status |= KN_USEWAIT;
++				wait_queue_assert_wait((wait_queue_t)kq->kq_wqs,
++				    &kn->kn_status, THREAD_UNINT, 0);
++				kqunlock(kq);
++				thread_block(THREAD_CONTINUE_NULL);
++				goto restart;
++			}
++#endif
+ #if BOARD_CONFIG_RASPBERRYPI3
+ 			/*
+ 			 * iOS 10 two-phase delete: an enabled EV_DISPATCH +
+@@ -2249,6 +2321,10 @@ knote_process(struct knote 	*kn,
+ 			kn->kn_data = 0;
+ 			kn->kn_fflags = 0;
+ 		}
++#if BOARD_CONFIG_RASPBERRYPI3
++		if (callback == rpi3_kqwq_callback)
++			rpi3_kq_inflight_add(kq, kn);
++#endif
+ 		kqunlock(kq);
+ 	} else {
+ 		/*
+@@ -2257,6 +2333,10 @@ knote_process(struct knote 	*kn,
+ 		 * the kq queue and wakeup any
+ 		 * waiters when we are done.
+ 		 */
++#if BOARD_CONFIG_RASPBERRYPI3
++		if (callback == rpi3_kqwq_callback)
++			rpi3_kq_inflight_add(kq, kn);
++#endif
+ 		kqunlock(kq);
+ 	}
+ 
+@@ -3004,6 +3084,9 @@ knote_drop(struct knote *kn, __unused struct proc *ctxp)
+ 	SLIST_REMOVE(list, kn, knote, kn_link);
+ 	kqlock(kq);
+ 	knote_dequeue(kn);
++#if BOARD_CONFIG_RASPBERRYPI3
++	rpi3_kq_inflight_forget(kq, kn);
++#endif
+ 	needswakeup = (kn->kn_status & KN_USEWAIT);
+ 	kqunlock(kq);
+ 	proc_fdunlock(p);
+diff --git a/xnu/bsd/kern/pthread_synch.c b/xnu/bsd/kern/pthread_synch.c
+index 1fe37bc..ab74a39 100644
+--- a/xnu/bsd/kern/pthread_synch.c
++++ b/xnu/bsd/kern/pthread_synch.c
+@@ -1394,6 +1394,12 @@ workq_kernreturn(struct proc *p, struct workq_kernreturn_args  *uap, int32_t *re
+ 		case WQOPS_THREAD_KEVENT_RETURN:
+ 		case WQOPS_THREAD_RETURN:
+ 			wq = (struct workqueue *)p->p_wqptr;
++			if (wq != NULL && wq->wq_rpi3_kq != NULL && th == wq->wq_rpi3_mgr) {
++				/* the manager is done with the events it was handed */
++				extern void rpi3_kq_inflight_done(struct kqueue *kq);
++
++				rpi3_kq_inflight_done(wq->wq_rpi3_kq);
++			}
+ 			if (wq != NULL && wq->wq_rpi3_kq != NULL &&
+ 			    uap->options == WQOPS_THREAD_KEVENT_RETURN &&
+ 			    uap->item != USER_ADDR_NULL && uap->affinity > 0) {
+diff --git a/xnu/bsd/sys/event.h b/xnu/bsd/sys/event.h
+index 84fd3f7..8c4f7e5 100644
+--- a/xnu/bsd/sys/event.h
++++ b/xnu/bsd/sys/event.h
+@@ -381,6 +381,7 @@ struct knote {
+ #define KN_ATTACHING	0x20			/* event is pending attach */
+ #define KN_STAYQUEUED	0x40			/* force event to stay on queue */
+ #define KN_DEFERDELETE	0x80			/* iOS 10: delete after one last delivery */
++#define KN_INFLIGHT	0x100			/* delivered to the workq event manager, not yet returned */
+ 
+ #define kn_id		kn_kevent.ident
+ #define kn_filter	kn_kevent.filter
+diff --git a/xnu/bsd/sys/eventvar.h b/xnu/bsd/sys/eventvar.h
+index df3c3f7..9126656 100644
+--- a/xnu/bsd/sys/eventvar.h
++++ b/xnu/bsd/sys/eventvar.h
+@@ -74,6 +74,13 @@ struct kqueue {
+ 	struct selinfo	kq_sel;		/* parent select/kqueue info */
+ 	struct proc	*kq_p;		/* process containing kqueue */
+ 	int		kq_level;	/* nesting level */
++	/*
++	 * iOS 10 workq kqueue: knotes handed to the event manager thread
++	 * and that thread, until it comes back (rpi3_kq_inflight_*).
++	 */
++	struct knote	*kq_inflight[16];
++	int		kq_ninflight;
++	void		*kq_servicer;
+ 
+ #define KQ_SEL		0x01
+ #define KQ_SLEEP	0x02
+-- 
+2.43.0
+
