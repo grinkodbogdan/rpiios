@@ -1,0 +1,59 @@
+From d014c0e63b4e9ed8ceaa5949e054d44e7c6bb976 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 13:30:17 +0000
+Subject: [PATCH] rpi3: Sandbox container mapping during create/lookup succeeds
+ for containermanagerd; errors-only systrace
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                 | 2 +-
+ xnu/bsd/dev/arm/unix_syscalls.c | 5 ++---
+ xnu/security/mac_base.c         | 8 ++++++++
+ 3 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index bcb0b3b..61072ad 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-393880c932dc5d0d
++bb9cb368e249099e
+diff --git a/xnu/bsd/dev/arm/unix_syscalls.c b/xnu/bsd/dev/arm/unix_syscalls.c
+index b7bac56..7510ecc 100644
+--- a/xnu/bsd/dev/arm/unix_syscalls.c
++++ b/xnu/bsd/dev/arm/unix_syscalls.c
+@@ -454,9 +454,8 @@ void unix_syscall(arm_saved_state_t * state)
+             int v = -1;
+             trace_pid = PE_parse_boot_argn("rpi3_systrace", &v, sizeof(v)) ? v : -1;
+         }
+-        boolean_t always = (code == 360 || code == 366 || code == 367 || code == 368 ||
+-                            code == 374 || code == 478 || code == 170);
+-        if ((error || always) && error != ERESTART && error != EJUSTRETURN && p->p_pid == trace_pid && traced < 400) {
++        boolean_t always = FALSE;
++        if ((error || always) && error != ERESTART && error != EJUSTRETURN && p->p_pid == trace_pid && traced < 6000) {
+             uint32_t *a = (uint32_t *)uthread->uu_arg;
+             traced++;
+             kprintf("rpi3 systrace: %s[%d] syscall %u error %d ret %x args %x %x %x %x %x %x\n",
+diff --git a/xnu/security/mac_base.c b/xnu/security/mac_base.c
+index b0ff5af..49722b4 100644
+--- a/xnu/security/mac_base.c
++++ b/xnu/security/mac_base.c
+@@ -2145,6 +2145,14 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
+ 		 */
+ 		if (rpi3_ios10_layout && uap->call == 15 && strcmp(target, "Sandbox") == 0)
+ 			return (0);
++		/*
++		 * Call 4 from containermanagerd records a container mapping
++		 * during create/lookup (other callers use it as a query, which
++		 * keeps answering "no Sandbox").
++		 */
++		if (rpi3_ios10_layout && uap->call == 4 && strcmp(target, "Sandbox") == 0 &&
++		    strncmp(p->p_comm, "containermanager", 16) == 0)
++			return (0);
+ 	}
+ #endif
+ 
+-- 
+2.43.0
+
