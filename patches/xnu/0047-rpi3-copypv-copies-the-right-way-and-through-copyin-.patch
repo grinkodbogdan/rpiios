@@ -1,0 +1,57 @@
+From 874ce784a564e914d792fb36bcfcef37b95a47ef Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 07:30:28 +0000
+Subject: [PATCH] rpi3: copypv copies the right way and through copyin/copyout
+
+The ARM copypv used copyout for a user source (backwards), had an
+unreachable copyin branch, and bcopy'd straight into user buffers,
+which is not fault-safe; a decmpfs read by apsd under iOS 10 ended in a
+kernel stack corruption panic.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches            |  2 +-
+ xnu/osfmk/arm/loose_ends.c | 17 +++++++++++------
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 9537333..87b765a 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-d808f4b4a4794b9e
++0ab3cbbdb1e6a3e0
+diff --git a/xnu/osfmk/arm/loose_ends.c b/xnu/osfmk/arm/loose_ends.c
+index ab13d1c..1bb3c4f 100644
+--- a/xnu/osfmk/arm/loose_ends.c
++++ b/xnu/osfmk/arm/loose_ends.c
+@@ -434,14 +434,19 @@ kern_return_t copypv(addr64_t src64, addr64_t snk64, unsigned int size, int whic
+         snk64 = phys_to_virt(snk64);
+ 
+     /*
+-     * If it's a kernel copy, use ovbcopy. 
++     * Both physical, or the virtual side is a kernel address: plain copy.
++     * Otherwise the virtual side is a user address and must go through
++     * the fault-safe copyin/copyout (it may not be resident).
+      */
+-    if (!(which & (cppvKmap | cppvPsrc)))
+-        copyout(src64, snk64, size);
+-    else if (!(which & (cppvKmap | cppvPsrc)))
+-        copyin(src64, snk64, size);
+-    else
++    if (bothphys || (which & cppvKmap))
+         bcopy(src64, snk64, size);
++    else if (which & cppvPsrc) {
++        if (copyout((const void *)(uintptr_t)src64, (user_addr_t)snk64, size))
++            return KERN_FAILURE;
++    } else {
++        if (copyin((user_addr_t)src64, (void *)(uintptr_t)snk64, size))
++            return KERN_FAILURE;
++    }
+ 
+     return KERN_SUCCESS;
+ }
+-- 
+2.43.0
+
