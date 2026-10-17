@@ -1,0 +1,70 @@
+From af23d5f83eab6bb9a16dae8800ee46af6347d577 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 23:02:12 +0000
+Subject: [PATCH] rpi3: accept iOS 10's newer socket-level options
+
+lockdownd's sockets get setsockopt(SOL_SOCKET, 0x10000) and other
+options newer than this kernel; the ENOPROTOOPT made lockdownd drop
+SpringBoard's connection (SpringBoard died of SIGPIPE in
+lockdown_copy_value). They tune power and routing policy only: accept
+them on iOS 10 and read them back as 0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/bsd/kern/uipc_socket.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/xnu/bsd/kern/uipc_socket.c b/xnu/bsd/kern/uipc_socket.c
+index de1440f..9d6fe0f 100644
+--- a/xnu/bsd/kern/uipc_socket.c
++++ b/xnu/bsd/kern/uipc_socket.c
+@@ -3366,6 +3366,27 @@ sosetopt(struct socket *so, struct sockopt *sopt)
+ 			break;
+ 
+ 		default:
++#if BOARD_CONFIG_RASPBERRYPI3
++			{
++				/*
++				 * iOS 10 sets socket-level options newer than this
++				 * kernel (SO_NOWAKEFROMSLEEP 0x10000 on every
++				 * launchd-passed socket, ...). lockdownd drops a
++				 * client connection when that fails, which killed
++				 * SpringBoard with SIGPIPE. They only tune power
++				 * and routing policy: accept them.
++				 */
++				extern int rpi3_ios10_layout;
++
++				if (rpi3_ios10_layout) {
++					printf("rpi3: %s[%d] setsockopt SOL_SOCKET 0x%x ignored\n",
++					    current_proc()->p_comm, proc_pid(current_proc()),
++					    sopt->sopt_name);
++					error = 0;
++					break;
++				}
++			}
++#endif
+ 			error = ENOPROTOOPT;
+ 			break;
+ 		}
+@@ -3679,6 +3700,17 @@ integer:
+ 			goto integer;
+ 
+ 		default:
++#if BOARD_CONFIG_RASPBERRYPI3
++			{
++				/* the newer options accepted by sosetopt read as 0 */
++				extern int rpi3_ios10_layout;
++
++				if (rpi3_ios10_layout) {
++					optval = 0;
++					goto integer;
++				}
++			}
++#endif
+ 			error = ENOPROTOOPT;
+ 			break;
+ 		}
+-- 
+2.43.0
+
