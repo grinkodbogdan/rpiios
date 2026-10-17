@@ -1,0 +1,44 @@
+From 0db54b8f5a252ba09de69d17a17681187401cf7a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 06:45:09 +0000
+Subject: [PATCH] rpi3: *at() emulation returns EFAULT for a missing path
+
+mkpath_np treats ENOENT from mkdirat as 'create the parent' and strdups
+the path; with a NULL path that crashed MobileInstallationHelperService
+(a real kernel answers EFAULT).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches             | 2 +-
+ xnu/bsd/kern/kern_descrip.c | 7 ++++---
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 4399456..9537333 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-8ce5fe1723f67f17
++d808f4b4a4794b9e
+diff --git a/xnu/bsd/kern/kern_descrip.c b/xnu/bsd/kern/kern_descrip.c
+index 735159d..21d10ff 100644
+--- a/xnu/bsd/kern/kern_descrip.c
++++ b/xnu/bsd/kern/kern_descrip.c
+@@ -5565,9 +5565,10 @@ rpi3_at_begin(proc_t p, int fd, user_addr_t path, struct rpi3_at *at)
+ 	int error;
+ 
+ 	at->active = 0;
+-	if (fd == RPI3_AT_FDCWD)
+-		return (0);
+-	if (path != USER_ADDR_NULL && copyin(path, &c, 1) == 0 && c == '/')
++	/* a bad path is EFAULT, as on a real kernel (callers rely on it) */
++	if (path == USER_ADDR_NULL || copyin(path, &c, 1) != 0)
++		return (EFAULT);
++	if (fd == RPI3_AT_FDCWD || c == '/')
+ 		return (0);
+ 	if ((error = file_vnode(fd, &vp)) != 0)
+ 		return (error);
+-- 
+2.43.0
+
