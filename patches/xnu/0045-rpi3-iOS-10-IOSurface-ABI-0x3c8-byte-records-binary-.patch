@@ -1,0 +1,284 @@
+From 15478cf87b4e23698947bd0253bcd4c335ace787 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 06:40:41 +0000
+Subject: [PATCH] rpi3: iOS 10 IOSurface ABI: 0x3c8-byte records, binary
+ properties, selector 13
+
+iOS 10's IOSurface client asks for a 0x3c8-byte surface record (same
+leading fields as iOS 7's 0x548), sends creation properties in the
+binary serialization (0xd3) this kernel could not read, and queries
+capabilities with selector 13 (iOS 7: 16). Also log IOSurface and
+framebuffer notification-port traffic on serial.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                               |   2 +-
+ .../ARM/AppleARMPlatform/IOS7LeoDisplay.cpp   | 144 ++++++++++++++++--
+ 2 files changed, 132 insertions(+), 14 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index fb07b53..4399456 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-7b9b07c724d4dcae
++8ce5fe1723f67f17
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+index 7fcb185..98cee84 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoDisplay.cpp
+@@ -16,6 +16,9 @@
+ #include <mach/vm_param.h>
+ extern "C" {
+ #include <pexpert/pexpert.h>
++struct proc *current_proc(void);
++char *proc_name_address(void *p);
++int proc_pid(struct proc *);
+ #include <mach/mach_time.h>
+ #include <kern/clock.h>
+ extern void task_reference(task_t);
+@@ -208,6 +211,20 @@ static uint64_t scanoutSequence;
+ static uint32_t displayBudget;
+ static const uint32_t leoWidth=480,leoHeight=800,leoRow=1920;
+ static const uint32_t primarySurfaceID = 1;
++/*
++ * iOS 10's IOSurface client takes a 0x3c8-byte surface record (iOS 7:
++ * 0x548); the leading fields (addresses, id, size, geometry, format) keep
++ * their places.
++ */
++static uint32_t rpi3_surface_record_min(void)
++{
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    extern int rpi3_ios10_layout;
++    if (rpi3_ios10_layout) return 0x3c8;
++#endif
++    return 0x548;
++}
++
+ static uint32_t activeScanoutSurfaceID = primarySurfaceID;
+ enum { IOS7LAB_MAX_OFFSCREEN = 64 };
+ 
+@@ -537,7 +554,7 @@ void IOS7LabSurfaceClient::releaseOffscreen(unsigned index)
+ IOReturn IOS7LabSurfaceClient::describeOffscreen(uint32_t id,
+     IOExternalMethodArguments *args, bool acquireReference)
+ {
+-    if (!id || !args->structureOutput || args->structureOutputSize < 0x548 ||
++    if (!id || !args->structureOutput || args->structureOutputSize < rpi3_surface_record_min() ||
+         args->scalarOutputCount) return kIOReturnBadArgument;
+ 
+     int mapIndex = -1;
+@@ -597,8 +614,11 @@ IOReturn IOS7LabSurfaceClient::describeOffscreen(uint32_t id,
+     info[14] = 0x01010004U; /* uint16 bytes=4, uint8 elementWidth=1, uint8 elementHeight=1 */
+     info[15] = 1;
+     info[16] = ((uint32_t *)kernelControl->getAddress())[2];
+-    memcpy(args->structureOutput, info, sizeof(info));
+-    args->structureOutputSize = sizeof(info);
++    {
++        uint32_t n = args->structureOutputSize < sizeof(info) ? args->structureOutputSize : sizeof(info);
++        memcpy(args->structureOutput, info, n);
++        args->structureOutputSize = n;
++    }
+     static unsigned int mapLogs;
+     if (mapLogs++ < 32)
+         IOLog("IOS7LAB offscreen surface id=%u mapped-pixels=%08x mapped-control=%08x bytes=%u\n",
+@@ -618,10 +638,81 @@ static uint32_t rpi3_surface_number(OSDictionary *d, const char *key)
+     OSNumber *n = OSDynamicCast(OSNumber, d->getObject(key));
+     return n ? n->unsigned32BitValue() : 0;
+ }
++/*
++ * iOS 10 sends surface properties in the kernel's binary serialization
++ * (signature 0xd3; each object a 32-bit header: type in bits 24-30, length
++ * below). This kernel only reads XML, so pick out the top-level
++ * symbol -> number pairs, which is all a surface request needs.
++ */
++static OSDictionary *rpi3_unserialize_binary_numbers(const void *buf, uint32_t bytes)
++{
++    const uint32_t *w = (const uint32_t *)buf;
++    uint32_t n = bytes / 4, i = 1;
++    OSDictionary *d;
++    const OSSymbol *key = 0;
++
++    if (n < 2 || w[0] != 0xd3 || !(d = OSDictionary::withCapacity(16)))
++        return 0;
++    while (i < n) {
++        uint32_t h = w[i++], type = (h >> 24) & 0x7f, len = h & 0xffffff;
++
++        switch (type) {
++        case 0x08: {	/* symbol: key */
++            uint32_t words = (len + 3) / 4;
++            if (i + words > n || !len) goto out;
++            if (key) key->release();
++            char name[64];
++            uint32_t l = len < sizeof(name) ? len : sizeof(name) - 1;
++            memcpy(name, &w[i], l);
++            name[l] = 0;
++            key = OSSymbol::withCString(name);
++            i += words;
++            continue;
++        }
++        case 0x04: {	/* number: 64-bit value follows */
++            if (i + 2 > n) goto out;
++            if (key) {
++                OSNumber *num = OSNumber::withNumber(((uint64_t)w[i + 1] << 32) | w[i], 64);
++                if (num) { d->setObject(key, num); num->release(); }
++            }
++            i += 2;
++            break;
++        }
++        case 0x09: case 0x0a:	/* string, data */
++            i += (len + 3) / 4;
++            break;
++        case 0x0c:		/* reference */
++            i += 1;
++            break;
++        default:		/* dictionary, array, set, boolean: no payload */
++            break;
++        }
++        if (key) { key->release(); key = 0; }
++    }
++out:
++    if (key) key->release();
++    return d;
++}
++
+ static bool rpi3_surface_request(const void *xml, uint32_t bytes, IOS7LabSimpleSurfaceRequest *out)
+ {
+-    if (!bytes || bytes > 4096 || ((const char *)xml)[bytes - 1]) return false;
+-    OSObject *o = OSUnserializeXML((const char *)xml);
++    {
++        static unsigned dumps;
++        const unsigned char *b = (const unsigned char *)xml;
++        if (dumps++ < 6) {
++            kprintf("rpi3: surface request %u bytes:", bytes);
++            for (uint32_t i = 0; i < bytes && i < 96; i++)
++                kprintf("%c", (b[i] >= 0x20 && b[i] < 0x7f) ? b[i] : '.');
++            kprintf("\n");
++        }
++    }
++    OSObject *o;
++    if (bytes >= 8 && *(const uint32_t *)xml == 0xd3) {
++        o = rpi3_unserialize_binary_numbers(xml, bytes);
++    } else {
++        if (!bytes || bytes > 4096 || ((const char *)xml)[bytes - 1]) return false;
++        o = OSUnserializeXML((const char *)xml);
++    }
+     OSDictionary *d = OSDynamicCast(OSDictionary, o);
+     bool ok = false;
+     if (d && !d->getObject("IOSurfaceAddress")) {
+@@ -644,7 +735,7 @@ IOReturn IOS7LabSurfaceClient::createOffscreen(IOExternalMethodArguments *args)
+ {
+ #if defined(BOARD_CONFIG_RASPBERRYPI3)
+     if (!args->scalarInputCount && args->structureInput && args->structureOutput &&
+-        args->structureOutputSize >= 0x548 && !args->scalarOutputCount &&
++        args->structureOutputSize >= rpi3_surface_record_min() && !args->scalarOutputCount &&
+         (args->structureInputSize != sizeof(ios7lab_fullscreen_surface_request) ||
+          memcmp(args->structureInput, ios7lab_fullscreen_surface_request,
+                 sizeof(ios7lab_fullscreen_surface_request)) != 0)) {
+@@ -663,7 +754,7 @@ IOReturn IOS7LabSurfaceClient::createOffscreen(IOExternalMethodArguments *args)
+         args->structureInputSize != sizeof(ios7lab_fullscreen_surface_request) ||
+         memcmp(args->structureInput, ios7lab_fullscreen_surface_request,
+                sizeof(ios7lab_fullscreen_surface_request)) != 0 ||
+-        !args->structureOutput || args->structureOutputSize < 0x548 ||
++        !args->structureOutput || args->structureOutputSize < rpi3_surface_record_min() ||
+         args->scalarOutputCount) return kIOReturnUnsupported;
+ 
+     IOS7LabSimpleSurfaceRequest geometry = {0, 0, 480, 800, 0x42475241U, 4, 1920, offscreenPixelBytes};
+@@ -674,7 +765,7 @@ IOReturn IOS7LabSurfaceClient::createSimple(IOExternalMethodArguments *args)
+ {
+     if (args->scalarInputCount || !args->structureInput ||
+         args->structureInputSize != sizeof(IOS7LabSimpleSurfaceRequest) ||
+-        !args->structureOutput || args->structureOutputSize < 0x548 ||
++        !args->structureOutput || args->structureOutputSize < rpi3_surface_record_min() ||
+         args->scalarOutputCount) return kIOReturnBadArgument;
+     IOS7LabSimpleSurfaceRequest input, geometry;
+     memcpy(&input, args->structureInput, sizeof(input));
+@@ -783,7 +874,7 @@ IOReturn IOS7LabSurfaceClient::clientClose(void)
+ 
+ IOReturn IOS7LabSurfaceClient::describe(IOExternalMethodArguments *args)
+ {
+-    if (!args->structureOutput || args->structureOutputSize < 0x548 || args->scalarOutputCount)
++    if (!args->structureOutput || args->structureOutputSize < rpi3_surface_record_min() || args->scalarOutputCount)
+         return kIOReturnBadArgument;
+     if (!ios7lab_primary_ready()) return kIOReturnNoMemory;
+     if (!pixelsMap) pixelsMap = primaryPixels->createMappingInTask(ownerTask, 0, kIOMapAnywhere | kIOMapCopybackCache);
+@@ -813,8 +904,11 @@ IOReturn IOS7LabSurfaceClient::describe(IOExternalMethodArguments *args)
+     info[14] = 0x01010004U; /* uint16 bytes=4, uint8 elementWidth=1, uint8 elementHeight=1 */
+     info[15] = 1;           /* Preserve existing adjacent descriptor word; not elementHeight. */
+     info[16] = ((uint32_t *)primaryControl->getBytesNoCopy())[2];
+-    memcpy(args->structureOutput, info, sizeof(info));
+-    args->structureOutputSize = sizeof(info);
++    {
++        uint32_t n = args->structureOutputSize < sizeof(info) ? args->structureOutputSize : sizeof(info);
++        memcpy(args->structureOutput, info, n);
++        args->structureOutputSize = n;
++    }
+     static unsigned int map_logs;
+     if (map_logs++ < 32)
+         IOLog("IOS7LAB surface lookup id=1 mapped-pixels=%08x mapped-control=%08x bytes=%u\n", info[0], info[2], primaryBytes);
+@@ -829,6 +923,22 @@ IOReturn IOS7LabSurfaceClient::externalMethod(uint32_t selector, IOExternalMetho
+     if (logs++ < 96)
+         IOLog("IOS7LAB surface method=%u scalar-in=%u struct-in=%u scalar-out=%u struct-out=%u\n",
+               selector, args->scalarInputCount, args->structureInputSize, args->scalarOutputCount, args->structureOutputSize);
++#if BOARD_CONFIG_RASPBERRYPI3
++    {
++        extern int rpi3_ios10_layout;
++        static unsigned klogs;
++
++        if (rpi3_ios10_layout && klogs++ < 300) {
++            kprintf("rpi3: surface %s[%d] method=%u in:", proc_name_address(current_proc()),
++                proc_pid(current_proc()), selector);
++            for (uint32_t i = 0; i < args->scalarInputCount && i < 4; i++)
++                kprintf(" %llx", (unsigned long long)args->scalarInput[i]);
++            kprintf(" struct-in=%u scalar-out=%u struct-out=%u%s\n", args->structureInputSize,
++                args->scalarOutputCount, args->structureOutputSize,
++                (args->structureInputDescriptor || args->structureOutputDescriptor) ? " (descriptor)" : "");
++        }
++    }
++#endif
+     if (args->structureInputDescriptor || args->structureOutputDescriptor) return kIOReturnUnsupported;
+     IOReturn result = kIOReturnUnsupported;
+     IOLockLock(mappingLock);
+@@ -836,7 +946,8 @@ IOReturn IOS7LabSurfaceClient::externalMethod(uint32_t selector, IOExternalMetho
+         result = createOffscreen(args);
+     } else if (selector == 8) {
+         result = createSimple(args);
+-    } else if (selector == 16 && !args->scalarInputCount && !args->structureInputSize &&
++    } else if ((selector == 16 || (selector == 13 && rpi3_surface_record_min() == 0x3c8)) &&
++               !args->scalarInputCount && !args->structureInputSize &&
+                !args->scalarOutputCount && args->structureOutput &&
+                args->structureOutputSize >= sizeof(IOS7LabSurfaceCapabilities)) {
+         IOS7LabSurfaceCapabilities capabilities = ios7lab_surface_capabilities();
+@@ -909,6 +1020,10 @@ IOReturn IOS7LabSurfaceClient::externalMethod(uint32_t selector, IOExternalMetho
+     /* Report actual unsupported native calls even after routine traffic has
+      * exhausted its log budget. These are ordinary driver errors, bounded. */
+     static unsigned int failures[32];
++#if BOARD_CONFIG_RASPBERRYPI3
++    if (result != kIOReturnSuccess)
++        kprintf("rpi3: surface method=%u -> %x\n", selector, result);
++#endif
+     if (result != kIOReturnSuccess && selector < 32 && failures[selector]++ < 4)
+         IOLog("IOS7LAB surface failure selector=%u result=%x scalar-in=%u struct-in=%u scalar-out=%u struct-out=%u\n",
+             selector, result, args->scalarInputCount, args->structureInputSize,
+@@ -1212,6 +1327,8 @@ IOReturn IOS7LabFramebufferClient::registerNotificationPort(mach_port_t port,
+     UInt32 type,io_user_reference_t refCon)
+ {
+     leo_graphics_port_entry(graphicsClient,graphicsOwnerPID,type,IPC_PORT_VALID(port));
++    kprintf("rpi3: framebuffer registerNotificationPort type=%u refcon=%llx valid=%d\n",
++        (unsigned)type, (unsigned long long)refCon, (int)IPC_PORT_VALID(port));
+     if(!transactionLock || !vsyncWorkLoop || !vsyncTimer){
+         leo_graphics_port_preflight(kIOReturnNotReady);return kIOReturnNotReady;
+     }
+@@ -1594,7 +1711,8 @@ IOReturn IOS7LabFramebufferClient::performExternalMethod(uint32_t selector,
+         static unsigned argLogs;
+ 
+         if (rpi3_ios10_layout && argLogs++ < 200) {
+-            kprintf("rpi3: framebuffer args sel=%u in:", selector);
++            kprintf("rpi3: framebuffer args sel=%u%s in:", selector,
++                args->asyncWakePort ? " ASYNC" : "");
+             for (uint32_t i = 0; i < args->scalarInputCount && i < 6; i++)
+                 kprintf(" %llx", (unsigned long long)args->scalarInput[i]);
+             if (args->structureInput && args->structureInputSize) {
+-- 
+2.43.0
+
