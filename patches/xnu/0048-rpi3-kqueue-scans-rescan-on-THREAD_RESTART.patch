@@ -1,0 +1,47 @@
+From acf00dc194abafa9d1ba5c5aecaf0e7c4e79d4ee Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 07:40:27 +0000
+Subject: [PATCH] rpi3: kqueue scans rescan on THREAD_RESTART
+
+With iOS 10's knotes on individual receive rights, a port that is
+destroyed or moved wakes kqueue waiters with THREAD_RESTART, which the
+scan treated as impossible (panic in launchd).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches           | 2 +-
+ xnu/bsd/kern/kern_event.c | 3 +++
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 87b765a..711f718 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-0ab3cbbdb1e6a3e0
++9e8312ef6e7cddb2
+diff --git a/xnu/bsd/kern/kern_event.c b/xnu/bsd/kern/kern_event.c
+index 382c6f9..89bf6fc 100644
+--- a/xnu/bsd/kern/kern_event.c
++++ b/xnu/bsd/kern/kern_event.c
+@@ -2304,6 +2304,8 @@ kqueue_scan_continue(void *data, wait_result_t wait_result)
+ 
+ 	/* convert the (previous) wait_result to a proper error */
+ 	switch (wait_result) {
++	case THREAD_RESTART:
++		/* a Mach port linked to this kqueue went away: just look again */
+ 	case THREAD_AWAKENED:
+ 		kqlock(kq);
+ 		error = kqueue_process(kq, cont_args->call, cont_args->data, &count, current_proc());
+@@ -2419,6 +2421,7 @@ kqueue_scan(struct kqueue *kq,
+ 		/* NOTREACHED if (continuation != NULL) */
+ 
+ 		switch (wait_result) {
++		case THREAD_RESTART:
+ 		case THREAD_AWAKENED:
+ 			continue;
+ 		case THREAD_TIMED_OUT:
+-- 
+2.43.0
+
