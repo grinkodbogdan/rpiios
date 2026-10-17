@@ -1,0 +1,155 @@
+From 9a0247b24676934369ff7afc26134eec1a8e2b5c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 16:59:28 +0000
+Subject: [PATCH] rpi3: iOS identity mapping for ACLs; getattrlist data-protect
+ flags
+
+- No identity resolver daemon exists on iOS; its kernel maps uids/gids
+  to the fixed compatibility GUIDs (FFFFEEEE-...-AAAA<uid>,
+  ABCDEFAB-...-CDEF<gid>). Here every lookup slept half a second and
+  failed, so container ACLs never granted mobile (lsd got EACCES on its
+  own container) and every ACL check stalled.
+- getattrlist: answer ATTR_CMN_DATA_PROTECT_FLAGS (class 0) and ignore
+  the unimplemented named-attribute bits, as iOS 10 does; lsd's
+  getattrlist calls all failed with EINVAL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches                 |  2 +-
+ xnu/bsd/dev/arm/unix_syscalls.c |  7 +++++++
+ xnu/bsd/kern/kern_credential.c  | 35 +++++++++++++++++++++++++++++++++
+ xnu/bsd/vfs/vfs_attrlist.c      | 25 +++++++++++++++++++++++
+ 4 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index dbddc51..ad957ce 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-a345623c2b167951
++12ce74b7e01c2a92
+diff --git a/xnu/bsd/dev/arm/unix_syscalls.c b/xnu/bsd/dev/arm/unix_syscalls.c
+index 8b2ea6d..6f73fec 100644
+--- a/xnu/bsd/dev/arm/unix_syscalls.c
++++ b/xnu/bsd/dev/arm/unix_syscalls.c
+@@ -485,6 +485,13 @@ void unix_syscall(arm_saved_state_t * state)
+ 
+                 if (copyinstr(pa, path, sizeof(path), &len) == 0)
+                     kprintf("rpi3 systrace path: %s\n", path);
++                if (code == 220) {
++                    uint32_t al[6];
++
++                    if (copyin(a[1], al, sizeof(al)) == 0)
++                        kprintf("rpi3 systrace attrlist: count %x common %08x vol %08x dir %08x file %08x fork %08x options %x\n",
++                            al[0] & 0xffff, al[1], al[2], al[3], al[4], al[5], a[4]);
++                }
+             }
+         }
+     }
+diff --git a/xnu/bsd/kern/kern_credential.c b/xnu/bsd/kern/kern_credential.c
+index 969279a..944a6d3 100644
+--- a/xnu/bsd/kern/kern_credential.c
++++ b/xnu/bsd/kern/kern_credential.c
+@@ -2334,6 +2334,41 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
+ 	int (* expired)(struct kauth_identity *kip);
+ 	char *namebuf = NULL;
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++	/*
++	 * iOS has no identity resolver daemon; its kernel maps ids to the
++	 * fixed compatibility GUIDs FFFFEEEE-DDDD-CCCC-BBBB-AAAA<uid> and
++	 * ABCDEFAB-CDEF-ABCD-EFAB-CDEF<gid> (what libsystem's membership
++	 * calls produce for ACL entries). Without this every lookup slept
++	 * half a second and failed, so ACLs never matched.
++	 */
++	{
++		static const uint8_t upfx[12] = { 0xff, 0xff, 0xee, 0xee, 0xdd, 0xdd, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa };
++		static const uint8_t gpfx[12] = { 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef };
++
++		if ((from == KI_VALID_UID || from == KI_VALID_GID) && to == KI_VALID_GUID) {
++			guid_t *g = (guid_t *)dst;
++			uint32_t id = *(uint32_t *)src;
++
++			bcopy(from == KI_VALID_UID ? upfx : gpfx, g->g_guid, 12);
++			g->g_guid[12] = id >> 24;
++			g->g_guid[13] = id >> 16;
++			g->g_guid[14] = id >> 8;
++			g->g_guid[15] = id;
++			return (0);
++		}
++		if (from == KI_VALID_GUID && (to == KI_VALID_UID || to == KI_VALID_GID)) {
++			guid_t *g = (guid_t *)src;
++
++			if (bcmp(g->g_guid, to == KI_VALID_UID ? upfx : gpfx, 12) != 0)
++				return (ENOENT);
++			*(uint32_t *)dst = ((uint32_t)g->g_guid[12] << 24) | ((uint32_t)g->g_guid[13] << 16) |
++			    ((uint32_t)g->g_guid[14] << 8) | g->g_guid[15];
++			return (0);
++		}
++	}
++#endif
++
+ 	KAUTH_DEBUG("CACHE - translate %d to %d", from, to);
+ 	
+ 	/*
+diff --git a/xnu/bsd/vfs/vfs_attrlist.c b/xnu/bsd/vfs/vfs_attrlist.c
+index 9f438ed..302cb2c 100644
+--- a/xnu/bsd/vfs/vfs_attrlist.c
++++ b/xnu/bsd/vfs/vfs_attrlist.c
+@@ -1198,6 +1198,9 @@ out:
+ static int
+ getattrlist_internal(vnode_t vp, struct getattrlist_args *uap, proc_t p, vfs_context_t ctx)
+ {
++#if BOARD_CONFIG_RASPBERRYPI3
++	int rpi3_dpflags = 0;
++#endif
+ 	struct attrlist	al;
+ 	struct vnode_attr va;
+ 	struct _attrlist_buf ab;
+@@ -1233,6 +1236,16 @@ getattrlist_internal(vnode_t vp, struct getattrlist_args *uap, proc_t p, vfs_con
+ 		error = EINVAL;
+ 		goto out;
+ 	}
++#if BOARD_CONFIG_RASPBERRYPI3
++	/*
++	 * iOS 10 asks for ATTR_CMN_DATA_PROTECT_FLAGS (0x40000000) and sends
++	 * the never-implemented named-attribute bits (0x00180000), which its
++	 * kernel ignores. Ignore those; answer the protection flags with 0
++	 * (no content protection here), packed after ADDEDTIME.
++	 */
++	rpi3_dpflags = (al.commonattr & 0x40000000) != 0;
++	al.commonattr &= ~(0x40000000 | 0x00180000);
++#endif
+ 
+ 	VFS_DEBUG(ctx, vp, "%p  ATTRLIST - %s request common %08x vol %08x file %08x dir %08x fork %08x %sfollow on '%s'",
+ 	    vp, p->p_comm, al.commonattr, al.volattr, al.fileattr, al.dirattr, al.forkattr,
+@@ -1287,6 +1300,10 @@ getattrlist_internal(vnode_t vp, struct getattrlist_args *uap, proc_t p, vfs_con
+ 		VFS_DEBUG(ctx, vp, "ATTRLIST - ERROR: setup for request failed");
+ 		goto out;
+ 	}
++#if BOARD_CONFIG_RASPBERRYPI3
++	if (rpi3_dpflags)
++		fixedsize += sizeof(uint32_t);
++#endif
+ 	if ((error = vnode_authorize(vp, NULL, action, ctx)) != 0) {
+ 		VFS_DEBUG(ctx, vp, "ATTRLIST - ERROR: authorisation failed/denied");
+ 		goto out;
+@@ -1775,6 +1792,14 @@ getattrlist_internal(vnode_t vp, struct getattrlist_args *uap, proc_t p, vfs_con
+ 		ATTR_PACK_TIME(ab, va.va_addedtime, proc_is64);
+ 		ab.actual.commonattr |= ATTR_CMN_ADDEDTIME;
+ 	}
++#if BOARD_CONFIG_RASPBERRYPI3
++	if (rpi3_dpflags) {
++		uint32_t dpflags = 0;
++
++		ATTR_PACK4(ab, dpflags);
++		ab.actual.commonattr |= 0x40000000;
++	}
++#endif
+ 
+ 	/* directory attributes *********************************************/
+ 	if (al.dirattr && (vtype == VDIR)) {
+-- 
+2.43.0
+
