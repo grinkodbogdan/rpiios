@@ -1,0 +1,132 @@
+From 6dab2da92608e83726672ee3270484cab6fa5631 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 08:59:10 +0000
+Subject: [PATCH] rpi3: iOS 10 guarded write syscalls and data-protection
+ classes
+
+- 484-487 guarded_open_dprotected_np / guarded_write_np /
+  guarded_pwrite_np / guarded_writev_np, guard ignored like the iOS 7
+  guarded calls (containermanagerd crashed on SIGSYS-turned-ENOTSUP).
+- F_GETPROTECTIONCLASS / F_SETPROTECTIONCLASS without content
+  protection: every file is class D. containermanagerd failed to create
+  any directory on ENOTTY, which held up installd, lsd and SpringBoard.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches              |  2 +-
+ xnu/bsd/kern/kern_descrip.c  | 64 ++++++++++++++++++++++++++++++++++++
+ xnu/bsd/kern/syscalls.master |  8 ++---
+ 3 files changed, 69 insertions(+), 5 deletions(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 0e2823f..40337f2 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-8cd4b6e8c6c7fa41
++2a214b939ca56332
+diff --git a/xnu/bsd/kern/kern_descrip.c b/xnu/bsd/kern/kern_descrip.c
+index 21d10ff..791a25d 100644
+--- a/xnu/bsd/kern/kern_descrip.c
++++ b/xnu/bsd/kern/kern_descrip.c
+@@ -1699,6 +1699,20 @@ fcntl_nocancel(proc_t p, struct fcntl_nocancel_args *uap, int32_t *retval)
+ 		break;
+ 	}
+ 			
++#if !CONFIG_PROTECT && BOARD_CONFIG_RASPBERRYPI3
++	/*
++	 * No content protection here: every file is effectively class D
++	 * (PROTECTION_CLASS_D, no protection). iOS 10 daemons set classes on
++	 * the directories they create and fail on ENOTTY.
++	 */
++	case F_GETPROTECTIONCLASS:
++		*retval = 4;
++		error = 0;
++		goto out;
++	case F_SETPROTECTIONCLASS:
++		error = 0;
++		goto out;
++#endif
+ #if CONFIG_PROTECT
+ 	case F_GETPROTECTIONCLASS: {
+ 		int class = 0;
+@@ -5452,6 +5466,56 @@ change_fdguard_np(proc_t p, struct change_fdguard_np_args *uap, __unused int32_t
+ 	return (error);
+ }
+ 
++/* iOS 10's guarded write family (containermanagerd, sqlite): guard ignored. */
++int
++guarded_open_dprotected_np(proc_t p, struct guarded_open_dprotected_np_args *uap, int32_t *retval)
++{
++	struct open_nocancel_args a;
++
++	bzero(&a, sizeof (a));
++	a.path = uap->path;
++	a.flags = uap->flags;
++	a.mode = uap->mode;
++	return (open_nocancel(p, &a, retval));
++}
++
++int
++guarded_write_np(proc_t p, struct guarded_write_np_args *uap, user_ssize_t *retval)
++{
++	struct write_nocancel_args a;
++
++	bzero(&a, sizeof (a));
++	a.fd = uap->fd;
++	a.cbuf = uap->cbuf;
++	a.nbyte = uap->nbyte;
++	return (write_nocancel(p, &a, retval));
++}
++
++int
++guarded_pwrite_np(proc_t p, struct guarded_pwrite_np_args *uap, user_ssize_t *retval)
++{
++	struct pwrite_nocancel_args a;
++
++	bzero(&a, sizeof (a));
++	a.fd = uap->fd;
++	a.buf = uap->buf;
++	a.nbyte = uap->nbyte;
++	a.offset = uap->offset;
++	return (pwrite_nocancel(p, &a, retval));
++}
++
++int
++guarded_writev_np(proc_t p, struct guarded_writev_np_args *uap, user_ssize_t *retval)
++{
++	struct writev_nocancel_args a;
++
++	bzero(&a, sizeof (a));
++	a.fd = uap->fd;
++	a.iovp = uap->iovp;
++	a.iovcnt = uap->iovcnt;
++	return (writev_nocancel(p, &a, retval));
++}
++
+ /* iOS 10: getentropy(2), up to 256 bytes from the kernel's generator. */
+ int
+ getentropy(__unused proc_t p, struct getentropy_args *uap, __unused int32_t *retval)
+diff --git a/xnu/bsd/kern/syscalls.master b/xnu/bsd/kern/syscalls.master
+index 8f39f02..3309ea4 100644
+--- a/xnu/bsd/kern/syscalls.master
++++ b/xnu/bsd/kern/syscalls.master
+@@ -714,10 +714,10 @@
+ 481	AUE_NULL	ALL	{ int nosys(void); }
+ 482	AUE_NULL	ALL	{ int nosys(void); }
+ 483	AUE_NULL	ALL	{ int nosys(void); }
+-484	AUE_NULL	ALL	{ int nosys(void); }
+-485	AUE_NULL	ALL	{ int nosys(void); }
+-486	AUE_NULL	ALL	{ int nosys(void); }
+-487	AUE_NULL	ALL	{ int nosys(void); }
++484	AUE_OPEN_RWTC	ALL	{ int guarded_open_dprotected_np(user_addr_t path, user_addr_t guard, u_int guardflags, int flags, int dpclass, int dpflags, int mode) NO_SYSCALL_STUB; }
++485	AUE_WRITE	ALL	{ user_ssize_t guarded_write_np(int fd, user_addr_t guard, user_addr_t cbuf, user_size_t nbyte) NO_SYSCALL_STUB; }
++486	AUE_PWRITE	ALL	{ user_ssize_t guarded_pwrite_np(int fd, user_addr_t guard, user_addr_t buf, user_size_t nbyte, off_t offset) NO_SYSCALL_STUB; }
++487	AUE_WRITEV	ALL	{ user_ssize_t guarded_writev_np(int fd, user_addr_t guard, struct iovec *iovp, u_int iovcnt) NO_SYSCALL_STUB; }
+ 488	AUE_NULL	ALL	{ int nosys(void); }
+ 489	AUE_NULL	ALL	{ int nosys(void); }
+ 490	AUE_NULL	ALL	{ int nosys(void); }
+-- 
+2.43.0
+
