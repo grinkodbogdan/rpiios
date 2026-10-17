@@ -2,7 +2,8 @@
 """Save what a running iOS wrote to its root image, so later boots keep it.
 
 Usage: cow-harvest.py OVERLAY_ADDR TARGET [--gdb HOST:PORT] [--stop-at KADDR]
-                        [--monitor HMP_SOCKET] [--mark-clean] [--dry-run] [--resume]
+                        [--monitor HMP_SOCKET] [--sync FLAG_KADDR] [--mark-clean]
+                        [--dry-run] [--resume]
 
 The kernel mounts IOS7/ROOTFS.HFS read-only with a copy-on-write overlay in
 RAM, so every boot is a first boot: lsd rebuilds its app database, installd
@@ -21,9 +22,11 @@ page through the GDB stub and writes it into TARGET:
   - an SD card image: IOS7/ROOTFS.HFS is found in its FAT32 partition and
     the pages go through the file's cluster chain.
 
+--sync (the kernel's rpi3_harvest_sync) first has the kernel write out
+every filesystem's dirty metadata; without it the harvested volume is
+inconsistent (this kernel never syncs on its own) and iOS gets EIO.
 --mark-clean sets the volume's cleanly-unmounted bit, without which the
-kernel refuses the image as root (only do this after the guest has been
-idle long enough for its 30-second sync to have flushed metadata).
+kernel refuses the image as root (use it together with --sync).
 
 Copy TARGET first if you want to keep the pristine image. The guest is left
 stopped (--resume lets it run on); kill QEMU afterwards (the harvested state is what a clean shutdown
@@ -201,7 +204,7 @@ def main():
     for a in sys.argv[1:]:
         if skip:
             skip = False
-        elif a in ('--gdb', '--stop-at', '--monitor'):
+        elif a in ('--gdb', '--stop-at', '--monitor', '--sync'):
             skip = True
         elif not a.startswith('--'):
             args.append(a)
@@ -220,6 +223,23 @@ def main():
     g = Gdb(host, port)
     stop_at = int(opts[opts.index('--stop-at') + 1], 16) if '--stop-at' in opts else None
     g.settle(addr, stop_at)
+    if '--sync' in opts:
+        # Ask the kernel to write out every filesystem first (its watchdog
+        # thread polls rpi3_harvest_sync every 5 s and sets it to 2 when done).
+        import time
+        flag = int(opts[opts.index('--sync') + 1], 16)
+        g.cmd('M%x,4:01000000' % flag)
+        for _ in range(60):
+            g.s.sendall(b'$c#63')
+            time.sleep(3)
+            g.s.sendall(b'\x03')
+            g._read_packet()
+            g.settle(addr, stop_at)
+            if struct.unpack('<I', g.read(flag, 4))[0] == 2:
+                break
+        else:
+            raise SystemExit('cow-harvest: the kernel never finished syncing')
+        print('cow-harvest: guest filesystems synced')
     hdr = g.read(addr, 40)
     sectors, capacity, used, dirty, slots, arena, entries = struct.unpack_from('<QIIIIII', hdr, 0)
     print('cow-harvest: image %d sectors, %d of %d overlay pages used, %d hash slots'

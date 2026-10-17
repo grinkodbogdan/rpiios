@@ -1,0 +1,73 @@
+From 2e661a8eaa889d4922c99d124f74575adede443b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 21:37:49 +0000
+Subject: [PATCH] rpi3: sync every filesystem on request for a root harvest
+
+This kernel has no periodic sync, so HFS kept catalog and bitmap
+changes in the buffer cache indefinitely and a harvested overlay held
+an inconsistent volume (iOS then got EIO from it). The watchdog thread
+now writes everything out when tools/cow-harvest.py sets
+rpi3_harvest_sync through the GDB stub, and reports back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/bsd/vfs/vfs_syscalls.c | 11 +++++++++++
+ xnu/osfmk/arm/trap.c       | 19 +++++++++++++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/xnu/bsd/vfs/vfs_syscalls.c b/xnu/bsd/vfs/vfs_syscalls.c
+index 0882469..2c7d62c 100644
+--- a/xnu/bsd/vfs/vfs_syscalls.c
++++ b/xnu/bsd/vfs/vfs_syscalls.c
+@@ -2041,6 +2041,17 @@ sync_callback(mount_t mp, void * arg)
+ 
+ clock_sec_t sync_wait_time = 0;
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++volatile int rpi3_harvest_sync;
++
++/* Write out every writable filesystem's dirty data and metadata, waiting. */
++void
++rpi3_sync_all(void)
++{
++	vfs_iterate(0, sync_callback, (void *)1);
++}
++#endif
++
+ /* ARGSUSED */
+ int
+ sync(__unused proc_t p, __unused struct sync_args *uap, __unused int32_t *retval)
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index 8fe6e91..17b9122 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -407,6 +407,25 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+         task_t task;
+         assert_wait_timeout((event_t) &rpi3_watchdog_event, THREAD_UNINT, 5, NSEC_PER_SEC);
+         thread_block(THREAD_CONTINUE_NULL);
++        {
++            /*
++             * tools/cow-harvest.py sets this to 1 through the GDB stub and
++             * waits for 2: every filesystem's dirty metadata written out,
++             * so the root overlay holds a consistent volume. (This kernel
++             * has no periodic sync; HFS keeps catalog and bitmap changes
++             * in the buffer cache indefinitely.)
++             */
++            extern volatile int rpi3_harvest_sync;
++            extern void rpi3_sync_all(void);
++
++            if (rpi3_harvest_sync == 1) {
++                kprintf("rpi3: syncing filesystems for a harvest\n");
++                rpi3_sync_all();
++                rpi3_sync_all();
++                rpi3_harvest_sync = 2;
++                kprintf("rpi3: filesystems synced\n");
++            }
++        }
+         printf("WD %u: sd reads=%u (%u KB) errors=%u busy=%u ms\n", round, rpi3_sd_stat_reads,
+                rpi3_sd_stat_reads / 2, rpi3_sd_stat_errors, (uint32_t) (rpi3_sd_stat_us / 1000));
+         printf(" sd cmd18=%u fail=%u (r=%d blk=%u irq=%08x st=%08x)\n", rpi3_sd_stat_commands,
+-- 
+2.43.0
+
