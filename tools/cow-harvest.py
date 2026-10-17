@@ -2,7 +2,7 @@
 """Save what a running iOS wrote to its root image, so later boots keep it.
 
 Usage: cow-harvest.py OVERLAY_ADDR TARGET [--gdb HOST:PORT] [--stop-at KADDR]
-                        [--monitor HMP_SOCKET] [--dry-run] [--resume]
+                        [--monitor HMP_SOCKET] [--mark-clean] [--dry-run] [--resume]
 
 The kernel mounts IOS7/ROOTFS.HFS read-only with a copy-on-write overlay in
 RAM, so every boot is a first boot: lsd rebuilds its app database, installd
@@ -20,6 +20,10 @@ page through the GDB stub and writes it into TARGET:
   - an HFS image (rootfs.hfs): pages go at their file offsets;
   - an SD card image: IOS7/ROOTFS.HFS is found in its FAT32 partition and
     the pages go through the file's cluster chain.
+
+--mark-clean sets the volume's cleanly-unmounted bit, without which the
+kernel refuses the image as root (only do this after the guest has been
+idle long enough for its 30-second sync to have flushed metadata).
 
 Copy TARGET first if you want to keep the pristine image. The guest is left
 stopped (--resume lets it run on); kill QEMU afterwards (the harvested state is what a clean shutdown
@@ -265,6 +269,15 @@ def main():
                 f.write(data[k:k + step])
             if n % 1000 == 999:
                 print('cow-harvest: %d/%d' % (n + 1, len(pages)))
+        if '--mark-clean' in opts:
+            # The kernel only mounts a root image marked cleanly unmounted
+            # (kHFSVolumeUnmountedBit); a snapshot of a mounted volume isn't.
+            for off in (1024, sectors * 512 - 1024):
+                f.seek(where(off) + 4)
+                attrs = struct.unpack('>I', f.read(4))[0]
+                f.seek(where(off) + 4)
+                f.write(struct.pack('>I', attrs | 0x100))
+            print('cow-harvest: volume marked cleanly unmounted')
     print('cow-harvest: wrote %d pages into %s' % (len(pages), target))
     if resume:
         g.resume(monitor)
