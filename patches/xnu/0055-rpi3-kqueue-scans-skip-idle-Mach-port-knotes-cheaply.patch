@@ -1,0 +1,81 @@
+From e9c5d9389912b6c9994d45e25c30b2535c67f102 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 13:48:37 +0000
+Subject: [PATCH] rpi3: kqueue scans skip idle Mach port knotes cheaply
+
+iOS 10 processes watch many individual ports as stay-queued knotes
+(launchd ~550); every scan re-validated each with a port lookup and a
+receive attempt, making launchd and others crawl under emulation.
+Ports that are alive with no message waiting are now skipped after a
+peek.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .rpiios-patches           |  2 +-
+ xnu/bsd/kern/kern_event.c | 22 ++++++++++++++++++++++
+ xnu/osfmk/ipc/ipc_pset.c  | 11 +++++++++++
+ 3 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/.rpiios-patches b/.rpiios-patches
+index 61072ad..58c8c10 100644
+--- a/.rpiios-patches
++++ b/.rpiios-patches
+@@ -1 +1 @@
+-bb9cb368e249099e
++c427ba6634d00576
+diff --git a/xnu/bsd/kern/kern_event.c b/xnu/bsd/kern/kern_event.c
+index f8ec9cc..bd20ddb 100644
+--- a/xnu/bsd/kern/kern_event.c
++++ b/xnu/bsd/kern/kern_event.c
+@@ -2069,6 +2069,28 @@ knote_process(struct knote 	*kn,
+ 	int result;
+ 	int error;
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++	/*
++	 * iOS 10 watches hundreds of individual Mach ports (launchd: ~550)
++	 * as stay-queued knotes, and every scan used to re-validate each one
++	 * (a port lookup plus a receive attempt). Skip, cheaply, the ports
++	 * that are alive and have no message waiting.
++	 */
++	{
++		extern int rpi3_machport_idle(struct knote *kn);
++
++		if (kn->kn_kevent.filter == EVFILT_MACHPORT &&
++		    (kn->kn_status & (KN_STAYQUEUED | KN_DISABLED)) == KN_STAYQUEUED &&
++		    rpi3_machport_idle(kn)) {
++			assert(kn->kn_tq == &kq->kq_head);
++			TAILQ_REMOVE(&kq->kq_head, kn, kn_tqe);
++			kn->kn_tq = inprocessp;
++			TAILQ_INSERT_TAIL(inprocessp, kn, kn_tqe);
++			return EJUSTRETURN;
++		}
++	}
++#endif
++
+ 	/*
+ 	 * Determine the kevent state we want to return.
+ 	 *
+diff --git a/xnu/osfmk/ipc/ipc_pset.c b/xnu/osfmk/ipc/ipc_pset.c
+index 6dca05b..6ff62bf 100644
+--- a/xnu/osfmk/ipc/ipc_pset.c
++++ b/xnu/osfmk/ipc/ipc_pset.c
+@@ -626,3 +626,14 @@ filt_machportpeek(struct knote *kn)
+ {
+ 	return (ipc_mqueue_peek(filt_machport_mqueue(kn)));
+ }
++
++/* kqueue scan shortcut: the port (set) is alive and has no message waiting */
++int
++rpi3_machport_idle(struct knote *kn)
++{
++	ipc_object_t object = (ipc_object_t)kn->kn_ptr.p_pset;
++
++	if (object == IO_NULL || !io_active(object))
++		return 0;
++	return ipc_mqueue_peek(filt_machport_mqueue(kn)) == 0;
++}
+-- 
+2.43.0
+
