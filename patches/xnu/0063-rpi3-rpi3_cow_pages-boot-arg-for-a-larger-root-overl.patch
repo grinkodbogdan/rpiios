@@ -1,0 +1,63 @@
+From e935e5ad149dfbb760ce4af765707d40bbb45cf5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 17 Oct 2026 19:09:47 +0000
+Subject: [PATCH] rpi3: rpi3_cow_pages boot-arg for a larger root overlay
+
+iOS 10's first boot writes far more than the default overlay budget
+(mobileassetd alone unpacks ~30 MB of preinstalled assets), and once
+the overlay is full every write fails: databases break and daemons
+drop connections. rpi3_cow_pages=N raises the budget for a setup boot
+whose writes tools/cow-harvest.py then saves into the image.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .../ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp   | 25 +++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
+index e320d68..ca9f19e 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7LeoHFSFile.cpp
+@@ -213,6 +213,23 @@ bool IOS7LeoHFSFile::initializeCow()
+                    (UInt32)((sizeof(*this)+4095U)>>12)+3U;
+  UInt32 cap=leo_cow_budget_pages(managed,freePages,reserved,target,fixedPages),slots=1;
+  if(cap>image.image_sectors>>3)cap=(UInt32)(image.image_sectors>>3);
++#if BOARD_CONFIG_RASPBERRYPI3
++ {
++  /* rpi3_cow_pages=N: a larger overlay for a setup boot. iOS 10's first
++   * boot writes far more than the default budget (mobileassetd unpacks
++   * ~30 MB of preinstalled assets); once the overlay is full every write
++   * fails. Leaves 96 MB plus the pageout reserve to the system. */
++  UInt32 want=0;
++  if(PE_parse_boot_argn("rpi3_cow_pages",&want,sizeof(want))&&want>cap){
++   UInt32 keep=reserved+target+24576U+fixedPages,room;
++   room=freePages>keep?freePages-keep:0;
++   room=room>16U?room-(room>>9)-16U:0; /* hash and pending tables */
++   if(want>room)want=room;
++   if(want>image.image_sectors>>3)want=(UInt32)(image.image_sectors>>3);
++   if(want>cap)cap=want;
++  }
++ }
++#endif
+  IOLog("Leo COW budget: managed=%llu free=%u reserve=%u target=%u cap=%u pages\n",(unsigned long long)managed,(unsigned)freePages,(unsigned)reserved,(unsigned)target,(unsigned)cap);
+  IOLog("Leo COW total charge=%llu pages fixed/work=%u\n",(unsigned long long)leo_cow_total_pages(cap,fixedPages),(unsigned)fixedPages);
+  if(!cap)return false;
+@@ -223,6 +240,14 @@ bool IOS7LeoHFSFile::initializeCow()
+  /* Payload is bounded/reserved before publication; I/O never allocates under
+   * this device's mutex or requires root-pageout to free new payload memory. */
+  uint64_t guard=(managed>>2)+(uint64_t)vm_page_free_reserved+vm_page_free_target;
++#if BOARD_CONFIG_RASPBERRYPI3
++ {
++  UInt32 want=0;
++  if(PE_parse_boot_argn("rpi3_cow_pages",&want,sizeof(want))&&want)
++   guard=(uint64_t)vm_page_free_reserved+vm_page_free_target+24576U;
++ }
++ kprintf("rpi3: cow overlay budget %u pages (free %u, managed %llu)\n",(unsigned)cap,(unsigned)vm_page_free_count,(unsigned long long)managed);
++#endif
+  if((uint64_t)vm_page_free_count<guard)return false;
+  if(leo_cow_init(&cow,image.image_sectors,cap,slots,cowArena,cowEntries,cowPending,this,readCowBase)!=LEO_COW_OK)return false;
+  cowReady=true;
+-- 
+2.43.0
+

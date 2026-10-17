@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Save what a running iOS wrote to its root image, so later boots keep it.
 
-Usage: cow-harvest.py OVERLAY_ADDR TARGET [--gdb HOST:PORT] [--dry-run] [--resume]
+Usage: cow-harvest.py OVERLAY_ADDR TARGET [--gdb HOST:PORT] [--stop-at KADDR]
+                        [--monitor HMP_SOCKET] [--dry-run] [--resume]
 
 The kernel mounts IOS7/ROOTFS.HFS read-only with a copy-on-write overlay in
 RAM, so every boot is a first boot: lsd rebuilds its app database, installd
@@ -11,7 +12,9 @@ that is most of the boot time.
 Boot once with the kernel's -gdb stub enabled (run10.sh passes
 -gdb tcp::1234), wait until the system is idle (SpringBoard up, a minute
 for the buffer cache to sync), then run this with the address the kernel
-logged as "rpi3: cow overlay 0x...". It stops the guest, reads every overlay
+logged as "rpi3: cow overlay 0x...". --monitor (QEMU's -monitor unix socket)
+makes it read the overlay in one memsave instead of GDB packets, which
+is much faster. It stops the guest, reads every overlay
 page through the GDB stub and writes it into TARGET:
 
   - an HFS image (rootfs.hfs): pages go at their file offsets;
@@ -59,6 +62,24 @@ class Gdb:
             if not reply.startswith((b'O', b'T', b'S')) or text == '?':
                 return reply
 
+    def settle(self, addr, stop_at=None):
+        """Stop the guest in privileged mode: QEMU's debug reads use the
+        current mode, and kernel pages are not readable from user mode."""
+        if not self.cmd('m%x,4' % addr).startswith(b'E'):
+            return
+        if stop_at is None:
+            raise SystemExit('cow-harvest: guest stopped in user mode; pass --stop-at '
+                             'with the address of a busy kernel function '
+                             '(thread_block_reason from the kernel\'s symbols)')
+        self.cmd('Z1,%x,2' % stop_at)
+        for _ in range(20):
+            self.s.sendall(b'$c#63')
+            self._read_packet()  # waits for the breakpoint's stop notice
+            if not self.cmd('m%x,4' % addr).startswith(b'E'):
+                self.cmd('z1,%x,2' % stop_at)
+                return
+        raise SystemExit('cow-harvest: kernel memory at %#x never readable' % addr)
+
     def read(self, addr, n):
         out = bytearray()
         while n:
@@ -70,6 +91,37 @@ class Gdb:
             addr += k
             n -= k
         return bytes(out)
+
+
+def memsave(sock_path, addr, n):
+    """Read guest virtual memory in one go through QEMU's HMP monitor (the
+    guest must already be stopped in privileged mode, see Gdb.settle)."""
+    import os
+    import tempfile
+    import time
+    fd, tmp = tempfile.mkstemp(prefix='cow-harvest-')
+    os.close(fd)
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sock_path)
+    s.sendall(b'memsave 0x%x %d "%s"\n' % (addr, n, tmp.encode()))
+    s.sendall(b'info version\n')
+    out = b''
+    while out.count(b'(qemu)') < 3:  # banner prompt, memsave, info version
+        data = s.recv(65536)
+        if not data:
+            break
+        out += data
+    s.close()
+    for _ in range(100):
+        if os.path.getsize(tmp) == n:
+            break
+        time.sleep(0.1)
+    data = open(tmp, 'rb').read()
+    os.unlink(tmp)
+    if len(data) != n:
+        raise SystemExit('cow-harvest: memsave of %#x returned %d of %d bytes: %s'
+                         % (addr, len(data), n, out.decode(errors='replace')[-1500:]))
+    return data
 
 
 def fat_file_map(f, path=('IOS7', 'ROOTFS  HFS')):
@@ -121,7 +173,15 @@ def fat_file_map(f, path=('IOS7', 'ROOTFS  HFS')):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    args = []
+    skip = False
+    for a in sys.argv[1:]:
+        if skip:
+            skip = False
+        elif a in ('--gdb', '--stop-at', '--monitor'):
+            skip = True
+        elif not a.startswith('--'):
+            args.append(a)
     opts = sys.argv[1:]
     if len(args) < 2:
         sys.exit(__doc__)
@@ -135,11 +195,17 @@ def main():
     resume = '--resume' in opts
 
     g = Gdb(host, port)
+    stop_at = int(opts[opts.index('--stop-at') + 1], 16) if '--stop-at' in opts else None
+    g.settle(addr, stop_at)
     hdr = g.read(addr, 40)
     sectors, capacity, used, dirty, slots, arena, entries = struct.unpack_from('<QIIIIII', hdr, 0)
     print('cow-harvest: image %d sectors, %d of %d overlay pages used, %d hash slots'
           % (sectors, used, capacity, slots))
-    table = g.read(entries, slots * 12)
+    monitor = opts[opts.index('--monitor') + 1] if '--monitor' in opts else None
+    if monitor:
+        table = memsave(monitor, entries, slots * 12)
+    else:
+        table = g.read(entries, slots * 12)
     pages = []
     for i in range(slots):
         page, slot, flags = struct.unpack_from('<III', table, i * 12)
@@ -169,8 +235,12 @@ def main():
 
             def where(off):
                 return off
+        blob = memsave(monitor, arena, capacity * PAGE) if monitor else None
         for n, (page, slot) in enumerate(pages):
-            data = g.read(arena + slot * PAGE, PAGE)
+            if blob is not None:
+                data = blob[slot * PAGE:(slot + 1) * PAGE]
+            else:
+                data = g.read(arena + slot * PAGE, PAGE)
             for k in range(0, PAGE, step):  # a page may span clusters
                 f.seek(where(page * PAGE + k))
                 f.write(data[k:k + step])
