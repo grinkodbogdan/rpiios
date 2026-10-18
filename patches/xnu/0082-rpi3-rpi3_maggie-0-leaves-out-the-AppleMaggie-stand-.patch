@@ -1,0 +1,38 @@
+From 741b60c129832fec7306796c1ecde6ef5c188e46 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 13:01:52 +0000
+Subject: [PATCH] rpi3: rpi3_maggie=0 leaves out the AppleMaggie stand-in
+
+With the iPhone 5 identity, backboardd takes the Taptic home-button path
+when AppleMaggie exists and waits for haptics that never load.
+---
+ .../KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+index 24a2fc2..b461cb6 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+@@ -15,6 +15,7 @@
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
++#include <pexpert/pexpert.h>
+ extern "C" int proc_selfpid(void);
+ 
+ class AppleDiagnosticDataAccess : public IOService {
+@@ -197,7 +198,10 @@ void AppleMaggieUserClient::free(void)
+ 
+ extern "C" void rpi3_register_diagdata(IOService *platform)
+ {
+-    rpi3_publish(new AppleMaggie, platform);
++    int maggie = 1;
++    PE_parse_boot_argn("rpi3_maggie", &maggie, sizeof(maggie));
++    if (maggie)
++        rpi3_publish(new AppleMaggie, platform);
+     rpi3_publish(new AppleDiagnosticDataAccess, platform);
+     rpi3_publish(new AppleDiagnosticDataAccessReadOnly, platform);
+     IOLog("Rpi3 AppleDiagnosticDataAccess stand-ins published (no factory data)\n");
+-- 
+2.43.0
+
