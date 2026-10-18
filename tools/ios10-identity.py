@@ -110,6 +110,18 @@ def encode(node):
     return out
 
 
+# Links into the iPhone's own tree: its phandles can clash with the Pi's,
+# and the kernel maps interrupts against controllers the Pi does not have
+# (a kernel data abort in IODTMapInterrupts). iOS reads only the rest.
+DROPPED = ('AAPL,phandle', 'interrupt-parent', 'interrupts')
+
+
+def portable(node):
+    props, children = node
+    return ([(n, v) for n, v in props if n not in DROPPED],
+            [portable(c) for c in children])
+
+
 def name_of(node):
     return dict(node[0]).get('name', b'').rstrip(b'\0').decode()
 
@@ -126,6 +138,7 @@ def main():
         node = next((c for c in root[1] if name_of(c) == want), None)
         if node is None:
             sys.exit('ios10-identity: no /%s node' % want)
+        node = portable(node)
         # Shipped under a neutral name; the kernel renames it for iOS 10 only.
         props = [(n, b'rpi3-ios10-' + want.encode() + b'\0' if n == 'name' else v)
                  for n, v in node[0]]
