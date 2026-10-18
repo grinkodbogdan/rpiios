@@ -1,0 +1,46 @@
+From d9404367373a02603aedad1fb467edfbe2c18d13 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 01:09:00 +0000
+Subject: [PATCH] rpi3: sandbox_check answers 'allowed' in its result word
+
+libsystem_sandbox reads the check verdict from a 64-bit word the
+argument block points to (nonzero = denied); the stub returned success
+without writing it, so callers saw stack garbage and cfprefsd refused
+preference reads that need user-preference-read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/security/mac_base.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/xnu/security/mac_base.c b/xnu/security/mac_base.c
+index 15cfd14..c9714d7 100644
+--- a/xnu/security/mac_base.c
++++ b/xnu/security/mac_base.c
+@@ -2136,8 +2136,21 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
+ 	{
+ 		extern int rpi3_ios10_layout;
+ 
+-		if (rpi3_ios10_layout && uap->call == 2 && strcmp(target, "Sandbox") == 0)
++		if (rpi3_ios10_layout && uap->call == 2 && strcmp(target, "Sandbox") == 0) {
++			/*
++			 * The argument block starts with a 64-bit pointer to the
++			 * verdict, which libsystem_sandbox reads after a successful
++			 * call (nonzero = denied). Leaving it unwritten gave
++			 * callers stack garbage: cfprefsd refused preference reads
++			 * ("requires user-preference-read sandbox access").
++			 */
++			uint64_t result_addr = 0, verdict = 0;
++
++			if (copyin(uap->arg, &result_addr, sizeof(result_addr)) == 0 &&
++			    result_addr != 0)
++				(void)copyout(&verdict, (user_addr_t)result_addr, sizeof(verdict));
+ 			return (0);
++		}
+ 		/*
+ 		 * sandbox_init(): call 22 asks whether a named profile is
+ 		 * built in, then call 1 applies it (call 0 applies a compiled
+-- 
+2.43.0
+
