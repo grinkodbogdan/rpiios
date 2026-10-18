@@ -1,0 +1,65 @@
+From eb0c894c736790234daff8dd7f2e40fc38e45a5a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 09:49:59 +0000
+Subject: [PATCH] rpi3: hang the Wi-Fi stand-in under a wlan node with
+ local-mac-address
+
+MobileGestalt takes the Wi-Fi address from an IONetworkController's
+ancestor named sdio or wlan (the device-tree node on an iPhone),
+property local-mac-address, and waits until it finds one; lockdownd
+waited on it forever.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .../ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp | 28 +++++++++++++------
+ 1 file changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+index 9b84c58..b42d7db 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+@@ -107,20 +107,32 @@ extern "C" void rpi3_register_diagdata(IOService *platform)
+     rpi3_publish(new AppleDiagnosticDataAccessReadOnly, platform);
+     IOLog("Rpi3 AppleDiagnosticDataAccess stand-ins published (no factory data)\n");
+ 
++    /*
++     * MobileGestalt takes the Wi-Fi address from the controller's
++     * ancestor named "wlan" (the device-tree node on an iPhone), property
++     * local-mac-address, and keeps waiting until one has it.
++     */
++    /* locally administered, so it can never clash with a real card */
++    static const UInt8 mac[6] = { 0x02, 0x52, 0x50, 0x49, 0x33, 0x01 };
++    IOService *wlan = new IOService;
+     IONetworkController *wifi = new IONetworkController;
+-    if (wifi && wifi->init()) {
+-        /* locally administered, so it can never clash with a real card */
+-        static const UInt8 mac[6] = { 0x02, 0x52, 0x50, 0x49, 0x33, 0x01 };
++    if (wlan && wifi && wlan->init() && wifi->init()) {
++        wlan->setName("wlan");
++        wlan->setProperty("local-mac-address", (void *)mac, sizeof(mac));
+         wifi->setProperty("IONetworkRootType", "airport");
+         wifi->setProperty("IOMACAddress", (void *)mac, sizeof(mac));
+         wifi->setProperty("IOBuiltin", true);
+-        if (wifi->attach(platform)) {
+-            if (wifi->start(platform))
+-                wifi->registerService();
+-            else
+-                wifi->detach(platform);
++        if (wlan->attach(platform)) {
++            wlan->registerService();
++            if (wifi->attach(wlan)) {
++                if (wifi->start(wlan))
++                    wifi->registerService();
++                else
++                    wifi->detach(wlan);
++            }
+         }
+     }
+     if (wifi) wifi->release();
++    if (wlan) wlan->release();
+ }
+ #endif /* BOARD_CONFIG_RASPBERRYPI3 */
+-- 
+2.43.0
+
