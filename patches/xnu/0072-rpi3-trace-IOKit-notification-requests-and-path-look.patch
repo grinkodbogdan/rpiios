@@ -1,0 +1,43 @@
+From 4258130803fcb99e68a7418a8e527fa8b0e0bc47 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 05:51:28 +0000
+Subject: [PATCH] rpi3: trace IOKit notification requests and path lookups
+
+rpi3_dtlog now also logs the traced process' service notifications
+(what it waits to appear) and registry path lookups.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/iokit/Kernel/IOUserClient.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/xnu/iokit/Kernel/IOUserClient.cpp b/xnu/iokit/Kernel/IOUserClient.cpp
+index 953f991..e2a4094 100644
+--- a/xnu/iokit/Kernel/IOUserClient.cpp
++++ b/xnu/iokit/Kernel/IOUserClient.cpp
+@@ -1874,6 +1874,13 @@ static kern_return_t internal_io_service_add_notification(
+     if( master_port != master_device_port)
+         return( kIOReturnNotPrivileged);
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++    {
++        char what[64];
++        snprintf(what, sizeof(what), "add-notification %s", notification_type);
++        RPI3_IOKIT_NOTE(what, matching, 0);
++    }
++#endif
+     do {
+         err = kIOReturnNoResources;
+ 
+@@ -2231,6 +2238,7 @@ kern_return_t is_io_registry_entry_from_path(
+     entry = IORegistryEntry::fromPath( path );
+ 
+     *registry_entry = entry;
++    RPI3_IOKIT_NOTE("from-path", path, entry ? 0 : 1);
+ 
+     return( kIOReturnSuccess );
+ }
+-- 
+2.43.0
+
