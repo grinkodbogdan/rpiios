@@ -40,8 +40,17 @@ SERVICES = [b'com.apple.commcenter', b'com.apple.commcenter.xpc',
 MG_CACHE = ('/private/var/containers/Shared/SystemGroup/'
             'systemgroup.com.apple.mobilegestaltcache/Library/Caches/'
             'com.apple.MobileGestalt.plist')
-NO_CELLULAR = ['telephony', 'cellular-data', 'HasBaseband', 'CellularTelephonyCapability',
-               'sms', 'data-plan', 'CarrierInstallCapability']
+# Answers recorded in the cache: a device without cellular, and the
+# iPhone 5's mechanical home button. A cache without the latter can say
+# "haptic" (1): SpringBoard then sends haptic button definitions, which
+# backboardd queues behind a Taptic Engine that never reports ready, and
+# SpringBoard's check-in with backboardd never returns.
+MG_ANSWERS = {
+    'telephony': False, 'cellular-data': False, 'HasBaseband': False,
+    'CellularTelephonyCapability': False, 'sms': False, 'data-plan': False,
+    'CarrierInstallCapability': False,
+    'HomeButtonType': 0,
+}
 
 
 def mg_key(name):
@@ -52,15 +61,15 @@ def set_mg_answers(image, undo):
     data = hfs_put.read_file(image, MG_CACHE)
     cache = plistlib.loads(data)
     extra = cache.setdefault('CacheExtra', {})
-    for name in NO_CELLULAR:
+    for name, value in MG_ANSWERS.items():
         if undo:
             extra.pop(mg_key(name), None)
         else:
-            extra[mg_key(name)] = False
+            extra[mg_key(name)] = value
     new = plistlib.dumps(cache, fmt=plistlib.FMT_BINARY)
     hfs_put.write_file(image, MG_CACHE, new)
-    print('ios10-nocellular: MobileGestalt %s: %s'
-          % ('answers removed' if undo else 'answers no', ', '.join(NO_CELLULAR)))
+    print('ios10-nocellular: MobileGestalt answers %s: %s'
+          % ('removed' if undo else 'recorded', ', '.join(MG_ANSWERS)))
 
 
 def renamed(name):
