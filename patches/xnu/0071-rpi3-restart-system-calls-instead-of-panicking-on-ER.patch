@@ -1,0 +1,52 @@
+From a10db7632f0ce32731b3a321471e5acf4e5e1a68 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 02:06:05 +0000
+Subject: [PATCH] rpi3: restart system calls instead of panicking on ERESTART
+
+A call interrupted by a signal whose handler has SA_RESTART returns
+ERESTART; this port had only a panic for it (apsd hit it). Back the pc
+up over the svc (2 bytes in Thumb, 4 in ARM) so the call runs again
+after the handler, as XNU does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/bsd/dev/arm/unix_syscalls.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/xnu/bsd/dev/arm/unix_syscalls.c b/xnu/bsd/dev/arm/unix_syscalls.c
+index 6f73fec..1cbc49d 100644
+--- a/xnu/bsd/dev/arm/unix_syscalls.c
++++ b/xnu/bsd/dev/arm/unix_syscalls.c
+@@ -516,11 +516,16 @@ void unix_syscall(arm_saved_state_t * state)
+     mac_thread_userret(code, error, thread);
+ #endif
+ 
+-    if (error)
++    if (error && error != ERESTART)
+         state->cpsr |= (1 << 29);  /* C-bit IIRC, turn this into a Define */
+ 
+     if (error == ERESTART) {
+-        panic("unix_syscall: restarting syscall\n");
++        /*
++         * Interrupted by a signal whose handler asked for restart
++         * (SA_RESTART): back the pc up over the svc so the call runs
++         * again with its untouched arguments once the handler returns.
++         */
++        state->pc -= (state->cpsr & (1 << 5)) ? 2 : 4;
+     } else if(error != EJUSTRETURN) {
+         if(error) {
+             state->r[0] = error;
+@@ -604,7 +609,8 @@ void unix_syscall_return(int error)
+     AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+ 
+     if (error == ERESTART) {
+-        panic("unix_syscall: restarting syscall\n");
++        /* as in unix_syscall: rerun the call after the signal handler */
++        state->pc -= (state->cpsr & (1 << 5)) ? 2 : 4;
+     } else if(error != EJUSTRETURN) {
+         if(error) {
+             state->r[0] = error;
+-- 
+2.43.0
+
