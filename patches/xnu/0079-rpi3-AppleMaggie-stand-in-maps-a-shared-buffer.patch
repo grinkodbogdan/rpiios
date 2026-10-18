@@ -1,0 +1,82 @@
+From 8d4bbdd3d619c104b884823e62c564d3133bd355 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 11:22:59 +0000
+Subject: [PATCH] rpi3: AppleMaggie stand-in maps a shared buffer
+
+The Haptics loader maps the user client's memory (IOConnectMapMemory)
+before it reports the haptic engine available; without it the loader
+gave up silently and backboardd's button controller kept waiting.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .../ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp | 28 +++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+index dc3ead0..24a2fc2 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+@@ -14,6 +14,7 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ extern "C" int proc_selfpid(void);
+ 
+ class AppleDiagnosticDataAccess : public IOService {
+@@ -118,11 +119,16 @@ public:
+ 
+ class AppleMaggieUserClient : public IOUserClient {
+     OSDeclareDefaultStructors(AppleMaggieUserClient)
++    IOBufferMemoryDescriptor *shared;
+ public:
+     virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+                                     IOExternalMethodDispatch *dispatch, OSObject *target,
+                                     void *reference);
++    /* the Haptics loader maps this before it reports the engine available */
++    virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
++                                         IOMemoryDescriptor **memory);
+     virtual IOReturn clientClose(void);
++    virtual void free(void);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleMaggie, IOService)
+@@ -161,12 +167,34 @@ IOReturn AppleMaggieUserClient::externalMethod(uint32_t selector, IOExternalMeth
+     return kIOReturnSuccess;
+ }
+ 
++IOReturn AppleMaggieUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
++                                                    IOMemoryDescriptor **memory)
++{
++    if (!memory) return kIOReturnBadArgument;
++    if (!shared) {
++        shared = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut, 64 * 1024, PAGE_SIZE);
++        if (!shared) return kIOReturnNoMemory;
++        bzero(shared->getBytesNoCopy(), shared->getLength());
++    }
++    shared->retain();
++    *memory = shared;
++    if (options) *options = 0;
++    (void)type;
++    return kIOReturnSuccess;
++}
++
+ IOReturn AppleMaggieUserClient::clientClose(void)
+ {
+     terminate();
+     return kIOReturnSuccess;
+ }
+ 
++void AppleMaggieUserClient::free(void)
++{
++    if (shared) { shared->release(); shared = 0; }
++    IOUserClient::free();
++}
++
+ extern "C" void rpi3_register_diagdata(IOService *platform)
+ {
+     rpi3_publish(new AppleMaggie, platform);
+-- 
+2.43.0
+
