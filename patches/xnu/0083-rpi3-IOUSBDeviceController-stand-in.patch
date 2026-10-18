@@ -1,0 +1,47 @@
+From 0388c43f260bfe33cecab3af3188818c25ab3e87 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 16:21:34 +0000
+Subject: [PATCH] rpi3: IOUSBDeviceController stand-in
+
+lockdownd sets up USB device mode before answering its clients, and
+IOUSBDeviceControllerCreate waits 30 s for the controller on every call;
+SpringBoard's lockdown queries never returned.
+---
+ .../ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp      | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+index b461cb6..24db012 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+@@ -196,6 +196,19 @@ void AppleMaggieUserClient::free(void)
+     IOUserClient::free();
+ }
+ 
++/*
++ * lockdownd sets up the iPhone's USB device mode (the cable to a
++ * computer) before it answers its clients, and IOKit's
++ * IOUSBDeviceControllerCreate waits 30 s for the controller each time;
++ * lockdownd keeps asking, so SpringBoard's lockdown queries never return.
++ * The Pi has no device-mode port for iOS to drive: a controller-shaped
++ * service with nothing behind it lets lockdownd move on.
++ */
++class IOUSBDeviceController : public IOService {
++    OSDeclareDefaultStructors(IOUSBDeviceController)
++};
++OSDefineMetaClassAndStructors(IOUSBDeviceController, IOService)
++
+ extern "C" void rpi3_register_diagdata(IOService *platform)
+ {
+     int maggie = 1;
+@@ -204,6 +217,7 @@ extern "C" void rpi3_register_diagdata(IOService *platform)
+         rpi3_publish(new AppleMaggie, platform);
+     rpi3_publish(new AppleDiagnosticDataAccess, platform);
+     rpi3_publish(new AppleDiagnosticDataAccessReadOnly, platform);
++    rpi3_publish(new IOUSBDeviceController, platform);
+     IOLog("Rpi3 AppleDiagnosticDataAccess stand-ins published (no factory data)\n");
+ 
+     /*
+-- 
+2.43.0
+
