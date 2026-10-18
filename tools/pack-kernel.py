@@ -71,7 +71,7 @@ def dt_node(props, children=()):
     return out
 
 
-def build_device_tree():
+def build_device_tree(extra_children=()):
     marker = b"RPI3HANDOFF-SLOT" * 8      # 128 bytes, located after building
     cpu = dt_node([("name", "cpu"), ("device_type", "cpu"),
                    ("compatible", "arm,cortex-a53"), ("reg", struct.pack("<I", 0))])
@@ -82,7 +82,7 @@ def build_device_tree():
                       ("ios7leo-fast-console", struct.pack("<I", 0))])
     root = dt_node([("name", "device-tree"), ("model", "Raspberry Pi 3 Model B+"),
                     ("compatible", b"brcm,bcm2837\0raspberrypi,3-model-b-plus\0")],
-                   [chosen, cpus])
+                   [chosen, cpus] + list(extra_children))
     at = root.find(marker)
     assert at > 0 and root.count(marker) == 1
     return root.replace(marker, b"\0" * 128), at
@@ -95,6 +95,8 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--cmdline", default=DEFAULT_CMDLINE)
     ap.add_argument("--describe", action="store_true", help="print the Mach-O layout and exit")
+    ap.add_argument("--product", help="flattened /product node from tools/ios10-identity.py; "
+                    "the kernel shows it to iOS 10 only")
     a = ap.parse_args()
 
     kernel = open(a.kernel, "rb").read()
@@ -115,7 +117,7 @@ def main():
     if len(cmdline) > 255:
         sys.exit("cmdline too long")
 
-    dt, handoff_at = build_device_tree()
+    dt, handoff_at = build_device_tree([open(a.product, "rb").read()] if a.product else [])
     kernel_offset = (HEADER_BYTES + 0xFFF) & ~0xFFF
     dt_offset = (kernel_offset + len(kernel) + 0xF) & ~0xF
     total = dt_offset + len(dt)

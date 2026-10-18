@@ -1,0 +1,54 @@
+From a35d40cd8807951e7385754326da2f0900ff721b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 12:14:03 +0000
+Subject: [PATCH] rpi3: show the iPhone 5's /product node to iOS 10
+
+iOS 10's MobileGestalt identifies the device from /product (a 20-byte
+product-id looked up in its device table, product name, idiom, artwork
+scale, feature subnodes). The Pi's tree had none: CommCenter crashed on
+an unknown hardware model, and backboardd and MobileGestalt waited for
+iPhone 7 hardware. pack-kernel.py --product adds the node extracted
+from Apple's N41 device tree as rpi3-ios10-product; the kernel renames
+it to product when the iOS 10 userland is found (iOS 7 never sees it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/iokit/Kernel/IOPlatformExpert.cpp | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/xnu/iokit/Kernel/IOPlatformExpert.cpp b/xnu/iokit/Kernel/IOPlatformExpert.cpp
+index e2ae15d..cf6cd37 100644
+--- a/xnu/iokit/Kernel/IOPlatformExpert.cpp
++++ b/xnu/iokit/Kernel/IOPlatformExpert.cpp
+@@ -785,6 +785,27 @@ void rpi3_ios10_device_identity(void)
+ 	}
+ 	chosen->release();
+     }
++    /*
++     * The iPhone 5's own /product node (product-id, idiom, artwork scale,
++     * feature subnodes: tools/ios10-identity.py, packed by pack-kernel.py
++     * --product) ships as rpi3-ios10-product so iOS 7 never sees it.
++     * MobileGestalt identifies the device from it; without it CommCenter
++     * crashed on an unknown hardware model and backboardd waited for
++     * iPhone 7 haptics.
++     */
++    IORegistryEntry * product = IORegistryEntry::fromPath("/rpi3-ios10-product", gIODTPlane);
++    if (product) {
++	static const char pname[] = "product";
++
++	product->setName(pname);
++	product->setName(pname, gIODTPlane);
++	if ((data = OSData::withBytes(pname, sizeof(pname)))) {
++	    product->setProperty("name", data);
++	    data->release();
++	}
++	product->release();
++	IOLog("rpi3: /product (iPhone 5) shown to iOS 10\n");
++    }
+     IOLog("rpi3: device identity iPhone5,1 (N41AP) for iOS 10\n");
+ }
+ #endif
+-- 
+2.43.0
+
