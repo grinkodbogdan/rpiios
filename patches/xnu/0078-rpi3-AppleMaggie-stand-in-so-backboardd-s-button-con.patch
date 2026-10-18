@@ -1,0 +1,102 @@
+From f046844bb10dbf34c8aaec7ce96b2514991d6703 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 10:35:37 +0000
+Subject: [PATCH] rpi3: AppleMaggie stand-in so backboardd's button controller
+ gets ready
+
+SpringBoard's check-in waits on backboardd applying button definitions,
+which waits for ButtonResolver, which waits for the Haptics loader to
+see AppleMaggie (the Taptic Engine driver of later phones) appear. An
+iPhone 5 never takes that path, but without a device identity iOS
+cannot tell. Publish an AppleMaggie whose user client accepts every
+request with zeroed outputs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .../ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp | 67 +++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+index b42d7db..dc3ead0 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+@@ -101,8 +101,75 @@ class IONetworkController : public IOService {
+ };
+ OSDefineMetaClassAndStructors(IONetworkController, IOService)
+ 
++/*
++ * backboardd's button controller waits for ButtonResolver to be ready,
++ * which waits for Haptics' loader to see AppleMaggie (the Taptic Engine
++ * driver of later phones) appear; SpringBoard's check-in waits on all of
++ * it. An iPhone 5 never takes that path, but without a device identity
++ * iOS cannot tell. A stand-in whose user client accepts every request
++ * (zeroed outputs, no haptics behind it) ends the wait.
++ */
++class AppleMaggie : public IOService {
++    OSDeclareDefaultStructors(AppleMaggie)
++public:
++    virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++                                   OSDictionary *properties, IOUserClient **handler);
++};
++
++class AppleMaggieUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(AppleMaggieUserClient)
++public:
++    virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++                                    IOExternalMethodDispatch *dispatch, OSObject *target,
++                                    void *reference);
++    virtual IOReturn clientClose(void);
++};
++
++OSDefineMetaClassAndStructors(AppleMaggie, IOService)
++OSDefineMetaClassAndStructors(AppleMaggieUserClient, IOUserClient)
++
++IOReturn AppleMaggie::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++                                    OSDictionary *properties, IOUserClient **handler)
++{
++    if (!handler) return kIOReturnBadArgument;
++    *handler = 0;
++    AppleMaggieUserClient *client = new AppleMaggieUserClient;
++    if (!client) return kIOReturnNoMemory;
++    if (!client->initWithTask(owningTask, securityID, type, properties)) {
++        client->release(); return kIOReturnNoMemory;
++    }
++    if (!client->attach(this)) { client->release(); return kIOReturnError; }
++    if (!client->start(this)) { client->detach(this); client->release(); return kIOReturnError; }
++    *handler = client;
++    return kIOReturnSuccess;
++}
++
++IOReturn AppleMaggieUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++                                               IOExternalMethodDispatch *, OSObject *, void *)
++{
++    static unsigned logs;
++    uint32_t i;
++    if (!args) return kIOReturnBadArgument;
++    if (logs < 16) {
++        ++logs;
++        IOLog("Rpi3 AppleMaggie pid=%d selector=%u (no haptics)\n", proc_selfpid(), selector);
++    }
++    for (i = 0; i < args->scalarOutputCount; i++) args->scalarOutput[i] = 0;
++    if (args->structureOutput && args->structureOutputSize)
++        bzero(args->structureOutput, args->structureOutputSize);
++    if (args->structureOutputDescriptor) args->structureOutputDescriptorSize = 0;
++    return kIOReturnSuccess;
++}
++
++IOReturn AppleMaggieUserClient::clientClose(void)
++{
++    terminate();
++    return kIOReturnSuccess;
++}
++
+ extern "C" void rpi3_register_diagdata(IOService *platform)
+ {
++    rpi3_publish(new AppleMaggie, platform);
+     rpi3_publish(new AppleDiagnosticDataAccess, platform);
+     rpi3_publish(new AppleDiagnosticDataAccessReadOnly, platform);
+     IOLog("Rpi3 AppleDiagnosticDataAccess stand-ins published (no factory data)\n");
+-- 
+2.43.0
+
