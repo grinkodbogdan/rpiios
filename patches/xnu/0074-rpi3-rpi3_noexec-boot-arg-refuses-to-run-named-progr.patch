@@ -1,0 +1,72 @@
+From da2d5da66b97929ab6867c3e282f444bf5ffd6e5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 07:03:31 +0000
+Subject: [PATCH] rpi3: rpi3_noexec boot-arg refuses to run named programs
+
+Daemons that cannot work on this hardware (CommCenter without a modem,
+fairplayd, apsd) exit or crash right after starting and launchd starts
+them again: a full program launch every few seconds on an emulated
+CPU. A failed exec makes launchd back off instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/bsd/kern/kern_exec.c | 42 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/xnu/bsd/kern/kern_exec.c b/xnu/bsd/kern/kern_exec.c
+index 8c2aee3..be40492 100644
+--- a/xnu/bsd/kern/kern_exec.c
++++ b/xnu/bsd/kern/kern_exec.c
+@@ -762,6 +762,48 @@ exec_mach_imgact(struct image_params *imgp)
+ 		goto bad;
+ 	}
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++	/*
++	 * rpi3_noexec=a,b,c: refuse to run these programs (by file name).
++	 * Daemons that cannot work on this hardware (CommCenter without a
++	 * modem, fairplayd, apsd without a network) exit or crash as soon as
++	 * they start and launchd starts them again, a full launch every few
++	 * seconds on an emulated CPU. A failed exec makes launchd back off.
++	 */
++	{
++		static char noexec[128];
++		static int noexec_read;
++
++		if (!noexec_read) {
++			if (!PE_parse_boot_argn("rpi3_noexec", noexec, sizeof(noexec)))
++				noexec[0] = 0;
++			noexec_read = 1;
++		}
++		if (noexec[0] && imgp->ip_strings) {
++			const char *base = imgp->ip_strings, *c;
++			const char *q = noexec;
++			size_t blen;
++
++			for (c = imgp->ip_strings; *c; c++)
++				if (*c == '/')
++					base = c + 1;
++			blen = strlen(base);
++			while (*q) {
++				const char *e = strchr(q, ',');
++				size_t n = e ? (size_t)(e - q) : strlen(q);
++
++				if (n == blen && strncmp(q, base, n) == 0) {
++					error = EPERM;
++					goto bad;
++				}
++				q += n;
++				if (*q == ',')
++					q++;
++			}
++		}
++	}
++#endif
++
+ 	if (!imgp->ip_origcputype) {
+ 		imgp->ip_origcputype = mach_header->cputype;
+ 		imgp->ip_origcpusubtype = mach_header->cpusubtype;
+-- 
+2.43.0
+
