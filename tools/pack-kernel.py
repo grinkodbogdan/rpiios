@@ -114,7 +114,7 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--cmdline", default=DEFAULT_CMDLINE)
     ap.add_argument("--describe", action="store_true", help="print the Mach-O layout and exit")
-    ap.add_argument("--product", help="flattened /product, /baseband nodes from tools/ios10-identity.py; "
+    ap.add_argument("--product", help="flattened /product node from tools/ios10-identity.py; "
                     "the kernel shows it to iOS 10 only")
     a = ap.parse_args()
 

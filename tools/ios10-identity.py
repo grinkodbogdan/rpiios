@@ -13,7 +13,7 @@ iPhone 7 hardware (haptics) that the iPhone 5 never had.
 The iOS 10.3.4 (14G61) iPhone 5 IPSW's DeviceTree.<model>.img3 is not
 encrypted. This reads only that file from Apple's CDN (HTTP range
 requests into the 2 GB zip), extracts the /product subtree and writes it
-as flattened device-tree nodes (/product, /baseband) that tools/pack-kernel.py --product adds
+as a flattened device-tree node that tools/pack-kernel.py --product adds
 to the Pi's tree. The kernel shows it to iOS 10 only (iOS 7 keeps the
 Pi's identity). Apple's firmware is fetched at build time, never stored in
 this repository.
@@ -26,10 +26,9 @@ import zlib
 IPSW = ('https://updates.cdn-apple.com/2019/ios/091-25277-20190722-0C1B94DE-992C-11E9-'
         'A2EE-E2C9A77C2E40/iPhone_4.0_32bit_10.3.4_14G61_Restore.ipsw')
 IPSW_SIZE = 2000796302
-# /product identifies the device; /baseband describes the modem, without
-# which CommCenter crashes on the first client request instead of
-# reporting a modem that does not answer.
-NODES = ('product', 'baseband')
+# Only /product: with the iPhone's /baseband as well, SpringBoard never got
+# past its check-in with backboardd.
+NODES = ('product',)
 
 
 def fetch(start, end):
