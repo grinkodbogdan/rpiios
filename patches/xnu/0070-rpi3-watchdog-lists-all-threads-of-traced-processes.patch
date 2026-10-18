@@ -1,0 +1,32 @@
+From da7e765faf19f38e05d45145117e82a87a2715c8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 01:48:18 +0000
+Subject: [PATCH] rpi3: watchdog lists all threads of traced processes
+
+Only the first six threads of each process were printed, which hid
+backboardd's workqueue threads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/osfmk/arm/trap.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/xnu/osfmk/arm/trap.c b/xnu/osfmk/arm/trap.c
+index 17b9122..5fc40fb 100644
+--- a/xnu/osfmk/arm/trap.c
++++ b/xnu/osfmk/arm/trap.c
+@@ -439,7 +439,9 @@ static void rpi3_watchdog(__unused void *arg, __unused wait_result_t wr)
+                 continue;
+             queue_iterate(&task->threads, th, thread_t, task_threads) {
+                 arm_saved_state_t *s = &th->machine.user_regs;
+-                if (k++ >= 6)
++                if (k++ >= ((rpi3_wdbt_match(proc_name_address(task->bsd_info)) ||
++                             !strncmp(proc_name_address(task->bsd_info), "backboardd", 10) ||
++                             !strncmp(proc_name_address(task->bsd_info), "SpringBoard", 11)) ? 32U : 6U))
+                     break;
+                 printf(" %s[%d].%u st=%x ev=%08x k=%08x pc=%08x lr=%08x r12=%x r0=%x\n",
+                        proc_name_address(task->bsd_info), proc_pid(task->bsd_info), k,
+-- 
+2.43.0
+
