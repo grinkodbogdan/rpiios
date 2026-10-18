@@ -1,0 +1,63 @@
+From 3e91d3e0dbb0bbb04c0769a94489750bf375f7e2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 07:44:47 +0000
+Subject: [PATCH] rpi3: a Wi-Fi controller stand-in for MobileGestalt
+
+MobileGestalt also waits without a deadline for the Wi-Fi interface (an
+IONetworkController with IONetworkRootType airport) to read its MAC
+address; this kernel has no networking family and the Pi port no Wi-Fi
+driver. Publish a controller-shaped service with just those properties
+(a locally administered address).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .../ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp | 28 +++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+index 4542dee..9b84c58 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+@@ -89,10 +89,38 @@ static void rpi3_publish(IOService *service, IOService *platform)
+     service->release();
+ }
+ 
++/*
++ * MobileGestalt also waits, without a deadline, for the Wi-Fi interface
++ * (an IONetworkController with IONetworkRootType "airport") to read its
++ * MAC address. This kernel has no networking family and the Pi port no
++ * Wi-Fi driver: publish a controller-shaped service that carries only
++ * the properties MobileGestalt reads.
++ */
++class IONetworkController : public IOService {
++    OSDeclareDefaultStructors(IONetworkController)
++};
++OSDefineMetaClassAndStructors(IONetworkController, IOService)
++
+ extern "C" void rpi3_register_diagdata(IOService *platform)
+ {
+     rpi3_publish(new AppleDiagnosticDataAccess, platform);
+     rpi3_publish(new AppleDiagnosticDataAccessReadOnly, platform);
+     IOLog("Rpi3 AppleDiagnosticDataAccess stand-ins published (no factory data)\n");
++
++    IONetworkController *wifi = new IONetworkController;
++    if (wifi && wifi->init()) {
++        /* locally administered, so it can never clash with a real card */
++        static const UInt8 mac[6] = { 0x02, 0x52, 0x50, 0x49, 0x33, 0x01 };
++        wifi->setProperty("IONetworkRootType", "airport");
++        wifi->setProperty("IOMACAddress", (void *)mac, sizeof(mac));
++        wifi->setProperty("IOBuiltin", true);
++        if (wifi->attach(platform)) {
++            if (wifi->start(platform))
++                wifi->registerService();
++            else
++                wifi->detach(platform);
++        }
++    }
++    if (wifi) wifi->release();
+ }
+ #endif /* BOARD_CONFIG_RASPBERRYPI3 */
+-- 
+2.43.0
+
