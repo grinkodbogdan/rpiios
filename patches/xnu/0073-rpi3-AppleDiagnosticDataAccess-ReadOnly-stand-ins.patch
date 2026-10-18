@@ -1,0 +1,410 @@
+From bcaae0b89b5d2f7c511526a0c6da1342035665de Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 06:32:42 +0000
+Subject: [PATCH] rpi3: AppleDiagnosticDataAccess(ReadOnly) stand-ins
+
+iOS 10's MobileGestalt waits, with no deadline, for
+AppleDiagnosticDataAccessReadOnly (the factory syscfg reader) to
+appear. Its migrator never finished, accountsd held every client until
+migration completed, and SpringBoard waited on accountsd forever.
+Publish both services; their user clients have no data and refuse
+every request.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ .../ARM/AppleARMPlatform/AppleARMPE.cpp       | 266 +++++++++---------
+ .../ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp |  98 +++++++
+ xnu/iokit/conf/files.arm                      |   1 +
+ 3 files changed, 233 insertions(+), 132 deletions(-)
+ create mode 100644 xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/AppleARMPE.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/AppleARMPE.cpp
+index edb5f76..6493b6d 100644
+--- a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/AppleARMPE.cpp
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/AppleARMPE.cpp
+@@ -1,132 +1,134 @@
+-//
+-//  AppleARMPE.cpp
+-//  AppleARMPlatform
+-//
+-//  Created by rms on 5/21/13.
+-//  Copyright (c) 2013 rms. All rights reserved.
+-//
+-
+-#include "AppleARMPE.h"
+-#include <kern/debug.h>
+-#include <pexpert/device_tree.h>
+-
+-#define HIGH_SCORE  100000
+-#define super IOPlatformExpert
+-
+-OSDefineMetaClassAndStructors(AppleARMPE, IODTPlatformExpert);
+-
+-bool AppleARMPE::init(OSDictionary * propTable)
+-{
+-    if (!super::init(propTable)) {
+-        panic("IOPlatformExpert failed to initialize");
+-    }
+-    return true;
+-}
+-
+-extern const IORegistryPlane *gIODTPlane;
+-#if defined(BOARD_CONFIG_QSD8250_LEO)
+-extern void ios7leo_register_sd(IOService *platform);
+-extern void ios7leo_register_display(IOService *platform);
+-extern void ios7leo_prepare_root_file();
+-extern void ios7leo_register_hid_touch(IOService *platform);
+-#if defined(BOARD_CONFIG_RASPBERRYPI3)
+-extern "C" void rpi3_register_keystore(IOService *platform);
+-#endif
+-extern "C" void ios7leo_prepare_log_reader(void);
+-#endif
+-#if BOARD_CONFIG_ARMPBA8
+-extern void ios7lab_register_display(IOService *platform);
+-extern void ios7lab_register_hid_touch(IOService *platform);
+-extern void ios7lab_register_sd(IOService *platform);
+-#endif
+-
+-void AppleARMPE::registerNVRAMController(IONVRAMController * caller)
+-{
+-    publishResource("IONVRAM");
+-}
+-
+-bool AppleARMPE::start(IOService * provider)
+-{
+-    DTEntry entry;
+-    char *dtype;
+-    unsigned int size;
+-
+-    IOLog("AppleARMPE::start: Welcome to the NeXT generation.\n");
+-
+-    if (!super::start(provider)) {
+-        panic("IOPlatformExpert failed to start");
+-    }
+-
+-    removeProperty(kIOPlatformMapperPresentKey);
+-    assert(IOService::getPlatform() == this);
+-
+-    registerService();
+-
+-    /*
+-     * Let these time out to let everything else initialize right. 
+-     */
+-#if 0
+-    publishResource("IONVRAM");
+-    publishResource("IORTC");
+-#endif
+-
+-    OSData *        prop;
+-    bool        ok = false;
+-
+-    prop = (OSData *) getProvider()->getProperty( gIODTModelKey );
+-    ok = (0 != prop);
+-
+-    if( ok )
+-        populate_model_name((char *) prop->getBytesNoCopy());
+-    else
+-        populate_model_name("Power Macintosh");
+-
+-#if BOARD_CONFIG_ARMPBA8
+-    ios7lab_register_display(this);
+-    ios7lab_register_hid_touch(this);
+-    ios7lab_register_sd(this);
+-#endif
+-#if defined(BOARD_CONFIG_QSD8250_LEO)
+-    ios7leo_register_display(this);
+-    ios7leo_prepare_root_file();
+-    ios7leo_prepare_log_reader(); /* optional owned logger before rawmedia publication */
+-    ios7leo_register_sd(this);
+-    ios7leo_register_hid_touch(this);
+-#if defined(BOARD_CONFIG_RASPBERRYPI3)
+-    rpi3_register_keystore(this);
+-#endif
+-#endif
+-    return true;
+-}
+-
+-const char *AppleARMPE::deleteList(void)
+-{
+-    return "";
+-}
+-
+-const char *AppleARMPE::excludeList(void)
+-{
+-    return ("'chosen', 'memory', 'options', 'aliases'");
+-}
+-
+-IOService *AppleARMPE::probe(IOService * provider, SInt32 * score)
+-{
+-    return this;
+-}
+-
+-bool AppleARMPE::getMachineName(char *name, int maxLength)
+-{
+-    OSData *        prop;
+-    bool        ok = false;
+-
+-    maxLength--;
+-    prop = (OSData *) getProvider()->getProperty( gIODTModelKey );
+-    ok = (0 != prop);
+-
+-    if( ok )
+-        strlcpy( name, (const char *) prop->getBytesNoCopy(), maxLength );
+-    else 
+-        strlcpy( name, "Power Macintosh", maxLength );
+-    
+-    return(true);
+-}
++//
++//  AppleARMPE.cpp
++//  AppleARMPlatform
++//
++//  Created by rms on 5/21/13.
++//  Copyright (c) 2013 rms. All rights reserved.
++//
++
++#include "AppleARMPE.h"
++#include <kern/debug.h>
++#include <pexpert/device_tree.h>
++
++#define HIGH_SCORE  100000
++#define super IOPlatformExpert
++
++OSDefineMetaClassAndStructors(AppleARMPE, IODTPlatformExpert);
++
++bool AppleARMPE::init(OSDictionary * propTable)
++{
++    if (!super::init(propTable)) {
++        panic("IOPlatformExpert failed to initialize");
++    }
++    return true;
++}
++
++extern const IORegistryPlane *gIODTPlane;
++#if defined(BOARD_CONFIG_QSD8250_LEO)
++extern void ios7leo_register_sd(IOService *platform);
++extern void ios7leo_register_display(IOService *platform);
++extern void ios7leo_prepare_root_file();
++extern void ios7leo_register_hid_touch(IOService *platform);
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++extern "C" void rpi3_register_keystore(IOService *platform);
++extern "C" void rpi3_register_diagdata(IOService *platform);
++#endif
++extern "C" void ios7leo_prepare_log_reader(void);
++#endif
++#if BOARD_CONFIG_ARMPBA8
++extern void ios7lab_register_display(IOService *platform);
++extern void ios7lab_register_hid_touch(IOService *platform);
++extern void ios7lab_register_sd(IOService *platform);
++#endif
++
++void AppleARMPE::registerNVRAMController(IONVRAMController * caller)
++{
++    publishResource("IONVRAM");
++}
++
++bool AppleARMPE::start(IOService * provider)
++{
++    DTEntry entry;
++    char *dtype;
++    unsigned int size;
++
++    IOLog("AppleARMPE::start: Welcome to the NeXT generation.\n");
++
++    if (!super::start(provider)) {
++        panic("IOPlatformExpert failed to start");
++    }
++
++    removeProperty(kIOPlatformMapperPresentKey);
++    assert(IOService::getPlatform() == this);
++
++    registerService();
++
++    /*
++     * Let these time out to let everything else initialize right. 
++     */
++#if 0
++    publishResource("IONVRAM");
++    publishResource("IORTC");
++#endif
++
++    OSData *        prop;
++    bool        ok = false;
++
++    prop = (OSData *) getProvider()->getProperty( gIODTModelKey );
++    ok = (0 != prop);
++
++    if( ok )
++        populate_model_name((char *) prop->getBytesNoCopy());
++    else
++        populate_model_name("Power Macintosh");
++
++#if BOARD_CONFIG_ARMPBA8
++    ios7lab_register_display(this);
++    ios7lab_register_hid_touch(this);
++    ios7lab_register_sd(this);
++#endif
++#if defined(BOARD_CONFIG_QSD8250_LEO)
++    ios7leo_register_display(this);
++    ios7leo_prepare_root_file();
++    ios7leo_prepare_log_reader(); /* optional owned logger before rawmedia publication */
++    ios7leo_register_sd(this);
++    ios7leo_register_hid_touch(this);
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++    rpi3_register_keystore(this);
++    rpi3_register_diagdata(this);
++#endif
++#endif
++    return true;
++}
++
++const char *AppleARMPE::deleteList(void)
++{
++    return "";
++}
++
++const char *AppleARMPE::excludeList(void)
++{
++    return ("'chosen', 'memory', 'options', 'aliases'");
++}
++
++IOService *AppleARMPE::probe(IOService * provider, SInt32 * score)
++{
++    return this;
++}
++
++bool AppleARMPE::getMachineName(char *name, int maxLength)
++{
++    OSData *        prop;
++    bool        ok = false;
++
++    maxLength--;
++    prop = (OSData *) getProvider()->getProperty( gIODTModelKey );
++    ok = (0 != prop);
++
++    if( ok )
++        strlcpy( name, (const char *) prop->getBytesNoCopy(), maxLength );
++    else 
++        strlcpy( name, "Power Macintosh", maxLength );
++    
++    return(true);
++}
+diff --git a/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+new file mode 100644
+index 0000000..4542dee
+--- /dev/null
++++ b/xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp
+@@ -0,0 +1,98 @@
++/*
++ * Raspberry Pi 3: stand-ins for AppleDiagnosticDataAccess(ReadOnly).
++ *
++ * On an iPhone these kexts read the factory system configuration (serial
++ * number, calibration data). iOS 10's MobileGestalt looks them up, and when
++ * the read-only one is missing it registers for its arrival and waits on a
++ * run loop with no deadline. Its migrator then never finishes, accountsd
++ * holds every client until migration completes, and SpringBoard waits on
++ * accountsd forever. These services exist so the wait ends; their user
++ * clients have no data and refuse every request, which MobileGestalt
++ * treats as an unanswerable question.
++ */
++#if defined(BOARD_CONFIG_RASPBERRYPI3)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++extern "C" int proc_selfpid(void);
++
++class AppleDiagnosticDataAccess : public IOService {
++    OSDeclareDefaultStructors(AppleDiagnosticDataAccess)
++public:
++    virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++                                   OSDictionary *properties, IOUserClient **handler);
++};
++
++class AppleDiagnosticDataAccessReadOnly : public AppleDiagnosticDataAccess {
++    OSDeclareDefaultStructors(AppleDiagnosticDataAccessReadOnly)
++};
++
++class AppleDiagnosticDataAccessUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(AppleDiagnosticDataAccessUserClient)
++public:
++    virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++                                    IOExternalMethodDispatch *dispatch, OSObject *target,
++                                    void *reference);
++    virtual IOReturn clientClose(void);
++};
++
++OSDefineMetaClassAndStructors(AppleDiagnosticDataAccess, IOService)
++OSDefineMetaClassAndStructors(AppleDiagnosticDataAccessReadOnly, AppleDiagnosticDataAccess)
++OSDefineMetaClassAndStructors(AppleDiagnosticDataAccessUserClient, IOUserClient)
++
++IOReturn AppleDiagnosticDataAccess::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++                                                  OSDictionary *properties, IOUserClient **handler)
++{
++    if (!handler) return kIOReturnBadArgument;
++    *handler = 0;
++    AppleDiagnosticDataAccessUserClient *client = new AppleDiagnosticDataAccessUserClient;
++    if (!client) return kIOReturnNoMemory;
++    if (!client->initWithTask(owningTask, securityID, type, properties)) {
++        client->release(); return kIOReturnNoMemory;
++    }
++    if (!client->attach(this)) { client->release(); return kIOReturnError; }
++    if (!client->start(this)) { client->detach(this); client->release(); return kIOReturnError; }
++    *handler = client;
++    return kIOReturnSuccess;
++}
++
++IOReturn AppleDiagnosticDataAccessUserClient::externalMethod(uint32_t selector,
++                                                             IOExternalMethodArguments *args,
++                                                             IOExternalMethodDispatch *,
++                                                             OSObject *, void *)
++{
++    static unsigned logs;
++    if (logs < 16) {
++        ++logs;
++        IOLog("Rpi3 AppleDiagnosticDataAccess pid=%d selector=%u: no factory data\n",
++              proc_selfpid(), selector);
++    }
++    (void)args;
++    return kIOReturnNotFound;
++}
++
++IOReturn AppleDiagnosticDataAccessUserClient::clientClose(void)
++{
++    terminate();
++    return kIOReturnSuccess;
++}
++
++static void rpi3_publish(IOService *service, IOService *platform)
++{
++    if (!service) return;
++    if (service->init() && service->attach(platform)) {
++        if (service->start(platform))
++            service->registerService();
++        else
++            service->detach(platform);
++    }
++    service->release();
++}
++
++extern "C" void rpi3_register_diagdata(IOService *platform)
++{
++    rpi3_publish(new AppleDiagnosticDataAccess, platform);
++    rpi3_publish(new AppleDiagnosticDataAccessReadOnly, platform);
++    IOLog("Rpi3 AppleDiagnosticDataAccess stand-ins published (no factory data)\n");
++}
++#endif /* BOARD_CONFIG_RASPBERRYPI3 */
+diff --git a/xnu/iokit/conf/files.arm b/xnu/iokit/conf/files.arm
+index ed5d87d..c544fd4 100644
+--- a/xnu/iokit/conf/files.arm
++++ b/xnu/iokit/conf/files.arm
+@@ -60,5 +60,6 @@ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_diag_stubs.c standard
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3SD.cpp optional iokitcpp
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_touch.cpp optional iokitcpp
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3KeyStore.cpp optional iokitcpp
++iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/IOS7Rpi3DiagData.cpp optional iokitcpp
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_usb.c standard
+ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/rpi3_sd.c standard
+-- 
+2.43.0
+
