@@ -1,0 +1,81 @@
+From 9ecf506c0b9175dfb91d99af88cfe42463b4ee23 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 09:09:35 +0000
+Subject: [PATCH] rpi3: rpi3_hidepath boot-arg hides named path components
+
+Any path with a component named in rpi3_hidepath=a,b is not found.
+iOS 10 loads optional plugins (data migrators) by scanning directories;
+one that hangs on this hardware (VideosMigrator waits forever on lsd)
+or only costs time (0AppMigrator re-protecting every container, with no
+data protection behind it) can be left out without editing the
+compressed root image.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0123xbco8JF8tibbBMLmXceV
+---
+ xnu/bsd/vfs/vfs_lookup.c | 42 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/xnu/bsd/vfs/vfs_lookup.c b/xnu/bsd/vfs/vfs_lookup.c
+index f5ba4f8..b5b9b11 100644
+--- a/xnu/bsd/vfs/vfs_lookup.c
++++ b/xnu/bsd/vfs/vfs_lookup.c
+@@ -86,6 +86,7 @@
+ #include <sys/filedesc.h>
+ #include <sys/proc_internal.h>
+ #include <sys/kdebug.h>
++#include <pexpert/pexpert.h>
+ #include <sys/unistd.h>		/* For _PC_NAME_MAX */
+ #include <sys/uio_internal.h>
+ #include <sys/kauth.h>
+@@ -256,6 +257,47 @@ retry_copy:
+ 	if (error)
+ 	        goto error_out;
+ 
++#if BOARD_CONFIG_RASPBERRYPI3
++	/*
++	 * rpi3_hidepath=a,b: any path with a component named a or b is
++	 * "not found". iOS 10 loads optional plugins (data migrators,
++	 * bundles) by scanning directories; one that hangs on this hardware
++	 * can be left out without editing the compressed root image.
++	 */
++	{
++		static char hide[160];
++		static int hide_read;
++
++		if (!hide_read) {
++			if (!PE_parse_boot_argn("rpi3_hidepath", hide, sizeof(hide)))
++				hide[0] = 0;
++			hide_read = 1;
++		}
++		if (hide[0]) {
++			const char *q = hide;
++
++			while (*q) {
++				const char *e = q;
++				const char *c = cnp->cn_pnbuf;
++				size_t n;
++
++				while (*e && *e != ',')
++					e++;
++				n = (size_t)(e - q);
++				/* match n bytes at a component start, ending at '/' or NUL */
++				for (; n && *c; c++) {
++					if ((c == cnp->cn_pnbuf || c[-1] == '/') &&
++					    strncmp(c, q, n) == 0 && (c[n] == '/' || c[n] == 0)) {
++						error = ENOENT;
++						goto error_out;
++					}
++				}
++				q = *e ? e + 1 : e;
++			}
++		}
++	}
++#endif
++
+ #if CONFIG_VOLFS
+  	/*
+ 	 * Check for legacy volfs style pathnames.
+-- 
+2.43.0
+
