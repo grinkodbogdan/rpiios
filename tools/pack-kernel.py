@@ -71,6 +71,25 @@ def dt_node(props, children=()):
     return out
 
 
+def split_nodes(blob):
+    """Flattened nodes laid end to end -> list of each node's bytes."""
+    def end_of(off):
+        nprops, nchildren = struct.unpack_from("<II", blob, off)
+        off += 8
+        for _ in range(nprops):
+            length = struct.unpack_from("<I", blob, off + 32)[0] & 0x7fffffff
+            off += 36 + ((length + 3) & ~3)
+        for _ in range(nchildren):
+            off = end_of(off)
+        return off
+    nodes, off = [], 0
+    while off < len(blob):
+        end = end_of(off)
+        nodes.append(blob[off:end])
+        off = end
+    return nodes
+
+
 def build_device_tree(extra_children=()):
     marker = b"RPI3HANDOFF-SLOT" * 8      # 128 bytes, located after building
     cpu = dt_node([("name", "cpu"), ("device_type", "cpu"),
@@ -95,7 +114,7 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--cmdline", default=DEFAULT_CMDLINE)
     ap.add_argument("--describe", action="store_true", help="print the Mach-O layout and exit")
-    ap.add_argument("--product", help="flattened /product node from tools/ios10-identity.py; "
+    ap.add_argument("--product", help="flattened /product, /baseband nodes from tools/ios10-identity.py; "
                     "the kernel shows it to iOS 10 only")
     a = ap.parse_args()
 
@@ -117,7 +136,7 @@ def main():
     if len(cmdline) > 255:
         sys.exit("cmdline too long")
 
-    dt, handoff_at = build_device_tree([open(a.product, "rb").read()] if a.product else [])
+    dt, handoff_at = build_device_tree(split_nodes(open(a.product, "rb").read()) if a.product else [])
     kernel_offset = (HEADER_BYTES + 0xFFF) & ~0xFFF
     dt_offset = (kernel_offset + len(kernel) + 0xF) & ~0xF
     total = dt_offset + len(dt)

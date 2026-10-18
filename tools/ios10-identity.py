@@ -13,7 +13,7 @@ iPhone 7 hardware (haptics) that the iPhone 5 never had.
 The iOS 10.3.4 (14G61) iPhone 5 IPSW's DeviceTree.<model>.img3 is not
 encrypted. This reads only that file from Apple's CDN (HTTP range
 requests into the 2 GB zip), extracts the /product subtree and writes it
-as a flattened device-tree node that tools/pack-kernel.py --product adds
+as flattened device-tree nodes (/product, /baseband) that tools/pack-kernel.py --product adds
 to the Pi's tree. The kernel shows it to iOS 10 only (iOS 7 keeps the
 Pi's identity). Apple's firmware is fetched at build time, never stored in
 this repository.
@@ -26,6 +26,10 @@ import zlib
 IPSW = ('https://updates.cdn-apple.com/2019/ios/091-25277-20190722-0C1B94DE-992C-11E9-'
         'A2EE-E2C9A77C2E40/iPhone_4.0_32bit_10.3.4_14G61_Restore.ipsw')
 IPSW_SIZE = 2000796302
+# /product identifies the device; /baseband describes the modem, without
+# which CommCenter crashes on the first client request instead of
+# reporting a modem that does not answer.
+NODES = ('product', 'baseband')
 
 
 def fetch(start, end):
@@ -117,16 +121,21 @@ def main():
     model = sys.argv[sys.argv.index('--model') + 1] if '--model' in sys.argv else 'n41ap'
     dt = img3_data(zip_member('Firmware/all_flash/DeviceTree.%s.img3' % model))
     (root, _) = parse(dt)
-    product = next((c for c in root[1] if name_of(c) == 'product'), None)
-    if product is None:
-        sys.exit('ios10-identity: no /product node')
-    # Shipped under a neutral name; the kernel renames it for iOS 10 only.
-    props = [(n, b'rpi3-ios10-product\0' if n == 'name' else v) for n, v in product[0]]
-    pid = dict(product[0]).get('product-id', b'')
-    open(args[0], 'wb').write(encode((props, product[1])))
-    print('ios10-identity: %s /product (%s, product-id %s) -> %s'
-          % (model, dict(product[0]).get('product-name', b'?').rstrip(b'\0').decode(),
-             pid.hex(), args[0]))
+    out = b''
+    for want in NODES:
+        node = next((c for c in root[1] if name_of(c) == want), None)
+        if node is None:
+            sys.exit('ios10-identity: no /%s node' % want)
+        # Shipped under a neutral name; the kernel renames it for iOS 10 only.
+        props = [(n, b'rpi3-ios10-' + want.encode() + b'\0' if n == 'name' else v)
+                 for n, v in node[0]]
+        out += encode((props, node[1]))
+    open(args[0], 'wb').write(out)
+    product = next(c for c in root[1] if name_of(c) == 'product')
+    print('ios10-identity: %s %s (%s, product-id %s) -> %s'
+          % (model, ' '.join('/' + n for n in NODES),
+             dict(product[0]).get('product-name', b'?').rstrip(b'\0').decode(),
+             dict(product[0]).get('product-id', b'').hex(), args[0]))
 
 
 if __name__ == '__main__':

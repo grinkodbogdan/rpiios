@@ -1,0 +1,63 @@
+From d3c83d5ac6f236914dbd3a51c27d538703c957d3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 12:26:41 +0000
+Subject: [PATCH] rpi3: also show the iPhone 5's /baseband node to iOS 10
+
+Without /baseband CommCenter crashes on its first client request and
+SpringBoard waits on that request forever.
+---
+ xnu/iokit/Kernel/IOPlatformExpert.cpp | 35 +++++++++++++++------------
+ 1 file changed, 20 insertions(+), 15 deletions(-)
+
+diff --git a/xnu/iokit/Kernel/IOPlatformExpert.cpp b/xnu/iokit/Kernel/IOPlatformExpert.cpp
+index cf6cd37..dadd41c 100644
+--- a/xnu/iokit/Kernel/IOPlatformExpert.cpp
++++ b/xnu/iokit/Kernel/IOPlatformExpert.cpp
+@@ -787,24 +787,29 @@ void rpi3_ios10_device_identity(void)
+     }
+     /*
+      * The iPhone 5's own /product node (product-id, idiom, artwork scale,
+-     * feature subnodes: tools/ios10-identity.py, packed by pack-kernel.py
+-     * --product) ships as rpi3-ios10-product so iOS 7 never sees it.
+-     * MobileGestalt identifies the device from it; without it CommCenter
+-     * crashed on an unknown hardware model and backboardd waited for
+-     * iPhone 7 haptics.
++     * feature subnodes) and /baseband node (tools/ios10-identity.py,
++     * packed by pack-kernel.py --product) ship as rpi3-ios10-<name> so
++     * iOS 7 never sees them. MobileGestalt identifies the device from
++     * /product; without it CommCenter crashed on an unknown hardware model
++     * and backboardd waited for iPhone 7 haptics. Without /baseband
++     * CommCenter crashes on its first client request, and SpringBoard
++     * waits on that request forever.
+      */
+-    IORegistryEntry * product = IORegistryEntry::fromPath("/rpi3-ios10-product", gIODTPlane);
+-    if (product) {
+-	static const char pname[] = "product";
+-
+-	product->setName(pname);
+-	product->setName(pname, gIODTPlane);
+-	if ((data = OSData::withBytes(pname, sizeof(pname)))) {
+-	    product->setProperty("name", data);
++    static const char * const shown[] = { "product", "baseband" };
++    for (unsigned i = 0; i < sizeof(shown) / sizeof(shown[0]); i++) {
++	char path[40];
++	snprintf(path, sizeof(path), "/rpi3-ios10-%s", shown[i]);
++	IORegistryEntry * node = IORegistryEntry::fromPath(path, gIODTPlane);
++	if (!node)
++	    continue;
++	node->setName(shown[i]);
++	node->setName(shown[i], gIODTPlane);
++	if ((data = OSData::withBytes(shown[i], strlen(shown[i]) + 1))) {
++	    node->setProperty("name", data);
+ 	    data->release();
+ 	}
+-	product->release();
+-	IOLog("rpi3: /product (iPhone 5) shown to iOS 10\n");
++	node->release();
++	IOLog("rpi3: /%s (iPhone 5) shown to iOS 10\n", shown[i]);
+     }
+     IOLog("rpi3: device identity iPhone5,1 (N41AP) for iOS 10\n");
+ }
+-- 
+2.43.0
+
