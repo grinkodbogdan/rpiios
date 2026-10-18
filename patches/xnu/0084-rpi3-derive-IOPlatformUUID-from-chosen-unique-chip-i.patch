@@ -1,0 +1,47 @@
+From c8aa5ba147fb96bcb67b91f7ef7a23617553cea4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 17:39:30 +0000
+Subject: [PATCH] rpi3: derive IOPlatformUUID from /chosen unique-chip-id,
+ chip-id
+
+The embedded path was compiled out; without a platform UUID iOS 10 reruns
+its data migration every boot and SpringBoard's check-in waits for it.
+---
+ xnu/iokit/Kernel/IOPlatformExpert.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/xnu/iokit/Kernel/IOPlatformExpert.cpp b/xnu/iokit/Kernel/IOPlatformExpert.cpp
+index dadd41c..4b3d5d0 100644
+--- a/xnu/iokit/Kernel/IOPlatformExpert.cpp
++++ b/xnu/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1007,7 +1007,8 @@ void IOPlatformExpert::registerNVRAMController(IONVRAMController * caller)
+     OSString *        string = 0;
+     uuid_string_t     uuid;
+ 
+-#if CONFIG_EMBEDDED
++#if CONFIG_EMBEDDED || defined(BOARD_CONFIG_RASPBERRYPI3)
++    /* the Pi's shim provides iBoot's unique-chip-id/chip-id (pack-kernel.py) */
+     entry = IORegistryEntry::fromPath( "/chosen", gIODTPlane );
+     if ( entry )
+     {
+@@ -1041,7 +1042,7 @@ void IOPlatformExpert::registerNVRAMController(IONVRAMController * caller)
+ 
+         entry->release( );
+     }
+-#else /* !CONFIG_EMBEDDED */
++#else /* !CONFIG_EMBEDDED && !BOARD_CONFIG_RASPBERRYPI3 */
+     entry = IORegistryEntry::fromPath( "/efi/platform", gIODTPlane );
+     if ( entry )
+     {
+@@ -1066,7 +1067,7 @@ void IOPlatformExpert::registerNVRAMController(IONVRAMController * caller)
+ 
+         entry->release( );
+     }
+-#endif /* !CONFIG_EMBEDDED */
++#endif
+ 
+     if ( string == 0 )
+     {
+-- 
+2.43.0
+

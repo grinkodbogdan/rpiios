@@ -98,7 +98,14 @@ def build_device_tree(extra_children=()):
                     ("#size-cells", struct.pack("<I", 0))], [cpu])
     chosen = dt_node([("name", "chosen"), ("firmware-version", "rpiios-shim"),
                       ("rpi3-handoff", marker), ("root-matching", ROOT_MATCHING),
-                      ("ios7leo-fast-console", struct.pack("<I", 0))])
+                      ("ios7leo-fast-console", struct.pack("<I", 0)),
+                      # The kernel derives IOPlatformUUID from these (iBoot
+                      # sets them on an iPhone). Without it iOS 10 reruns its
+                      # data migration on every boot and SpringBoard's
+                      # check-in waits for it. Fixed values keep the UUID,
+                      # and what iOS keys on it, the same across boots.
+                      ("unique-chip-id", struct.pack("<Q", 0x0000525049330001)),
+                      ("chip-id", struct.pack("<I", 0x8950))])
     root = dt_node([("name", "device-tree"), ("model", "Raspberry Pi 3 Model B+"),
                     ("compatible", b"brcm,bcm2837\0raspberrypi,3-model-b-plus\0")],
                    [chosen, cpus] + list(extra_children))
