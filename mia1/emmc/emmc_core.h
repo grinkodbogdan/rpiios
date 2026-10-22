@@ -8,7 +8,7 @@
  * card to sleep and switches the controller out of SDHCI mode before it starts us
  * (target_uninit: mmc_put_card_to_sleep, sdhci_mode_disable), so everything is done again here,
  * in the order LK's platform/msm_shared/sdhci_msm.c and mmc_sdhci.c do it:
- *   - the SDCC1 clocks on and the core clock at 50 MHz (GCC: GPLL0 / 16)
+ *   - the SDCC1 core clock read as LK left it (192 or 384 MHz), the controller's own divider from it
  *   - SDHCI mode on, a reset, Qualcomm's power-control handshake acknowledged
  *   - the card from sleep to idle (CMD0), then identified and selected at 400 kHz
  *   - 8 data lines, high speed timing, 50 MHz (a card that refuses stays at 1 line, 25 MHz)
@@ -344,26 +344,51 @@ failed:
 	return -1;
 }
 
-/* The SDCC1 clocks on, and the core clock at SDCC_CLOCK_HZ. */
-static void
+/*
+ * The SDCC1 core clock as LK left it -- it is never switched off before the kernel starts, and
+ * changing it from here once hung the phone (the controller stops answering its own registers
+ * while its clock is between two sources) -- read from its clock generator: source, divider and
+ * M/N. The SDHCI divider then works from that. Only if a branch is off is it switched on.
+ */
+#define GCC_SDCC1_M             0x4200c
+#define GCC_SDCC1_N             0x42010
+
+static uint32_t
 msm_clocks(struct emmc *e)
 {
+	/* msm8953-clock.c: xo, gpll0, gpll4, -, gpll0_out_main_div2 */
+	static const uint32_t source_hz[8] = { 19200000, 800000000, 1152000000, 0, 400000000, 0, 0, 0 };
+	uint32_t cfg, src, div, mode, m, n;
+	uint64_t hz;
+
 	if (e->gcc == 0) {
-		return;
+		return 0;
 	}
-	emmc_wr32(e->gcc + GCC_SDCC1_AHB_CBCR, emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR) | CBCR_ENABLE);
-	/* GPLL0 / 16: the divider field is 2 * 16 - 1, no M/N */
-	emmc_wr32(e->gcc + GCC_SDCC1_CFG_RCGR, (2 * 16 - 1) | GPLL0_SOURCE << 8);
-	emmc_wr32(e->gcc + GCC_SDCC1_CMD_RCGR, emmc_rd32(e->gcc + GCC_SDCC1_CMD_RCGR) | RCGR_UPDATE);
-	for (int i = 0; i < 1000 && (emmc_rd32(e->gcc + GCC_SDCC1_CMD_RCGR) & RCGR_UPDATE); i++) {
-		emmc_udelay(1);
+	if (emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR) & CBCR_OFF) {
+		emmc_wr32(e->gcc + GCC_SDCC1_AHB_CBCR, emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR) | CBCR_ENABLE);
 	}
-	emmc_wr32(e->gcc + GCC_SDCC1_APPS_CBCR, emmc_rd32(e->gcc + GCC_SDCC1_APPS_CBCR) | CBCR_ENABLE);
-	for (int i = 0; i < 1000 && (emmc_rd32(e->gcc + GCC_SDCC1_APPS_CBCR) & CBCR_OFF); i++) {
-		emmc_udelay(1);
+	if (emmc_rd32(e->gcc + GCC_SDCC1_APPS_CBCR) & CBCR_OFF) {
+		emmc_wr32(e->gcc + GCC_SDCC1_APPS_CBCR, emmc_rd32(e->gcc + GCC_SDCC1_APPS_CBCR) | CBCR_ENABLE);
 	}
-	emmc_log("%s: clocks: ahb %x, apps %x, rcg %x\n", e->name, emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR),
-	    emmc_rd32(e->gcc + GCC_SDCC1_APPS_CBCR), emmc_rd32(e->gcc + GCC_SDCC1_CFG_RCGR));
+	cfg = emmc_rd32(e->gcc + GCC_SDCC1_CFG_RCGR);
+	src = (cfg >> 8) & 7;
+	div = cfg & 0x1f;
+	mode = (cfg >> 12) & 3;
+	hz = source_hz[src];
+	if (div != 0) {
+		hz = hz * 2 / (div + 1);
+	}
+	if (mode != 0) {
+		m = emmc_rd32(e->gcc + GCC_SDCC1_M) & 0xff;
+		n = ((~emmc_rd32(e->gcc + GCC_SDCC1_N)) & 0xff) + m;
+		if (m != 0 && n != 0) {
+			hz = hz * m / n;
+		}
+	}
+	emmc_log("%s: clocks as LK left them: ahb %x, apps %x, rcg %x (source %u, divider %u, M/N mode %u): %u Hz\n",
+	    e->name, emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR), emmc_rd32(e->gcc + GCC_SDCC1_APPS_CBCR), cfg, src, div, mode,
+	    (uint32_t)hz);
+	return (uint32_t)hz;
 }
 
 static int
@@ -401,13 +426,23 @@ emmc_sd_identify(struct emmc *e, uint32_t *r)
 static int
 emmc_init(struct emmc *e)
 {
-	uint32_t r[4], ocr = 0, caps;
+	uint32_t r[4], ocr = 0, caps, core_hz = 0;
 	static uint8_t ext_csd[512];
 
 	e->sd = 0;
 	e->errors = 0;
 	if (e->core != 0) {
-		msm_clocks(e);
+		core_hz = msm_clocks(e);
+		/*
+		 * The whole core reset first (MCI_POWER's CORE_SW_RST), as Linux's sdhci-msm does: LK leaves
+		 * HS400 behind in Qualcomm's own registers (clock selection, DLL), which an SDHCI reset
+		 * does not touch. The core is in its old (MCI) mode after it.
+		 */
+		emmc_wr32(e->core + 0x00, emmc_rd32(e->core + 0x00) | 1u << 7);
+		for (int i = 0; i < 10000 && (emmc_rd32(e->core + 0x00) & 1u << 7); i++) {
+			emmc_udelay(1);
+		}
+		emmc_log("%s: core reset: MCI_POWER %x\n", e->name, emmc_rd32(e->core + 0x00));
 		hc_wr(e, MSM_VENDOR_SPEC, 0xa1c);                       /* as LK writes it first */
 		emmc_wr32(e->core + MSM_HC_MODE, emmc_rd32(e->core + MSM_HC_MODE) | 1u | 1u << 13);
 		emmc_log("%s: Qualcomm SDCC %x, SDHCI mode on\n", e->name, emmc_rd32(e->core + MSM_VERSION));
@@ -424,8 +459,10 @@ emmc_init(struct emmc *e)
 	}
 	caps = hc_rd(e, SDHCI_CAPS);
 	e->base_hz = ((caps >> 8) & 0xff) * 1000000u;
-	if (e->core != 0 || e->base_hz == 0) {
-		e->base_hz = e->core != 0 ? SDCC_CLOCK_HZ : 50000000u;
+	if (e->core != 0 && core_hz != 0) {
+		e->base_hz = core_hz;
+	} else if (e->base_hz == 0) {
+		e->base_hz = 50000000u;
 	}
 	emmc_log("%s: SDHCI version %u, capabilities %x, base clock %u Hz, present %x\n", e->name,
 	    ((hc_rd(e, SDHCI_VERSION) >> 16) & 0xff) + 1, caps, e->base_hz, hc_rd(e, SDHCI_PRESENT));
