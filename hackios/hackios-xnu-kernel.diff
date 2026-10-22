@@ -11,6 +11,215 @@ index dd8667b..989d6b0 100755
    -accel tcg,tb-size=${QEMU_TB_MB:-384} \
    -drive if=pflash,format=raw,readonly=on,file="$EFI" \
    -drive if=pflash,format=raw,file=vars.fd \
+diff --git a/xnu/files/bsd/dev/redwood_adreno.c b/xnu/files/bsd/dev/redwood_adreno.c
+index e840053..d96500d 100644
+--- a/xnu/files/bsd/dev/redwood_adreno.c
++++ b/xnu/files/bsd/dev/redwood_adreno.c
+@@ -3279,6 +3279,29 @@ gpu_address_span(uint64_t size)
+ 	return gpu_va >= 2 ? span + GPU_ADDRESS_GRANULE : span;
+ }
+ 
++/*
++ * The Mi A1's Adreno 506 (bsd/dev/redwood_tissot_gpu.c): when it is the GPU that is up, every
++ * redwood_gpu_* below hands the call to it.
++ */
++extern bool redwood_tissot_gpu_on;
++bool redwood_tissot_gpu_ready(void);
++bool redwood_tissot_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t redwood_tissot_gpu_address(uint64_t size);
++void redwood_tissot_gpu_address_free(uint64_t address, uint64_t size);
++void redwood_tissot_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most,
++    uint64_t *lost, uint32_t *refused);
++bool redwood_tissot_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void redwood_tissot_gpu_mapped(void);
++void redwood_tissot_gpu_unmap(uint64_t address, uint64_t size);
++void redwood_tissot_gpu_to_memory(void *start, uint64_t size);
++bool redwood_tissot_gpu_done(uint32_t fence);
++uint32_t redwood_tissot_gpu_last(void);
++void redwood_tissot_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++uint32_t redwood_tissot_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++void redwood_tissot_gpu_report(const char *why);
++bool redwood_tissot_gpu_recover(void);
++void redwood_tissot_gpu_stop(void);
++
+ extern void RedwoodGPUStart(void);
+ extern void RedwoodGPUStop(void);       /* takes the clients' lock, then calls redwood_gpu_stop() */
+ static void gpu_block_stop(void);
+@@ -3295,6 +3318,10 @@ static void gpu_block_stop(void);
+ void
+ redwood_gpu_stop(void)
+ {
++	if (redwood_tissot_gpu_on) {
++		redwood_tissot_gpu_stop();
++		return;
++	}
+ 	if (gpu_kept) {
+ 		uint32_t waited = 0;
+ 
+@@ -3321,7 +3348,7 @@ redwood_adreno_stop(void)
+ {
+ 	uint32_t dirty = 0;
+ 
+-	if (gpu_kept && !(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
++	if ((gpu_kept || redwood_tissot_gpu_on) && !(PE_parse_boot_argn("adreno_dirty", &dirty, sizeof(dirty)) && dirty)) {
+ 		RedwoodGPUStop();
+ 	}
+ }
+@@ -3329,6 +3356,9 @@ redwood_adreno_stop(void)
+ bool
+ redwood_gpu_ready(void)
+ {
++	if (redwood_tissot_gpu_on) {
++		return redwood_tissot_gpu_ready();
++	}
+ 	return gpu_kept;
+ }
+ 
+@@ -3336,6 +3366,9 @@ redwood_gpu_ready(void)
+ bool
+ redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ {
++	if (redwood_tissot_gpu_on) {
++		return redwood_tissot_gpu_parameter(which, value);
++	}
+ 	switch (which) {
+ 	case 0x01:                              /* GPU_ID: none, the chip ID says it */
+ 	case 0x06:                              /* GMEM_BASE */
+@@ -3394,6 +3427,9 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
+ uint64_t
+ redwood_gpu_address(uint64_t size)
+ {
++	if (redwood_tissot_gpu_on) {
++		return redwood_tissot_gpu_address(size);
++	}
+ 	size = gpu_address_span(size);
+ 	for (unsigned i = 0; i < gpu_free_count; i++) {
+ 		if (gpu_free[i].size >= size) {
+@@ -3416,6 +3452,10 @@ redwood_gpu_address(uint64_t size)
+ void
+ redwood_gpu_address_free(uint64_t address, uint64_t size)
+ {
++	if (redwood_tissot_gpu_on) {
++		redwood_tissot_gpu_address_free(address, size);
++		return;
++	}
+ 	unsigned at;
+ 
+ 	size = gpu_address_span(size);
+@@ -3461,6 +3501,10 @@ void
+ redwood_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most, uint64_t *lost,
+     uint32_t *refused)
+ {
++	if (redwood_tissot_gpu_on) {
++		redwood_tissot_gpu_space(used, live, largest, holes, most, lost, refused);
++		return;
++	}
+ 	*largest = 0;
+ 	for (unsigned i = 0; i < gpu_free_count; i++) {
+ 		if (gpu_free[i].size > *largest) {
+@@ -3479,18 +3523,29 @@ redwood_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *h
+ bool
+ redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+ {
++	if (redwood_tissot_gpu_on) {
++		return redwood_tissot_gpu_map(address, phys, read_only);
++	}
+ 	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
+ }
+ 
+ void
+ redwood_gpu_mapped(void)
+ {
++	if (redwood_tissot_gpu_on) {
++		redwood_tissot_gpu_mapped();
++		return;
++	}
+ 	space_commit(&core_space);
+ }
+ 
+ void
+ redwood_gpu_unmap(uint64_t address, uint64_t size)
+ {
++	if (redwood_tissot_gpu_on) {
++		redwood_tissot_gpu_unmap(address, size);
++		return;
++	}
+ 	uint32_t context = smmu_context(&core_space);
+ 
+ 	for (uint64_t offset = 0; offset < size; offset += 4096) {
+@@ -3507,6 +3562,10 @@ redwood_gpu_unmap(uint64_t address, uint64_t size)
+ void
+ redwood_gpu_to_memory(void *start, uint64_t size)
+ {
++	if (redwood_tissot_gpu_on) {
++		redwood_tissot_gpu_to_memory(start, size);
++		return;
++	}
+ 	to_memory((vm_offset_t)start, size);
+ }
+ 
+@@ -3514,6 +3573,9 @@ redwood_gpu_to_memory(void *start, uint64_t size)
+ bool
+ redwood_gpu_done(uint32_t fence)
+ {
++	if (redwood_tissot_gpu_on) {
++		return redwood_tissot_gpu_done(fence);
++	}
+ 	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+ 
+ 	to_memory((vm_offset_t)word, 4);
+@@ -3523,6 +3585,9 @@ redwood_gpu_done(uint32_t fence)
+ uint32_t
+ redwood_gpu_last(void)
+ {
++	if (redwood_tissot_gpu_on) {
++		return redwood_tissot_gpu_last();
++	}
+ 	return gpu_fence;
+ }
+ 
+@@ -3578,6 +3643,10 @@ gpu_times(void)
+ void
+ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+ {
++	if (redwood_tissot_gpu_on) {
++		redwood_tissot_gpu_worked(microseconds, submissions, by);
++		return;
++	}
+ 	gpu_times();
+ 	*microseconds = gpu_ticks * 10 / 192;
+ 	*submissions = gpu_timed_count;
+@@ -3595,6 +3664,9 @@ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]
+ uint32_t
+ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+ {
++	if (redwood_tissot_gpu_on) {
++		return redwood_tissot_gpu_submit(addresses, words, count);
++	}
+ 	uint32_t wanted = 26 + 4 * count, room = 0;
+ 
+ 	for (int i = 0; i < 20000; i++) {
+@@ -3640,6 +3712,10 @@ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
+ void
+ redwood_gpu_report(const char *why)
+ {
++	if (redwood_tissot_gpu_on) {
++		redwood_tissot_gpu_report(why);
++		return;
++	}
+ 	uint32_t context = smmu_context(&core_space);
+ 
+ 	printf("adreno: gpu: %s: submission %u is the last, the core has done %u; ring: read up to %u, written up to %u; status "
+@@ -3712,6 +3788,9 @@ redwood_gpu_report(const char *why)
+ bool
+ redwood_gpu_recover(void)
+ {
++	if (redwood_tissot_gpu_on) {
++		return redwood_tissot_gpu_recover();
++	}
+ 	uint32_t fence_status;
+ 
+ 	if (!gpu_kept || !gpu_recover) {
 diff --git a/xnu/files/bsd/dev/redwood_input.c b/xnu/files/bsd/dev/redwood_input.c
 index 8076cf0..fb17f0d 100644
 --- a/xnu/files/bsd/dev/redwood_input.c
@@ -1740,46 +1949,73 @@ index 0000000..5cd2ae9
 +#endif
 diff --git a/xnu/files/bsd/dev/redwood_tissot_gpu.c b/xnu/files/bsd/dev/redwood_tissot_gpu.c
 new file mode 100644
-index 0000000..cfc97c0
+index 0000000..7c6082a
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_gpu.c
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,1199 @@
 +/*
-+ * The Mi A1's (tissot, MSM8953) Adreno 506, step 1: power, clocks, and a look at its registers,
-+ * as the Pixel 1 port (ios-sailfish, sweet_gpu.c) began with its Adreno 530. And the speed the
-+ * processors run at, measured: what LK left them at.
++ * The Mi A1's (tissot, MSM8953) Adreno 506, for the system to draw with: the hardware half of the
++ * service RedwoodGPU (iokit/Kernel/RedwoodGPU.cpp), which hands it to Mesa's freedreno through the
++ * interface of Linux's msm driver. On the POCO that half is bsd/dev/redwood_adreno.c (an A6xx with
++ * a GMU); here it is an A5xx, which needs no GMU, and every redwood_gpu_* call of that file comes
++ * here instead when this GPU is up (redwood_tissot_gpu_on). Ported from Linux:
++ * drivers/gpu/drm/msm/adreno/a5xx_gpu.c (a5xx_pm_resume, a5xx_hw_init, a5xx_me_init, a5xx_submit,
++ * with its A506 branches), adreno_gpu.c, drivers/iommu/arm/arm-smmu/qcom_iommu.c,
++ * drivers/soc/qcom/mdt_loader.c, drivers/firmware/qcom/qcom_scm.c; the order of things after the
++ * Pixel 1 port ios-sailfish (sweet_gpu.c, an A530).
 + *
-+ * Boot-arg tissot_gpu=1. The GPU's logic is on VDD_CX (the RPM keeps that on; at its lowest
-+ * corner it carries the GPU up to 133 MHz, Linux's msm8953.dtsi gpu_opp_table), so there is no
-+ * rail of its own to switch. The global clock controller (0x01800000, Linux gcc-msm8953.c):
-+ *   gfx3d RCG          0x59000 (CMD), 0x59004 (CFG: source [10:8], divider*2-1 [4:0]);
-+ *                      sources 0 XO, 1 GPLL0 (800 MHz), 5 GPLL0/2
-+ *   branches           gfx3d 0x59020, ahb 0x59028, bimc_gpu 0x59030, bimc_gfx 0x59034,
-+ *                      timer 0x59040, aon 0x59044: [0] on, [31] the clock is off
-+ *   GDSCs              oxili_cx 0x5904c, oxili_gx 0x5901c (its I/O clamp at 0x5b00c [0]):
-+ *                      [0] collapse, [31] powered
-+ * The GPU at 0x01c00000 (dword offsets, Linux a5xx.xml): VBIF_VERSION 0x3000, RBBM_STATUS 0x4f5,
-+ * RBBM_ALWAYSON_COUNTER_LO 0x4d2. Nothing of the GPU is read unless everything said it is on: a
-+ * read of a block without its clock stops the bus, and the phone with it.
++ * Boot-args:
++ *   tissot_gpu=1       look only: power, clocks, three registers read (the first probe)
++ *   tissot_gpu=2       bring it up and keep it for the system (RedwoodGPU): CoreAnimation then draws
++ *                      with OpenGL ES on it, Mesa's freedreno being in the small image (GL=1)
++ *   tissot_gpu_mhz=N   its clock: 133 (default), 200, 266, 320 or 400. Above 133 MHz the RPM is asked
++ *                      for a higher VDD_CX level first, and the clock stays at 133 if it says no.
++ * Without either, every Mi A1 boot still says the processors' clock (measure_cpu()).
 + *
-+ * Each stage is said in the log before it is made (and kept for the next boot: the shim shows
-+ * it), with a pause between them.
++ * The pieces, all of this phone (msm8953.dtsi, gcc-msm8953.c):
++ *   power      VDD_CX (the RPM's; no rail of the GPU's own). GCC 0x01800000: the gfx3d RCG 0x59000,
++ *              branches gfx3d 0x59020, ahb 0x59028, bimc_gpu 0x59030, bimc_gfx 0x59034, timer
++ *              0x59040, aon 0x59044; GDSCs oxili_cx 0x5904c, oxili_gx 0x5901c (I/O clamp 0x5b00c)
++ *   GPU        0x01c00000, 256 KB of registers (dword offsets of a5xx.xml)
++ *   IOMMU      qcom,msm-iommu-v2 at 0x01c48000, TrustZone's (secure id 18): its context bank 0
++ *              (gfx3d_user) is ours once TrustZone has been asked to set it up; 32-bit LPAE page
++ *              tables, three levels of 4K pages, one address space for everything
++ *   firmware   in the small image's fw/: a530_pm4.fw and a530_pfp.fw (the CP's microcode, the
++ *              A530's, as Linux uses for the A506), a506_zap.mdt and .b0N (the zap shader, signed
++ *              for this phone: TrustZone runs it, and only then lets the CP out of secure mode).
++ *              Its memory: the reserved 8 KB at 0x81800000.
 + */
 +#include <kern/clock.h>
 +#include <kern/thread.h>
 +#include <libkern/libkern.h>
 +#include <mach/mach_types.h>
++#include <mach/vm_param.h>
 +#include <pexpert/pexpert.h>
++#include <sys/param.h>
 +#include <sys/systm.h>
++#include <vm/vm_kern.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern uint64_t kvtophys(vm_offset_t va);
 +extern kern_return_t thread_terminate(thread_t thread);
 +extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
 +extern void redwood_tissot_log(const char *format, ...) __printflike(1, 2);
++extern int redwood_tissot_rpm_request(uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
++extern void RedwoodGPUStart(void);
 +#define say(...) redwood_tissot_log("tissot-gpu: " __VA_ARGS__)
++
++bool redwood_tissot_gpu_on;             /* redwood_adreno.c's redwood_gpu_* come here */
++
++/* ---- registers ------------------------------------------------------------------------------- */
 +
 +#define GCC_PHYS                0x01800000UL
 +#define GPU_PHYS                0x01c00000UL
++#define GPU_SIZE                0x40000UL
++#define SMMU_CB0_PHYS           0x01c48000UL
++#define ZAP_PHYS                0x81800000UL
++#define ZAP_SIZE                0x2000u
 +
 +#define GFX3D_CMD               0x59000
 +#define GFX3D_CFG               0x59004
@@ -1794,11 +2030,128 @@ index 0000000..cfc97c0
 +#define CX_GDSC                 0x5904c
 +#define GX_CLAMP                0x5b00c
 +
-+#define VBIF_VERSION            (0x3000 * 4)
-+#define RBBM_ALWAYSON_LO        (0x04d2 * 4)
-+#define RBBM_STATUS             (0x04f5 * 4)
++/* a5xx.xml, dword offsets */
++#define A5_RBBM_INTERFACE_HANG_INT_CNTL 0x002f
++#define A5_RBBM_INT_CLEAR_CMD           0x0037
++#define A5_RBBM_INT_0_MASK              0x0038
++#define A5_RBBM_SW_RESET_CMD            0x0043
++#define A5_RBBM_CLOCK_CNTL              0x0067
++#define A5_RBBM_AHB_CNTL0               0x0093
++#define A5_RBBM_AHB_CNTL1               0x0094
++#define A5_RBBM_AHB_CNTL2               0x0095
++#define A5_RBBM_PERFCTR_CNTL            0x0464
++#define A5_RBBM_PERFCTR_RBBM_SEL_0      0x046b
++#define A5_RBBM_PERFCTR_GPU_BUSY_MASKED 0x046f
++#define A5_RBBM_ALWAYSON_COUNTER_LO     0x04d2
++#define A5_RBBM_INT_0_STATUS            0x04e1
++#define A5_RBBM_STATUS                  0x04f5
++#define A5_RBBM_ISDB_CNT                0x0533
++#define A5_CP_RB_BASE                   0x0800
++#define A5_CP_RB_CNTL                   0x0802
++#define A5_CP_RB_RPTR_ADDR              0x0804
++#define A5_CP_RB_RPTR                   0x0806
++#define A5_CP_RB_WPTR                   0x0807
++#define A5_CP_ROQ_THRESHOLDS_1          0x081f
++#define A5_CP_ROQ_THRESHOLDS_2          0x0820
++#define A5_CP_MEQ_THRESHOLDS            0x0825
++#define A5_CP_MERCIU_SIZE               0x0826
++#define A5_CP_PFP_ME_CNTL               0x0832
++#define A5_CP_CHICKEN_DBG               0x0833
++#define A5_CP_PFP_INSTR_BASE_LO         0x0835
++#define A5_CP_ME_INSTR_BASE_LO          0x0838
++#define A5_CP_ADDR_MODE_CNTL            0x0860
++#define A5_CP_PROTECT(n)                (0x0880 + (n))
++#define A5_CP_PROTECT_CNTL              0x08a0
++#define A5_CP_INTERRUPT_STATUS          0x0b18
++#define A5_CP_HW_FAULT                  0x0b1a
++#define A5_CP_PROTECT_STATUS            0x0b1c
++#define A5_CP_IB1_BASE                  0x0b1f
++#define A5_CP_IB1_BUFSZ                 0x0b21
++#define A5_CP_IB2_BASE                  0x0b22
++#define A5_CP_IB2_BUFSZ                 0x0b24
++#define A5_CP_SCRATCH_REG(n)            (0x0b78 + (n))
++#define A5_CP_PERFCTR_CP_SEL_0          0x0bb0
++#define A5_VSC_ADDR_MODE_CNTL           0x0bc1
++#define A5_GRAS_ADDR_MODE_CNTL          0x0c81
++#define A5_RB_DBG_ECO_CNTL              0x0cc4
++#define A5_RB_ADDR_MODE_CNTL            0x0cc5
++#define A5_RB_MODE_CNTL                 0x0cc6
++#define A5_PC_DBG_ECO_CNTL              0x0d00
++#define A5_PC_ADDR_MODE_CNTL            0x0d01
++#define A5_HLSQ_DBG_ECO_CNTL            0x0e04
++#define A5_HLSQ_ADDR_MODE_CNTL          0x0e05
++#define A5_VFD_ADDR_MODE_CNTL           0x0e41
++#define A5_VPC_DBG_ECO_CNTL             0x0e60
++#define A5_VPC_ADDR_MODE_CNTL           0x0e61
++#define A5_UCHE_ADDR_MODE_CNTL          0x0e80
++#define A5_UCHE_MODE_CNTL               0x0e81
++#define A5_UCHE_WRITE_THRU_BASE         0x0e87
++#define A5_UCHE_TRAP_BASE               0x0e89
++#define A5_UCHE_GMEM_RANGE_MIN          0x0e8b
++#define A5_UCHE_GMEM_RANGE_MAX          0x0e8d
++#define A5_UCHE_CACHE_WAYS              0x0e96
++#define A5_SP_ADDR_MODE_CNTL            0x0ec1
++#define A5_TPL1_ADDR_MODE_CNTL          0x0f01
++#define A5_TPL1_MODE_CNTL               0x0f02
++#define A5_VBIF_VERSION                 0x3000
++#define A5_VBIF_ROUND_ROBIN_QOS_ARB     0x3049
++#define A5_RBBM_SECVID_TRUST_CNTL       0xf400
++#define A5_RBBM_SECVID_TSB_TRUSTED_BASE 0xf800
++#define A5_RBBM_SECVID_TSB_TRUSTED_SIZE 0xf802
++#define A5_RBBM_SECVID_TSB_CNTL         0xf803
++#define A5_RBBM_SECVID_TSB_ADDR_MODE_CNTL 0xf810
 +
-+static vm_offset_t gcc59, gcc5b;
++#define RBBM_STATUS_HI_BUSY             (1u << 0)
++#define RBBM_INT_MISC_HANG_DETECT       (1u << 23)
++
++/* the hardware clock gating of the A505/A506/A508 (a5xx_gpu.c: a50x_hwcg) */
++static const uint32_t a50x_hwcg[][2] = {
++	{ 0x0068, 0x02222222 }, { 0x006c, 0x02222220 }, { 0x0070, 0x0000f3cf }, { 0x0074, 0x00000080 },
++	{ 0x004a, 0x22222222 }, { 0x004e, 0x22222222 }, { 0x0052, 0x00002222 }, { 0x00b0, 0x77777777 },
++	{ 0x00b4, 0x77777777 }, { 0x00b8, 0x00007777 }, { 0x00a4, 0x11111111 }, { 0x00a8, 0x11111111 },
++	{ 0x00ac, 0x00001111 }, { 0x005b, 0x22222222 }, { 0x005c, 0x22222222 }, { 0x005d, 0x00222222 },
++	{ 0x005a, 0x22222222 }, { 0x005e, 0x00fffff4 }, { 0x005f, 0x00000002 }, { 0x0078, 0x22222222 },
++	{ 0x007c, 0x00222222 }, { 0x0082, 0x00022220 }, { 0x008a, 0x05522222 }, { 0x008b, 0x00505555 },
++	{ 0x0086, 0x04040404 }, { 0x0080, 0x07444044 }, { 0x008c, 0x00000002 }, { 0x0081, 0x00010011 },
++	{ 0x0063, 0x04222222 }, { 0x0060, 0x02222222 }, { 0x0091, 0x00002222 }, { 0x0064, 0x00000000 },
++	{ 0x0062, 0x04104004 }, { 0x0090, 0x00000000 }, { 0x0066, 0x00000000 }, { 0x0065, 0x00004000 },
++	{ 0x0061, 0x00000200 }, { 0x0092, 0x00002222 },
++};
++
++/* PM4 (adreno_pm4.xml, adreno_gpu.h) */
++#define CP_TYPE4_PKT            0x40000000u
++#define CP_TYPE7_PKT            0x70000000u
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_MEM_WRITE            0x3d
++#define CP_REG_TO_MEM           0x3e
++#define CP_INDIRECT_BUFFER_PFE  0x3f
++#define CP_EVENT_WRITE          0x46
++#define CP_ME_INIT              0x48
++#define CP_SET_SECURE_MODE      0x66
++#define EVENT_CACHE_FLUSH_TS    0x04
++
++#define GMEM_SIZE               (128 * 1024 + 8 * 1024)         /* Linux's catalog, A506 */
++#define GMEM_BASE               0x00100000u
++#define HIGHEST_BANK_BIT        14
++#define CHIP_ID                 0x05000600u                     /* 5.0.6.0 */
++#define UCHE_TRAP_BASE          0x0001ffffffff0000ull
++
++/* the GPU's addresses: ours below 0x10000000, the buffers' above (32 bits: the context is 32-bit LPAE) */
++#define VA_RING                 0x01000000ull
++#define VA_PM4                  0x01100000ull
++#define VA_PFP                  0x01200000ull
++#define VA_SCRATCH              0x01300000ull
++#define VA_START                0x10000000ull
++#define VA_SIZE                 0xe0000000ull
++#define RING_BYTES              32768u
++#define RING_WORDS              (RING_BYTES / 4)
++#define RB_CNTL                 (12u | 2u << 8 | 1u << 27)      /* 32 KB, 32-byte blocks, no rptr shadow */
++#define SCRATCH_FENCE           0x40
++#define SCRATCH_TEST            0x80
++
++static vm_offset_t gcc59, gcc5b, gpu, smmu;
++static uint32_t core_mhz = 133;
++static bool started;
 +
 +static inline uint32_t
 +rd(vm_offset_t a)
@@ -1821,6 +2174,40 @@ index 0000000..cfc97c0
 +gcc(uint32_t offset)
 +{
 +	return (offset >> 12 == 0x5b ? gcc5b : gcc59) + (offset & 0xfff);
++}
++
++static inline uint32_t
++grd(uint32_t reg)
++{
++	return rd(gpu + 4 * reg);
++}
++
++static inline void
++gwr(uint32_t reg, uint32_t value)
++{
++	wr(gpu + 4 * reg, value);
++}
++
++static inline void
++gwr64(uint32_t reg, uint64_t value)
++{
++	gwr(reg, (uint32_t)value);
++	gwr(reg + 1, (uint32_t)(value >> 32));
++}
++
++static inline void
++grmw(uint32_t reg, uint32_t clear, uint32_t set)
++{
++	gwr(reg, (grd(reg) & ~clear) | set);
++}
++
++static void
++to_memory(vm_offset_t start, vm_size_t size)
++{
++	for (vm_offset_t line = start & ~(vm_offset_t)63; line < start + size; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line));
++	}
++	__builtin_arm_dsb(0xf);
 +}
 +
 +static bool
@@ -1882,90 +2269,895 @@ index 0000000..cfc97c0
 +	    __builtin_arm_rsr64("MPIDR_EL1") & 0xffff, ns ? (c1 - c0) * 1000 / ns : 0, c1 - c0, ns / 1000);
 +}
 +
-+static void
-+gpu_thread(__unused void *parameter, __unused wait_result_t result)
-+{
-+	vm_offset_t gpu, gpu_vbif;
-+	bool cx, gx, ok = true;
-+	uint32_t a0, a1;
++/* ---- power and clocks ------------------------------------------------------------------------ */
 +
-+	measure_cpu();
++/*
++ * The core clock: GPLL0 (800 MHz) divided, from Linux's ftbl_gfx3d_clk_src. VDD_CX's level for
++ * each (msm8953.dtsi gpu_opp_table): 133 MHz min_svs, 200/216 low_svs, 266/320 svs, 400 svs_plus.
++ * A level above the lowest is asked of the RPM (rpmpd: resource "rwcx" 0, key "lvl"); the clock is
++ * raised only if the RPM acknowledges it.
++ */
++static const struct {
++	uint32_t mhz, half_dividers, level;
++} speeds[] = {
++	{ 133, 12, 48 }, { 200, 8, 64 }, { 266, 6, 128 }, { 320, 5, 128 }, { 400, 4, 192 },
++};
++#define RPM_RWCX                0x78637772u     /* "rwcx" */
++#define RPM_KEY_LEVEL           0x006c766cu     /* "lvl" */
++
++static bool
++power_up(void)
++{
++	bool ok = true, cx, gx;
++	uint32_t wanted = 133, pick = 0;
++
 +	gcc59 = ml_io_map(GCC_PHYS + 0x59000, 0x1000);
 +	gcc5b = ml_io_map(GCC_PHYS + 0x5b000, 0x1000);
 +	dump("as LK left it");
-+	delay_for_interval(2, NSEC_PER_SEC);
 +
-+	say("stage 1: the bus and interface clocks (ahb, bimc_gfx, bimc_gpu, timer, aon)\n");
 +	ok &= branch_on(BR_AHB);
 +	ok &= branch_on(BR_BIMC_GFX);
 +	ok &= branch_on(BR_BIMC_GPU);
 +	ok &= branch_on(BR_TIMER);
 +	ok &= branch_on(BR_AON);
-+	say("stage 1: %s\n", ok ? "all on" : "NOT ALL ON");
-+	delay_for_interval(2, NSEC_PER_SEC);
-+
-+	say("stage 2: the CX power domain\n");
 +	cx = gdsc_on(CX_GDSC);
-+	say("stage 2: cx gdsc %s (%08x)\n", cx ? "on" : "DID NOT POWER UP", rd(gcc(CX_GDSC)));
-+	delay_for_interval(2, NSEC_PER_SEC);
-+
-+	say("stage 3: the GX power domain (the I/O clamp let go first)\n");
 +	wr(gcc(GX_CLAMP), rd(gcc(GX_CLAMP)) & ~1u);
 +	gx = gdsc_on(GX_GDSC);
-+	wr(gcc(BR_GFX3D), rd(gcc(BR_GFX3D)) | 3u << 13);         /* keep memories and periphery while it is on */
++	wr(gcc(BR_GFX3D), rd(gcc(BR_GFX3D)) | 3u << 13);         /* keep memories and periphery while on */
 +	wr(gcc(BR_GX_OTHER), rd(gcc(BR_GX_OTHER)) | 3u << 13);
-+	say("stage 3: gx gdsc %s (%08x), clamp %08x\n", gx ? "on" : "DID NOT POWER UP", rd(gcc(GX_GDSC)), rd(gcc(GX_CLAMP)));
-+	delay_for_interval(2, NSEC_PER_SEC);
 +
-+	say("stage 4: the core clock, GPLL0 / 6 = 133 MHz\n");
-+	wr(gcc(GFX3D_CFG), 1u << 8 | (2 * 6 - 1));
++	PE_parse_boot_argn("tissot_gpu_mhz", &wanted, sizeof(wanted));
++	for (unsigned i = 0; i < sizeof(speeds) / sizeof(speeds[0]); i++) {
++		if (speeds[i].mhz <= wanted) {
++			pick = i;
++		}
++	}
++	while (pick > 0 && redwood_tissot_rpm_request(RPM_RWCX, 0, RPM_KEY_LEVEL, speeds[pick].level) != 0) {
++		say("the RPM does not take VDD_CX level %u for %u MHz\n", speeds[pick].level, speeds[pick].mhz);
++		pick--;
++	}
++	wr(gcc(GFX3D_CFG), 1u << 8 | (speeds[pick].half_dividers - 1));
 +	wr(gcc(GFX3D_CMD), rd(gcc(GFX3D_CMD)) | 1);
 +	ok &= wait_for(GFX3D_CMD, 1, 0, 10);
 +	ok &= branch_on(BR_GFX3D);
-+	dump("after the power-up");
-+	if (!(ok && cx && gx)) {
-+		say("not everything is on: no GPU register is read (stopping here)\n");
-+		goto out;
-+	}
-+	delay_for_interval(2, NSEC_PER_SEC);
++	core_mhz = speeds[pick].mhz;
++	dump("powered");
++	say("clocks %s, cx %s, gx %s; the core at %u MHz\n", ok ? "on" : "NOT ALL ON", cx ? "on" : "OFF", gx ? "on" : "OFF",
++	    core_mhz);
++	return ok && cx && gx;
++}
 +
-+	say("stage 5: the GPU's registers\n");
-+	gpu = ml_io_map(GPU_PHYS + 0x1000, 0x1000) - 0x1000;
-+	gpu_vbif = ml_io_map(GPU_PHYS + (VBIF_VERSION & ~0xfffu), 0x1000) - (VBIF_VERSION & ~0xfffu);
-+	a0 = rd(gpu + RBBM_ALWAYSON_LO);
-+	delay(1000);
-+	a1 = rd(gpu + RBBM_ALWAYSON_LO);
-+	say("VBIF_VERSION %08x, RBBM_STATUS %08x, always-on counter %08x -> %08x (%s)\n", rd(gpu_vbif + VBIF_VERSION),
-+	    rd(gpu + RBBM_STATUS), a0, a1, a1 != a0 ? "counting: the GPU is alive" : "not counting");
-+out:
-+	thread_terminate(current_thread());
++/* ---- TrustZone ------------------------------------------------------------------------------- */
++
++#define SCM_64                  (1ull << 30)
++#define SCM_SIP                 (2ull << 24)
++#define SCM_CALL(service, command) ((uint64_t)(service) << 8 | (command))
++#define SCM_INTERRUPTED         1
++#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
++#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
++#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
++#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
++#define SCM_MP_RESTORE_SEC_CFG  SCM_CALL(0xc, 2)
++#define SCM_MP_PTBL_SIZE        SCM_CALL(0xc, 3)
++#define SCM_MP_PTBL_INIT        SCM_CALL(0xc, 4)
++#define PAS_GPU                 13
++#define GPU_IOMMU_SECURE_ID     18
++
++/* One call (qcom_scm-smc.c, the 64-bit convention): x0 the result, *a1/*a2 the answer's words. */
++static int32_t
++scm(const char *what, uint64_t function, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *a1, uint64_t *a2)
++{
++	uint64_t session = 0;
++
++	for (int i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i == 0 ? (SCM_64 | SCM_SIP | function) : SCM_INTERRUPTED;
++		register uint64_t x1 __asm__("x1") = arginfo;
++		register uint64_t x2 __asm__("x2") = a;
++		register uint64_t x3 __asm__("x3") = b;
++		register uint64_t x4 __asm__("x4") = c;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
++		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		session = x6;
++		if (x0 != SCM_INTERRUPTED) {
++			say("TrustZone, %s: %d, %#llx %#llx\n", what, (int32_t)x0, x1, x2);
++			if (a1 != NULL) {
++				*a1 = x1;
++			}
++			if (a2 != NULL) {
++				*a2 = x2;
++			}
++			return (int32_t)x0;
++		}
++	}
++	say("TrustZone, %s: always interrupted\n", what);
++	return -1;
++}
++
++static const uint8_t *
++image_file(const char *name, uint64_t *size)
++{
++	int disk = -1;
++	const uint8_t *data = redwood_image_file("fw", name, size, &disk);
++
++	if (data == NULL) {
++		say("no fw/%s in the small image (build it with ../fw-gpu holding the Mi A1's GPU firmware)\n", name);
++	}
++	return data;
++}
++
++/* Memory TrustZone may read (and then owns): physically contiguous, out of the cache. 0: none. */
++static uint64_t
++tz_memory(const void *contents, uint64_t size, uint64_t total)
++{
++	vm_offset_t memory = 0;
++
++	if (kmem_alloc_contig(kernel_map, &memory, round_page(total), 0, 0, 0, KMA_KOBJECT | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return 0;
++	}
++	if (contents != NULL) {
++		memcpy((void *)memory, contents, size);
++	}
++	to_memory(memory, round_page(total));
++	return kvtophys(memory);
++}
++
++/*
++ * The zap shader (mdt_loader.c, qcom_mdt_pas_init + qcom_mdt_load; adreno_gpu.c zap_shader_load_mdt):
++ * TrustZone checks the header, is told where the image goes, the loadable segments are put there,
++ * and it authenticates and runs it. The A506's has one loadable segment, relocatable.
++ */
++static bool
++zap_load(void)
++{
++	const uint8_t *mdt;
++	uint64_t mdt_size = 0, header, answer = 0;
++	uint32_t phoff, phnum, min_address = ~0u, max_address = 0;
++	volatile uint8_t *zap;
++
++	if ((mdt = image_file("a506_zap.mdt", &mdt_size)) == NULL || mdt_size < 52 || memcmp(mdt, "\177ELF\1", 5) != 0) {
++		return false;
++	}
++	phoff = mdt[28] | mdt[29] << 8 | mdt[30] << 16 | (uint32_t)mdt[31] << 24;
++	phnum = mdt[44] | mdt[45] << 8;
++	for (uint32_t i = 0; i < phnum && phoff + 32 * (i + 1) <= mdt_size; i++) {
++		const uint32_t *ph = (const uint32_t *)(const void *)(mdt + phoff + 32 * i);
++
++		/* PT_LOAD, not the hash segment (flags [26:24] = 2), with memory */
++		if (ph[0] == 1 && ((ph[6] >> 24) & 7) != 2 && ph[5] != 0) {
++			min_address = MIN(min_address, ph[3] & ~0xfffu);
++			max_address = MAX(max_address, (ph[3] + ph[5] + 0xfff) & ~0xfffu);
++		}
++	}
++	if (min_address >= max_address || max_address - min_address > ZAP_SIZE) {
++		say("the zap shader's segments (%#x..%#x) do not fit its 8 KB\n", min_address, max_address);
++		return false;
++	}
++	scm("give up an earlier zap shader", SCM_PAS_SHUTDOWN, 1, PAS_GPU, 0, 0, NULL, NULL);
++	if ((header = tz_memory(mdt, mdt_size, mdt_size)) == 0) {
++		return false;
++	}
++	if (scm("the zap shader's header", SCM_PAS_INIT_IMAGE, 2 | 2 << 6, PAS_GPU, header, 0, &answer, NULL) != 0 || answer != 0) {
++		return false;
++	}
++	if (scm("where it goes", SCM_PAS_MEM_SETUP, 3, PAS_GPU, ZAP_PHYS, max_address - min_address, &answer, NULL) != 0 ||
++	    answer != 0) {
++		return false;
++	}
++	zap = (volatile uint8_t *)ml_io_map_wcomb(ZAP_PHYS, ZAP_SIZE);
++	for (uint32_t i = 0; i < ZAP_SIZE; i++) {
++		zap[i] = 0;
++	}
++	for (uint32_t i = 0; i < phnum; i++) {
++		const uint32_t *ph = (const uint32_t *)(const void *)(mdt + phoff + 32 * i);
++		char name[24];
++		const uint8_t *segment;
++		uint64_t size = 0;
++
++		if (ph[0] != 1 || ((ph[6] >> 24) & 7) == 2 || ph[4] == 0) {
++			continue;
++		}
++		snprintf(name, sizeof(name), "a506_zap.b%02u", i);
++		if ((segment = image_file(name, &size)) == NULL || size < ph[4] || ph[3] - min_address + ph[4] > ZAP_SIZE) {
++			return false;
++		}
++		for (uint32_t k = 0; k < ph[4]; k++) {
++			zap[ph[3] - min_address + k] = segment[k];
++		}
++	}
++	__builtin_arm_dsb(0xf);
++	if (scm("authenticate and run the zap shader", SCM_PAS_AUTH_AND_RESET, 1, PAS_GPU, 0, 0, &answer, NULL) != 0 ||
++	    answer != 0) {
++		return false;
++	}
++	say("TrustZone runs the zap shader\n");
++	return true;
++}
++
++/* ---- the IOMMU: context bank 0, page tables ------------------------------------------------------ */
++
++#define CB_SCTLR                0x000
++#define CB_TCR2                 0x010
++#define CB_TTBR0                0x020
++#define CB_TTBR1                0x028
++#define CB_TCR                  0x030
++#define CB_MAIR0                0x038
++#define CB_MAIR1                0x03c
++#define CB_FSR                  0x058
++#define CB_FAR                  0x060
++#define CB_FSYNR0               0x068
++#define CB_TLBIASID             0x610
++#define CB_TLBSYNC              0x7f0
++#define CB_TLBSTATUS            0x7f4
++#define SCTLR_ON                0x10e7u         /* M TRE AFE CFRE CFIE CFCFG ASIDPNE (qcom_iommu_init_domain) */
++#define TCR_32BIT_NC            0x80802000u     /* EAE, EPD1, SH0 outer, walks uncached, T0SZ 0 (32 bits) */
++#define TCR2_40BIT              0x00038002u     /* SEP upstream, 40-bit output */
++#define MAIR_LINUX              0xf404ff44u     /* 0 non-cacheable, 1 write-back, 2 device, 3 inner NC outer WB */
++
++#define PTE_TABLE               3ull
++#define PTE_PAGE                (3ull | 1ull << 10 | 2ull << 8 | 1ull << 6 | 1ull << 11)       /* AF, outer shareable, user, nG; attr 0 */
++#define PTE_READ_ONLY           (2ull << 6)
++
++static uint64_t *l1;                    /* 4 entries of 1 GB */
++static uint64_t *l2[4];                 /* 512 of 2 MB each */
++static uint64_t **l3[4];                /* [512] tables of 512 4K pages */
++static uint64_t l1_phys;
++
++static uint64_t *
++table_new(void)
++{
++	vm_offset_t page = 0;
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	to_memory(page, PAGE_SIZE);
++	return (uint64_t *)page;
++}
++
++/* A 4K page of physical memory at a GPU address (0: unmapped). */
++static bool
++space_map(uint64_t address, uint64_t phys, bool read_only)
++{
++	uint32_t i1 = (uint32_t)(address >> 30) & 3, i2 = (uint32_t)(address >> 21) & 511, i3 = (uint32_t)(address >> 12) & 511;
++	uint64_t *table;
++
++	if (address >> 32) {
++		return false;
++	}
++	if (l2[i1] == NULL) {
++		vm_offset_t list = 0;
++
++		if ((l2[i1] = table_new()) == NULL ||
++		    kmem_alloc(kernel_map, &list, round_page(512 * sizeof(uint64_t *)), KMA_KOBJECT | KMA_ZERO,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return false;
++		}
++		l3[i1] = (uint64_t **)list;
++		l1[i1] = kvtophys((vm_offset_t)l2[i1]) | PTE_TABLE;
++		to_memory((vm_offset_t)&l1[i1], 8);
++	}
++	if ((table = l3[i1][i2]) == NULL) {
++		if (phys == 0) {
++			return true;
++		}
++		if ((table = l3[i1][i2] = table_new()) == NULL) {
++			return false;
++		}
++		l2[i1][i2] = kvtophys((vm_offset_t)table) | PTE_TABLE;
++		to_memory((vm_offset_t)&l2[i1][i2], 8);
++	}
++	table[i3] = phys == 0 ? 0 : (phys & ~0xfffull) | PTE_PAGE | (read_only ? PTE_READ_ONLY : 0);
++	to_memory((vm_offset_t)&table[i3], 8);
++	return true;
++}
++
++static void
++space_flush(void)
++{
++	__builtin_arm_dsb(0xf);
++	wr(smmu + CB_TLBIASID, 0);
++	wr(smmu + CB_TLBSYNC, 0);
++	for (int i = 0; i < 100000 && (rd(smmu + CB_TLBSTATUS) & 1); i++) {
++	}
++}
++
++static bool
++smmu_up(void)
++{
++	uint64_t size = 0, result = 0, table;
++
++	/* TrustZone's own tables for the secure contexts, once per boot (qcom_iommu_sec_ptbl_init) */
++	if (scm("the IOMMUs' secure table size", SCM_MP_PTBL_SIZE, 1, 0, 0, 0, &size, &result) == 0 && result == 0 && size != 0 &&
++	    size < 16 * 1024 * 1024) {
++		if ((table = tz_memory(NULL, 0, size)) != 0) {
++			scm("the IOMMUs' secure tables", SCM_MP_PTBL_INIT, 3 | 2 << 4, table, size, 0, NULL, NULL);
++		}
++	}
++	if (scm("the GPU IOMMU's context bank 0 (secure id 18)", SCM_MP_RESTORE_SEC_CFG, 2, GPU_IOMMU_SECURE_ID, 0, 0, &result,
++	    NULL) != 0 || result != 0) {
++		say("TrustZone does not hand over the GPU's IOMMU context\n");
++		return false;
++	}
++	if ((l1 = table_new()) == NULL) {
++		return false;
++	}
++	l1_phys = kvtophys((vm_offset_t)l1);
++	smmu = ml_io_map(SMMU_CB0_PHYS, 0x1000);
++	wr(smmu + CB_SCTLR, 0);
++	wr(smmu + CB_FAR, 0);
++	wr(smmu + CB_FAR + 4, 0);
++	wr(smmu + CB_FSR, 0xffffffff);
++	wr(smmu + CB_TTBR0, (uint32_t)l1_phys);
++	wr(smmu + CB_TTBR0 + 4, (uint32_t)(l1_phys >> 32));     /* ASID 0 */
++	wr(smmu + CB_TTBR1, 0);
++	wr(smmu + CB_TTBR1 + 4, 0);
++	wr(smmu + CB_TCR2, TCR2_40BIT);
++	wr(smmu + CB_TCR, TCR_32BIT_NC);
++	wr(smmu + CB_MAIR0, MAIR_LINUX);
++	wr(smmu + CB_MAIR1, 0);
++	wr(smmu + CB_SCTLR, SCTLR_ON);
++	space_flush();
++	say("IOMMU context 0: tables at %#llx, SCTLR %08x TCR %08x\n", l1_phys, rd(smmu + CB_SCTLR), rd(smmu + CB_TCR));
++	return true;
++}
++
++/* Kernel memory of ours at a fixed GPU address. */
++struct block {
++	vm_offset_t memory;
++	uint64_t address;
++	uint32_t size;
++};
++static struct block ring_block, pm4_block, pfp_block, scratch_block;
++
++static bool
++block_new(struct block *block, uint64_t address, uint32_t size, bool read_only)
++{
++	block->address = address;
++	block->size = (size + 4095) & ~4095u;
++	if (kmem_alloc(kernel_map, &block->memory, round_page(block->size), KMA_KOBJECT | KMA_ZERO, VM_KERN_MEMORY_IOKIT) !=
++	    KERN_SUCCESS) {
++		return false;
++	}
++	for (uint32_t offset = 0; offset < block->size; offset += 4096) {
++		if (!space_map(address + offset, kvtophys(block->memory + offset), read_only)) {
++			return false;
++		}
++	}
++	to_memory(block->memory, block->size);
++	return true;
++}
++
++/* A microcode file without its first word (adreno_fw_create_bo). */
++static bool
++microcode(struct block *block, const char *name, uint64_t address)
++{
++	const uint8_t *file;
++	uint64_t size = 0;
++
++	if ((file = image_file(name, &size)) == NULL || size < 8 || !block_new(block, address, (uint32_t)size - 4, true)) {
++		return false;
++	}
++	memcpy((void *)block->memory, file + 4, size - 4);
++	to_memory(block->memory, block->size);
++	return true;
++}
++
++/* ---- the ring ---------------------------------------------------------------------------------- */
++
++static uint32_t ring_at;                /* where the next word goes, in words */
++static uint32_t fence;                  /* the number of the last submission */
++
++static inline uint32_t
++parity(uint32_t v)
++{
++	return (0x9669 >> (0xf & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28))) & 1;
++}
++
++static void
++ring(uint32_t word)
++{
++	((volatile uint32_t *)ring_block.memory)[ring_at] = word;
++	ring_at = (ring_at + 1) % RING_WORDS;
++}
++
++static void
++ring_pkt7(uint32_t opcode, uint32_t count)
++{
++	ring(CP_TYPE7_PKT | count | parity(count) << 15 | (opcode & 0x7f) << 16 | parity(opcode) << 23);
++}
++
++static void
++ring_pkt4(uint32_t reg, uint32_t count)
++{
++	ring(CP_TYPE4_PKT | count | parity(count) << 7 | (reg & 0x3ffff) << 8 | parity(reg) << 27);
++}
++
++static void
++ring_send(void)
++{
++	to_memory(ring_block.memory, RING_BYTES);
++	gwr(A5_CP_RB_WPTR, ring_at);
++}
++
++static uint32_t
++ring_room(void)
++{
++	return (grd(A5_CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
++}
++
++static bool
++ring_idle(uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 10; i++) {
++		if (grd(A5_CP_RB_RPTR) == ring_at && !(grd(A5_RBBM_STATUS) & ~RBBM_STATUS_HI_BUSY)) {
++			return true;
++		}
++		delay(100);
++	}
++	say("not idle: status %08x, interrupts %08x, rptr %u wptr %u, CP fault %08x, protection %08x\n", grd(A5_RBBM_STATUS),
++	    grd(A5_RBBM_INT_0_STATUS), grd(A5_CP_RB_RPTR), ring_at, grd(A5_CP_HW_FAULT), grd(A5_CP_PROTECT_STATUS));
++	return false;
++}
++
++static uint32_t
++scratch_word(uint32_t at)
++{
++	to_memory(scratch_block.memory + at, 4);
++	return *(volatile uint32_t *)(scratch_block.memory + at);
++}
++
++/* ---- bring-up (a5xx_pm_resume, a5xx_hw_init) ------------------------------------------------------ */
++
++#define PROTECT_RW(reg, log2_len) (1u << 30 | 1u << 29 | (uint32_t)(log2_len) << 24 | (((reg) << 2) & 0xfffff))
++
++static void
++hwcg(bool on)
++{
++	for (unsigned i = 0; i < sizeof(a50x_hwcg) / sizeof(a50x_hwcg[0]); i++) {
++		gwr(a50x_hwcg[i][0], on ? a50x_hwcg[i][1] : 0);
++	}
++	gwr(A5_RBBM_CLOCK_CNTL, on ? 0xaaa8aa00 : 0);
++	gwr(A5_RBBM_ISDB_CNT, on ? 0x182 : 0x180);
++}
++
++static void
++hw_init(void)
++{
++	/* a5xx_pm_resume: the A505..A512 do their own RBBM clock control */
++	gwr(A5_RBBM_CLOCK_CNTL, 0x00000055);
++	hwcg(true);
++	grmw(A5_RBBM_CLOCK_CNTL, 0xff, 0);
++
++	gwr(A5_VBIF_ROUND_ROBIN_QOS_ARB, 0x00000003);
++	gwr(A5_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
++	gwr(A5_RBBM_AHB_CNTL0, 0x00000001);
++	gwr(A5_RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0xffff);
++	gwr(A5_RBBM_PERFCTR_CNTL, 0x01);
++	gwr(A5_CP_PERFCTR_CP_SEL_0, 0);                 /* PERF_CP_ALWAYS_COUNT */
++	gwr(A5_RBBM_PERFCTR_RBBM_SEL_0, 6);
++	gwr(A5_UCHE_CACHE_WAYS, 0x02);
++	gwr64(A5_UCHE_TRAP_BASE, UCHE_TRAP_BASE);
++	gwr64(A5_UCHE_WRITE_THRU_BASE, UCHE_TRAP_BASE);
++	gwr64(A5_UCHE_GMEM_RANGE_MIN, GMEM_BASE);
++	gwr64(A5_UCHE_GMEM_RANGE_MAX, GMEM_BASE + GMEM_SIZE - 1);
++	/* the A505/A506/A508 branches */
++	gwr(A5_CP_MEQ_THRESHOLDS, 0x20);
++	gwr(A5_CP_MERCIU_SIZE, 0x400);
++	gwr(A5_CP_ROQ_THRESHOLDS_2, 0x40000030);
++	gwr(A5_CP_ROQ_THRESHOLDS_1, 0x20100d0a);
++	gwr(A5_PC_DBG_ECO_CNTL, 0x100u << 11 | 0x100u << 22);
++	grmw(A5_PC_DBG_ECO_CNTL, 0, 1u << 8);           /* ADRENO_QUIRK_TWO_PASS_USE_WFI */
++	grmw(A5_RB_DBG_ECO_CNTL, 0, 1u << 9);           /* one SP: no DP2 clock gating */
++	gwr(A5_UCHE_MODE_CNTL, 1u << 29);
++	gwr(A5_CP_CHICKEN_DBG, 0x02000000);
++	gwr(A5_RBBM_AHB_CNTL1, 0xa6ffffff);
++	hwcg(true);
++	gwr(A5_RBBM_AHB_CNTL2, 0x0000003f);
++	gwr(A5_TPL1_MODE_CNTL, (HIGHEST_BANK_BIT - 13) << 7);
++	gwr(A5_RB_MODE_CNTL, (HIGHEST_BANK_BIT - 13) << 1);
++	grmw(A5_VPC_DBG_ECO_CNTL, 0, 1u << 10);
++	/* what the CP may not write */
++	gwr(A5_CP_PROTECT_CNTL, 0x00000007);
++	gwr(A5_CP_PROTECT(0), PROTECT_RW(0x04, 2));
++	gwr(A5_CP_PROTECT(1), PROTECT_RW(0x08, 3));
++	gwr(A5_CP_PROTECT(2), PROTECT_RW(0x10, 4));
++	gwr(A5_CP_PROTECT(3), PROTECT_RW(0x20, 5));
++	gwr(A5_CP_PROTECT(4), PROTECT_RW(0x40, 6));
++	gwr(A5_CP_PROTECT(5), PROTECT_RW(0x80, 6));
++	gwr(A5_CP_PROTECT(6), PROTECT_RW(A5_RBBM_SECVID_TSB_TRUSTED_BASE, 4));
++	gwr(A5_CP_PROTECT(7), PROTECT_RW(A5_RBBM_SECVID_TRUST_CNTL, 1));
++	gwr(A5_CP_PROTECT(8), PROTECT_RW(0x800, 6));
++	gwr(A5_CP_PROTECT(9), PROTECT_RW(0x840, 3));
++	gwr(A5_CP_PROTECT(10), PROTECT_RW(0x880, 5));
++	gwr(A5_CP_PROTECT(11), PROTECT_RW(0xaa0, 0));
++	gwr(A5_CP_PROTECT(12), PROTECT_RW(0xcc0, 0));
++	gwr(A5_CP_PROTECT(13), PROTECT_RW(0xcf0, 1));
++	gwr(A5_CP_PROTECT(14), PROTECT_RW(0xe68, 3));
++	gwr(A5_CP_PROTECT(15), PROTECT_RW(0xe70, 4));
++	gwr(A5_CP_PROTECT(16), PROTECT_RW(0xe80, 4));
++	gwr(A5_CP_PROTECT(17), PROTECT_RW(0x10000, 15));
++	gwr(A5_RBBM_SECVID_TSB_CNTL, 0);
++	gwr64(A5_RBBM_SECVID_TSB_TRUSTED_BASE, 0);
++	gwr(A5_RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
++	/* 64-bit addresses everywhere */
++	gwr(A5_CP_ADDR_MODE_CNTL, 1);
++	gwr(A5_VSC_ADDR_MODE_CNTL, 1);
++	gwr(A5_GRAS_ADDR_MODE_CNTL, 1);
++	gwr(A5_RB_ADDR_MODE_CNTL, 1);
++	gwr(A5_PC_ADDR_MODE_CNTL, 1);
++	gwr(A5_HLSQ_ADDR_MODE_CNTL, 1);
++	gwr(A5_VFD_ADDR_MODE_CNTL, 1);
++	gwr(A5_VPC_ADDR_MODE_CNTL, 1);
++	gwr(A5_UCHE_ADDR_MODE_CNTL, 1);
++	gwr(A5_SP_ADDR_MODE_CNTL, 1);
++	gwr(A5_TPL1_ADDR_MODE_CNTL, 1);
++	gwr(A5_RBBM_SECVID_TSB_ADDR_MODE_CNTL, 1);
++	/* ADRENO_QUIRK_LMLOADKILL_DISABLE */
++	grmw(A5_VPC_DBG_ECO_CNTL, 0, 1u << 23);
++	grmw(A5_HLSQ_DBG_ECO_CNTL, 1u << 18, 0);
++	/* the microcode and the ring */
++	gwr64(A5_CP_ME_INSTR_BASE_LO, VA_PM4);
++	gwr64(A5_CP_PFP_INSTR_BASE_LO, VA_PFP);
++	gwr64(A5_CP_RB_BASE, VA_RING);
++	gwr(A5_CP_RB_CNTL, RB_CNTL);
++	gwr(A5_RBBM_INT_0_MASK, 0);                     /* polled: no interrupts */
++}
++
++static bool
++cp_start(void)
++{
++	ring_at = 0;
++	gwr(A5_CP_PFP_ME_CNTL, 0);                      /* the micro engine runs */
++	/* a5xx_me_init */
++	ring_pkt7(CP_ME_INIT, 8);
++	ring(0x0000002f);
++	ring(0x00000003);
++	ring(0x20000000);
++	ring(0);
++	ring(0);
++	ring(0x0000000b);                               /* A505/A506/A530: a WFI after every 3D draw */
++	ring(0);
++	ring(0);
++	ring_send();
++	return ring_idle(500);
++}
++
++/* The CP writes a word to memory on command: the proof that it does as it is told, through the IOMMU. */
++static bool
++cp_writes(uint32_t value)
++{
++	ring_pkt7(CP_MEM_WRITE, 3);
++	ring((uint32_t)(VA_SCRATCH + SCRATCH_TEST));
++	ring((uint32_t)((VA_SCRATCH + SCRATCH_TEST) >> 32));
++	ring(value);
++	ring_pkt7(CP_WAIT_FOR_IDLE, 0);
++	ring_send();
++	return ring_idle(500) && scratch_word(SCRATCH_TEST) == value;
++}
++
++static bool
++bring_up(void)
++{
++	gpu = ml_io_map(GPU_PHYS, GPU_SIZE);
++	say("GPU registers: VBIF version %08x, RBBM status %08x\n", grd(A5_VBIF_VERSION), grd(A5_RBBM_STATUS));
++	if (!smmu_up()) {
++		return false;
++	}
++	if (!block_new(&ring_block, VA_RING, RING_BYTES, true) || !block_new(&scratch_block, VA_SCRATCH, 4096, false) ||
++	    !microcode(&pm4_block, "a530_pm4.fw", VA_PM4) || !microcode(&pfp_block, "a530_pfp.fw", VA_PFP)) {
++		say("no memory for the ring or the microcode, or no microcode\n");
++		return false;
++	}
++	space_flush();
++	hw_init();
++	if (!cp_start()) {
++		say("the CP does not take its first command (ME_INIT); IOMMU FSR %08x FAR %08x FSYNR0 %08x\n", rd(smmu + CB_FSR),
++		    rd(smmu + CB_FAR), rd(smmu + CB_FSYNR0));
++		return false;
++	}
++	say("the CP runs (ME_INIT done)\n");
++	if (!zap_load()) {
++		say("NO ZAP SHADER: the CP stays in secure mode, and draws nothing of ours\n");
++		return false;
++	}
++	ring_pkt7(CP_SET_SECURE_MODE, 1);
++	ring(0);
++	ring_send();
++	if (!ring_idle(500)) {
++		return false;
++	}
++	if (!cp_writes(0x5a0de506)) {
++		say("the CP does not write to memory through the IOMMU: word %08x, IOMMU FSR %08x FAR %08x\n",
++		    scratch_word(SCRATCH_TEST), rd(smmu + CB_FSR), rd(smmu + CB_FAR));
++		return false;
++	}
++	say("THE ADRENO 506 RUNS: out of secure mode, it writes memory on command (%u MHz)\n", core_mhz);
++	return true;
++}
++
++/* ---- the interface of RedwoodGPU (see redwood_adreno.c, "the GPU kept on") ----------------------- */
++
++static struct {
++	uint64_t start, size;
++} va_free[1024];
++static unsigned va_free_count;
++static uint64_t va_used;
++static uint32_t va_live;
++
++bool
++redwood_tissot_gpu_ready(void)
++{
++	return started;
++}
++
++bool
++redwood_tissot_gpu_parameter(uint32_t which, uint64_t *value)
++{
++	switch (which) {
++	case 0x01:                              /* GPU_ID */
++		*value = 506;
++		return true;
++	case 0x02:                              /* GMEM_SIZE */
++		*value = GMEM_SIZE;
++		return true;
++	case 0x03:                              /* CHIP_ID */
++		*value = CHIP_ID;
++		return true;
++	case 0x04:                              /* MAX_FREQ */
++		*value = core_mhz * 1000000ull;
++		return true;
++	case 0x05:                              /* TIMESTAMP */
++		*value = mach_absolute_time();
++		return true;
++	case 0x06:                              /* GMEM_BASE */
++		*value = GMEM_BASE;
++		return true;
++	case 0x07:                              /* PRIORITIES */
++		*value = 1;
++		return true;
++	case 0x08:                              /* PP_PGTABLE */
++	case 0x09:                              /* FAULTS */
++	case 0x0a:                              /* SUSPENDS */
++		*value = 0;
++		return true;
++	case 0x10:                              /* HIGHEST_BANK_BIT */
++		*value = HIGHEST_BANK_BIT;
++		return true;
++	default:
++		return false;
++	}
++}
++
++uint64_t
++redwood_tissot_gpu_address(uint64_t size)
++{
++	size = (size + 0xffff) & ~0xffffull;
++	for (unsigned i = 0; i < va_free_count; i++) {
++		if (va_free[i].size >= size) {
++			uint64_t address = va_free[i].start;
++
++			va_free[i].start += size;
++			va_free[i].size -= size;
++			if (va_free[i].size == 0) {
++				memmove(&va_free[i], &va_free[i + 1], (--va_free_count - i) * sizeof(va_free[0]));
++			}
++			va_used += size;
++			va_live++;
++			return address;
++		}
++	}
++	return 0;
 +}
 +
 +void
-+redwood_tissot_gpu_init(void)
++redwood_tissot_gpu_address_free(uint64_t address, uint64_t size)
 +{
-+	uint32_t enabled = 0;
-+	thread_t thread;
++	unsigned at;
 +
-+	if (!PE_parse_boot_argn("tissot_gpu", &enabled, sizeof(enabled)) || !enabled) {
-+		uint32_t tissot = 0;
-+
-+		/* the processor's speed alone, on every Mi A1 boot */
-+		if (PE_parse_boot_argn("tissot", &tissot, sizeof(tissot)) && tissot) {
-+			measure_cpu();
++	size = (size + 0xffff) & ~0xffffull;
++	va_used -= size;
++	va_live--;
++	for (at = 0; at < va_free_count && va_free[at].start < address; at++) {
++	}
++	if (at > 0 && va_free[at - 1].start + va_free[at - 1].size == address) {
++		va_free[at - 1].size += size;
++		if (at < va_free_count && address + size == va_free[at].start) {
++			va_free[at - 1].size += va_free[at].size;
++			memmove(&va_free[at], &va_free[at + 1], (--va_free_count - at) * sizeof(va_free[0]));
 +		}
++	} else if (at < va_free_count && address + size == va_free[at].start) {
++		va_free[at].start = address;
++		va_free[at].size += size;
++	} else if (va_free_count < sizeof(va_free) / sizeof(va_free[0])) {
++		memmove(&va_free[at + 1], &va_free[at], (va_free_count++ - at) * sizeof(va_free[0]));
++		va_free[at].start = address;
++		va_free[at].size = size;
++	}
++}
++
++void
++redwood_tissot_gpu_space(uint64_t *used, uint32_t *live, uint64_t *largest, unsigned *holes, unsigned *most, uint64_t *lost,
++    uint32_t *refused)
++{
++	*largest = 0;
++	for (unsigned i = 0; i < va_free_count; i++) {
++		*largest = MAX(*largest, va_free[i].size);
++	}
++	*used = va_used;
++	*live = va_live;
++	*holes = va_free_count;
++	*most = va_free_count;
++	*lost = 0;
++	*refused = 0;
++}
++
++bool
++redwood_tissot_gpu_map(uint64_t address, uint64_t phys, bool read_only)
++{
++	return space_map(address, phys, read_only);
++}
++
++void
++redwood_tissot_gpu_mapped(void)
++{
++	__builtin_arm_dsb(0xf);
++}
++
++void
++redwood_tissot_gpu_unmap(uint64_t address, uint64_t size)
++{
++	for (uint64_t offset = 0; offset < size; offset += 4096) {
++		space_map(address + offset, 0, false);
++	}
++	space_flush();
++}
++
++void
++redwood_tissot_gpu_to_memory(void *start, uint64_t size)
++{
++	to_memory((vm_offset_t)start, size);
++}
++
++bool
++redwood_tissot_gpu_done(uint32_t number)
++{
++	return (int32_t)(scratch_word(SCRATCH_FENCE) - number) >= 0;
++}
++
++uint32_t
++redwood_tissot_gpu_last(void)
++{
++	return fence;
++}
++
++void
++redwood_tissot_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
++{
++	*microseconds = 0;
++	*submissions = 0;
++	bzero(by, 7 * sizeof(uint32_t));
++}
++
++/* As Linux's a5xx_submit puts command buffers in the ring, without preemption. 0: the ring is full. */
++uint32_t
++redwood_tissot_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
++{
++	uint32_t wanted = 12 + 4 * count, room = 0;
++
++	for (int i = 0; i < 20000; i++) {
++		if ((room = ring_room()) >= wanted) {
++			break;
++		}
++		delay(100);
++	}
++	if (room < wanted) {
++		return 0;
++	}
++	if (++fence == 0) {
++		fence = 1;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		ring_pkt7(CP_INDIRECT_BUFFER_PFE, 3);
++		ring((uint32_t)addresses[i]);
++		ring((uint32_t)(addresses[i] >> 32));
++		ring(words[i]);
++	}
++	ring_pkt4(A5_CP_SCRATCH_REG(2), 1);
++	ring(fence);
++	ring_pkt7(CP_EVENT_WRITE, 4);
++	ring(EVENT_CACHE_FLUSH_TS);
++	ring((uint32_t)(VA_SCRATCH + SCRATCH_FENCE));
++	ring((uint32_t)((VA_SCRATCH + SCRATCH_FENCE) >> 32));
++	ring(fence);
++	ring_send();
++	return fence;
++}
++
++void
++redwood_tissot_gpu_report(const char *why)
++{
++	say("%s: submission %u is the last, %u done; rptr %u wptr %u; status %08x, interrupts %08x; CP fault %08x, "
++	    "interrupts %08x, protection %08x; IB1 %08x (%u words left), IB2 %08x (%u); IOMMU FSR %08x FAR %08x FSYNR0 %08x\n",
++	    why, fence, scratch_word(SCRATCH_FENCE), grd(A5_CP_RB_RPTR), ring_at, grd(A5_RBBM_STATUS),
++	    grd(A5_RBBM_INT_0_STATUS), grd(A5_CP_HW_FAULT), grd(A5_CP_INTERRUPT_STATUS), grd(A5_CP_PROTECT_STATUS),
++	    grd(A5_CP_IB1_BASE), grd(A5_CP_IB1_BUFSZ), grd(A5_CP_IB2_BASE), grd(A5_CP_IB2_BUFSZ), rd(smmu + CB_FSR),
++	    rd(smmu + CB_FAR), rd(smmu + CB_FSYNR0));
++	wr(smmu + CB_FSR, 0xffffffff);
++}
++
++bool
++redwood_tissot_gpu_recover(void)
++{
++	return false;
++}
++
++void
++redwood_tissot_gpu_stop(void)
++{
++	for (int i = 0; i < 5000 && started && !redwood_tissot_gpu_done(fence); i++) {
++		delay(100);
++	}
++	started = false;
++}
++
++/* ---- start ----------------------------------------------------------------------------------- */
++
++static void
++probe_only(void)
++{
++	if (!power_up()) {
++		say("not everything is on: no GPU register is read\n");
 +		return;
 +	}
-+	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
-+		thread_deallocate(thread);
++	gpu = ml_io_map(GPU_PHYS, GPU_SIZE);
++	say("VBIF_VERSION %08x, RBBM_STATUS %08x, always-on counter %08x\n", grd(A5_VBIF_VERSION), grd(A5_RBBM_STATUS),
++	    grd(A5_RBBM_ALWAYSON_COUNTER_LO));
++}
++
++/*
++ * Called while the system starts (redwood_input.c), before the first program: the window server
++ * looks for RedwoodGPU once, when it starts (userland src/inject.c), so the GPU is brought up here,
++ * at once, and not in a thread of its own.
++ */
++void
++redwood_tissot_gpu_init(void)
++{
++	uint32_t mode = 0, tissot = 0;
++
++	if (!PE_parse_boot_argn("tissot", &tissot, sizeof(tissot)) || !tissot) {
++		return;
 +	}
++	measure_cpu();
++	PE_parse_boot_argn("tissot_gpu", &mode, sizeof(mode));
++	if (mode == 1) {
++		probe_only();
++		return;
++	}
++	if (mode < 2) {
++		return;
++	}
++	if (!power_up() || !bring_up()) {
++		say("the GPU is not used: CoreAnimation draws with the processor\n");
++		return;
++	}
++	va_free[0].start = VA_START;
++	va_free[0].size = VA_SIZE;
++	va_free_count = 1;
++	started = true;
++	redwood_tissot_gpu_on = true;
++	RedwoodGPUStart();
 +}
 diff --git a/xnu/files/bsd/dev/redwood_tissot_rpm.c b/xnu/files/bsd/dev/redwood_tissot_rpm.c
 new file mode 100644
-index 0000000..59487ec
+index 0000000..9152aca
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_rpm.c
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,312 @@
 +/*
 + * The Mi A1's (tissot, MSM8953) resource power manager, the RPM: the processor that owns the
 + * PMIC's regulators and the shared clocks. A supply the RPM owns is not to be written through
@@ -2268,6 +3460,15 @@ index 0000000..59487ec
 +	uint32_t kv[4] = { KEY_SWEN, on ? 1u : 0u, KEY_UV, uv };
 +
 +	return rpm_request(RES_LDOA, n, kv, on ? 2 : 1);
++}
++
++/* Any resource of the RPM's active set with one key (e.g. VDD_CX's level: "rwcx" 0, "lvl"). Returns 0 or -1. */
++int
++redwood_tissot_rpm_request(uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++{
++	uint32_t kv[2] = { key, value };
++
++	return rpm_request(type, id, kv, 1);
 +}
 diff --git a/xnu/files/bsd/dev/redwood_tissot_touch.c b/xnu/files/bsd/dev/redwood_tissot_touch.c
 new file mode 100644

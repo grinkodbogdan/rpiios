@@ -6,6 +6,7 @@
 #   OUT/mia1-ios-fast.img   the same, iOS drawing at 750 x 1624 (fbscale=2) and the display scaling it up
 #   OUT/mia1-ios-1cpu.img   the same on one core; mia1-ios-4cpu.img on the first cluster's four
 #   OUT/mia1-ios-gpu.img    one core, and the Adreno 506 powered up and looked at (tissot_gpu=1)
+#   OUT/mia1-ios-gl.img     GL_ROOT=...: the fast image with the Adreno 506 drawing (tissot_gpu=2)
 # Usage: build.sh OUT_DIR HACKIOS_TREE
 # HACKIOS_TREE: a HackiOS checkout with hackios/hackios-xnu-kernel.diff applied, the kernel,
 # xnuloader and userland/root.apfs built. The iOS system (userland/system.apfs) goes to the phone
@@ -39,7 +40,7 @@ gzip -9 -n -c "$out/shim.bin" > "$out/shim.bin.gz"
 cat "$out/shim.bin.gz" "$out/tissot.dtb" > "$out/kernel-dtb"
 
 image() {   # NAME CMDLINE [SHIM_ARGS: the boot image's own command line, e.g. scale=720]
-	python3 "$hack/xnuloader/mkpayload.py" -o "$out/payload-$1.bin" kernel="$kernel" ramdisk="$hack/userland/root.apfs" \
+	python3 "$hack/xnuloader/mkpayload.py" -o "$out/payload-$1.bin" kernel="$kernel" ramdisk="${ROOT:-$hack/userland/root.apfs}" \
 		--rdres 4000 --cmdline "$2 epoch=$(date +%s)" >/dev/null
 	python3 "$here/mkcontainer.py" "$out/ramdisk-$1" loader="$hack/xnuloader/loader.efi" payload="$out/payload-$1.bin"
 	python3 "$hack/prebuilt/uefi/mkbootimg.py" --header_version 0 --kernel "$out/kernel-dtb" \
@@ -92,3 +93,10 @@ image mia1-ios-fast "tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=8 fbscale=2"
 image mia1-ios-1cpu "tissot=1 vtimer_ppi=20 emmc_root=userdata"
 image mia1-ios-4cpu "tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=4"
 image mia1-ios-gpu "tissot=1 vtimer_ppi=20 emmc_root=userdata tissot_gpu=1"
+# The GPU for CoreAnimation (tissot_gpu=2): only with a small image built with GL=1 and the Mi A1's
+# GPU firmware in ../fw-gpu (a530_pm4.fw, a530_pfp.fw, a506_zap.mdt/.b00-.b02; the vendor's, never in
+# this repository), given as GL_ROOT=that root.apfs. The image then carries that firmware: keep it to
+# yourself.
+if [ -n "${GL_ROOT:-}" ]; then
+	ROOT=$GL_ROOT image mia1-ios-gl "tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=8 fbscale=2 tissot_gpu=2" "fbw=750 fbh=1624"
+fi

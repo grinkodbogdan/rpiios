@@ -50,6 +50,15 @@ aboot (LK) --fastboot boot--> shim (mia1/shim) --its own UEFI--> HackiOS loader 
    fastboot boot mia1-ios-gpu.img      # one core; the Adreno 506 powered up and its registers read
    ```
 
+   `mia1-ios-gl.img` (built, not in this repository: it carries the phone's GPU firmware) is the
+   fast image with the Adreno 506 drawing: `redwood_tissot_gpu.c` (tissot_gpu=2) brings the GPU
+   up as Linux's a5xx driver does -- power and clocks, its IOMMU context (TrustZone asked first),
+   the CP microcode, the zap shader through TrustZone -- and serves HackiOS's RedwoodGPU in place
+   of the POCO's A6xx code; Mesa's freedreno (in the small image, `userland/build.sh GL=1` with
+   the firmware in `fw-gpu/`) then draws CoreAnimation. The firmware: a530_pm4.fw, a530_pfp.fw,
+   a506_zap.mdt/.b00-.b02 (e.g. from /vendor/firmware of the phone's Android);
+   `GL_ROOT=.../root.apfs shim/build.sh ...` makes the image.
+
    Every image measures the processor's clock at boot (`tissot-gpu: this processor ... MHz`);
    the GPU image adds its power-up stages (`redwood_tissot_gpu.c`, after ios-sailfish's first
    GPU step). Both show in yellow on the next boot.
