@@ -12,16 +12,17 @@ index dd8667b..989d6b0 100755
    -drive if=pflash,format=raw,readonly=on,file="$EFI" \
    -drive if=pflash,format=raw,file=vars.fd \
 diff --git a/xnu/files/bsd/dev/redwood_input.c b/xnu/files/bsd/dev/redwood_input.c
-index 8076cf0..73c3c29 100644
+index 8076cf0..fb17f0d 100644
 --- a/xnu/files/bsd/dev/redwood_input.c
 +++ b/xnu/files/bsd/dev/redwood_input.c
-@@ -218,6 +218,9 @@ redwood_input_init(void)
+@@ -218,6 +218,10 @@ redwood_input_init(void)
  	redwood_virtio_input_init();
  	redwood_goodix_init();
  	redwood_buttons_init();
 +	redwood_tissot_emmc_init();
 +	redwood_tissot_touch_init();
 +	redwood_tissot_buttons_init();
++	redwood_tissot_gpu_init();
  	redwood_battery_init();
  	redwood_ufs_init();
  	redwood_net_init();
@@ -1737,6 +1738,228 @@ index 0000000..5cd2ae9
 +}
 +
 +#endif
+diff --git a/xnu/files/bsd/dev/redwood_tissot_gpu.c b/xnu/files/bsd/dev/redwood_tissot_gpu.c
+new file mode 100644
+index 0000000..cfc97c0
+--- /dev/null
++++ b/xnu/files/bsd/dev/redwood_tissot_gpu.c
+@@ -0,0 +1,216 @@
++/*
++ * The Mi A1's (tissot, MSM8953) Adreno 506, step 1: power, clocks, and a look at its registers,
++ * as the Pixel 1 port (ios-sailfish, sweet_gpu.c) began with its Adreno 530. And the speed the
++ * processors run at, measured: what LK left them at.
++ *
++ * Boot-arg tissot_gpu=1. The GPU's logic is on VDD_CX (the RPM keeps that on; at its lowest
++ * corner it carries the GPU up to 133 MHz, Linux's msm8953.dtsi gpu_opp_table), so there is no
++ * rail of its own to switch. The global clock controller (0x01800000, Linux gcc-msm8953.c):
++ *   gfx3d RCG          0x59000 (CMD), 0x59004 (CFG: source [10:8], divider*2-1 [4:0]);
++ *                      sources 0 XO, 1 GPLL0 (800 MHz), 5 GPLL0/2
++ *   branches           gfx3d 0x59020, ahb 0x59028, bimc_gpu 0x59030, bimc_gfx 0x59034,
++ *                      timer 0x59040, aon 0x59044: [0] on, [31] the clock is off
++ *   GDSCs              oxili_cx 0x5904c, oxili_gx 0x5901c (its I/O clamp at 0x5b00c [0]):
++ *                      [0] collapse, [31] powered
++ * The GPU at 0x01c00000 (dword offsets, Linux a5xx.xml): VBIF_VERSION 0x3000, RBBM_STATUS 0x4f5,
++ * RBBM_ALWAYSON_COUNTER_LO 0x4d2. Nothing of the GPU is read unless everything said it is on: a
++ * read of a block without its clock stops the bus, and the phone with it.
++ *
++ * Each stage is said in the log before it is made (and kept for the next boot: the shim shows
++ * it), with a pause between them.
++ */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
++extern void redwood_tissot_log(const char *format, ...) __printflike(1, 2);
++#define say(...) redwood_tissot_log("tissot-gpu: " __VA_ARGS__)
++
++#define GCC_PHYS                0x01800000UL
++#define GPU_PHYS                0x01c00000UL
++
++#define GFX3D_CMD               0x59000
++#define GFX3D_CFG               0x59004
++#define GX_GDSC                 0x5901c
++#define BR_GFX3D                0x59020
++#define BR_GX_OTHER             0x59024         /* the GX GDSC's second clock (Linux: its cxcs) */
++#define BR_AHB                  0x59028
++#define BR_BIMC_GPU             0x59030
++#define BR_BIMC_GFX             0x59034
++#define BR_TIMER                0x59040
++#define BR_AON                  0x59044
++#define CX_GDSC                 0x5904c
++#define GX_CLAMP                0x5b00c
++
++#define VBIF_VERSION            (0x3000 * 4)
++#define RBBM_ALWAYSON_LO        (0x04d2 * 4)
++#define RBBM_STATUS             (0x04f5 * 4)
++
++static vm_offset_t gcc59, gcc5b;
++
++static inline uint32_t
++rd(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++
++	__builtin_arm_dmb(0xf);
++	return v;
++}
++
++static inline void
++wr(vm_offset_t a, uint32_t v)
++{
++	__builtin_arm_dmb(0xf);
++	*(volatile uint32_t *)a = v;
++	__builtin_arm_dsb(0xf);
++}
++
++static vm_offset_t
++gcc(uint32_t offset)
++{
++	return (offset >> 12 == 0x5b ? gcc5b : gcc59) + (offset & 0xfff);
++}
++
++static bool
++wait_for(uint32_t offset, uint32_t mask, uint32_t want, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms * 10; i++) {
++		if ((rd(gcc(offset)) & mask) == want) {
++			return true;
++		}
++		delay(100);
++	}
++	return false;
++}
++
++static bool
++branch_on(uint32_t offset)
++{
++	wr(gcc(offset), rd(gcc(offset)) | 1);
++	return wait_for(offset, 1u << 31, 0, 10);
++}
++
++static bool
++gdsc_on(uint32_t offset)
++{
++	wr(gcc(offset), rd(gcc(offset)) & ~1u);
++	return wait_for(offset, 1u << 31, 1u << 31, 10);
++}
++
++static void
++dump(const char *when)
++{
++	say("%s: rcg %08x/%08x, cx gdsc %08x, gx gdsc %08x clamp %08x; gfx3d %08x gx2 %08x ahb %08x bimc_gpu %08x "
++	    "bimc_gfx %08x timer %08x aon %08x\n", when, rd(gcc(GFX3D_CMD)), rd(gcc(GFX3D_CFG)), rd(gcc(CX_GDSC)),
++	    rd(gcc(GX_GDSC)), rd(gcc(GX_CLAMP)), rd(gcc(BR_GFX3D)), rd(gcc(BR_GX_OTHER)), rd(gcc(BR_AHB)),
++	    rd(gcc(BR_BIMC_GPU)), rd(gcc(BR_BIMC_GFX)), rd(gcc(BR_TIMER)), rd(gcc(BR_AON)));
++}
++
++/* The processor's clock: its cycle counter against the 19.2 MHz timer, for 20 ms. */
++static void
++measure_cpu(void)
++{
++	uint64_t pmcr, t0, t1, c0, c1, ns;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++
++	pmcr = __builtin_arm_rsr64("PMCR_EL0");
++	__builtin_arm_wsr64("PMCR_EL0", pmcr | 1);
++	__builtin_arm_wsr64("PMCCFILTR_EL0", 0);
++	__builtin_arm_wsr64("PMCNTENSET_EL0", 1ull << 31);
++	__builtin_arm_isb(0xf);
++	t0 = mach_absolute_time();
++	c0 = __builtin_arm_rsr64("PMCCNTR_EL0");
++	do {
++		t1 = mach_absolute_time();
++	} while (t1 - t0 < 20 * 19200);
++	c1 = __builtin_arm_rsr64("PMCCNTR_EL0");
++	ml_set_interrupts_enabled(istate);
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	say("this processor (MPIDR %llx) runs at about %llu MHz (%llu cycles in %llu us)\n",
++	    __builtin_arm_rsr64("MPIDR_EL1") & 0xffff, ns ? (c1 - c0) * 1000 / ns : 0, c1 - c0, ns / 1000);
++}
++
++static void
++gpu_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	vm_offset_t gpu, gpu_vbif;
++	bool cx, gx, ok = true;
++	uint32_t a0, a1;
++
++	measure_cpu();
++	gcc59 = ml_io_map(GCC_PHYS + 0x59000, 0x1000);
++	gcc5b = ml_io_map(GCC_PHYS + 0x5b000, 0x1000);
++	dump("as LK left it");
++	delay_for_interval(2, NSEC_PER_SEC);
++
++	say("stage 1: the bus and interface clocks (ahb, bimc_gfx, bimc_gpu, timer, aon)\n");
++	ok &= branch_on(BR_AHB);
++	ok &= branch_on(BR_BIMC_GFX);
++	ok &= branch_on(BR_BIMC_GPU);
++	ok &= branch_on(BR_TIMER);
++	ok &= branch_on(BR_AON);
++	say("stage 1: %s\n", ok ? "all on" : "NOT ALL ON");
++	delay_for_interval(2, NSEC_PER_SEC);
++
++	say("stage 2: the CX power domain\n");
++	cx = gdsc_on(CX_GDSC);
++	say("stage 2: cx gdsc %s (%08x)\n", cx ? "on" : "DID NOT POWER UP", rd(gcc(CX_GDSC)));
++	delay_for_interval(2, NSEC_PER_SEC);
++
++	say("stage 3: the GX power domain (the I/O clamp let go first)\n");
++	wr(gcc(GX_CLAMP), rd(gcc(GX_CLAMP)) & ~1u);
++	gx = gdsc_on(GX_GDSC);
++	wr(gcc(BR_GFX3D), rd(gcc(BR_GFX3D)) | 3u << 13);         /* keep memories and periphery while it is on */
++	wr(gcc(BR_GX_OTHER), rd(gcc(BR_GX_OTHER)) | 3u << 13);
++	say("stage 3: gx gdsc %s (%08x), clamp %08x\n", gx ? "on" : "DID NOT POWER UP", rd(gcc(GX_GDSC)), rd(gcc(GX_CLAMP)));
++	delay_for_interval(2, NSEC_PER_SEC);
++
++	say("stage 4: the core clock, GPLL0 / 6 = 133 MHz\n");
++	wr(gcc(GFX3D_CFG), 1u << 8 | (2 * 6 - 1));
++	wr(gcc(GFX3D_CMD), rd(gcc(GFX3D_CMD)) | 1);
++	ok &= wait_for(GFX3D_CMD, 1, 0, 10);
++	ok &= branch_on(BR_GFX3D);
++	dump("after the power-up");
++	if (!(ok && cx && gx)) {
++		say("not everything is on: no GPU register is read (stopping here)\n");
++		goto out;
++	}
++	delay_for_interval(2, NSEC_PER_SEC);
++
++	say("stage 5: the GPU's registers\n");
++	gpu = ml_io_map(GPU_PHYS + 0x1000, 0x1000) - 0x1000;
++	gpu_vbif = ml_io_map(GPU_PHYS + (VBIF_VERSION & ~0xfffu), 0x1000) - (VBIF_VERSION & ~0xfffu);
++	a0 = rd(gpu + RBBM_ALWAYSON_LO);
++	delay(1000);
++	a1 = rd(gpu + RBBM_ALWAYSON_LO);
++	say("VBIF_VERSION %08x, RBBM_STATUS %08x, always-on counter %08x -> %08x (%s)\n", rd(gpu_vbif + VBIF_VERSION),
++	    rd(gpu + RBBM_STATUS), a0, a1, a1 != a0 ? "counting: the GPU is alive" : "not counting");
++out:
++	thread_terminate(current_thread());
++}
++
++void
++redwood_tissot_gpu_init(void)
++{
++	uint32_t enabled = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("tissot_gpu", &enabled, sizeof(enabled)) || !enabled) {
++		uint32_t tissot = 0;
++
++		/* the processor's speed alone, on every Mi A1 boot */
++		if (PE_parse_boot_argn("tissot", &tissot, sizeof(tissot)) && tissot) {
++			measure_cpu();
++		}
++		return;
++	}
++	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
 diff --git a/xnu/files/bsd/dev/redwood_tissot_rpm.c b/xnu/files/bsd/dev/redwood_tissot_rpm.c
 new file mode 100644
 index 0000000..59487ec
@@ -2602,15 +2825,16 @@ index 8f0ed38..007a3df 100644
  			am->am_nx.cheap_requests = (cheap != 0);
  		}
 diff --git a/xnu/files/bsd/sys/redwood_input.h b/xnu/files/bsd/sys/redwood_input.h
-index bb8ad1b..c2ca3c3 100644
+index bb8ad1b..07cedf5 100644
 --- a/xnu/files/bsd/sys/redwood_input.h
 +++ b/xnu/files/bsd/sys/redwood_input.h
-@@ -48,6 +48,12 @@ bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */
+@@ -48,6 +48,13 @@ bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */
  void redwood_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
  int redwood_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
  /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/redwood_buttons.c) */
 +void redwood_tissot_touch_init(void);   /* boot-arg tissot=1: the Mi A1's FocalTech touch screen */
 +void redwood_tissot_buttons_init(void); /* boot-arg tissot=1: the Mi A1's power and volume keys */
++void redwood_tissot_gpu_init(void);     /* boot-arg tissot_gpu=1: the Mi A1's Adreno 506, powered and looked at */
 +void redwood_tissot_emmc_init(void);    /* boot-arg tissot=1: the Mi A1's eMMC (/dev/emmc_NAME); emmc_pci=1: QEMU's sdhci-pci */
 +void redwood_tissot_emmc_report(void);
 +bool redwood_tissot_emmc_dev(dev_t dev);    /* one of the eMMC's devices */
@@ -2903,7 +3127,7 @@ index 63ffd4b..46fb767 100644
  	}
  
 diff --git a/xnu/redwood.patch b/xnu/redwood.patch
-index 8f7dd87..5e96d8e 100644
+index 8f7dd87..18db2f7 100644
 --- a/xnu/redwood.patch
 +++ b/xnu/redwood.patch
 @@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
@@ -2911,15 +3135,15 @@ index 8f7dd87..5e96d8e 100644
   
  diff --git a/bsd/conf/files b/bsd/conf/files
 -index 44274016a4cf..9cd24b42caca 100644
-+index 44274016a4cf..15b259dca6ce 100644
++index 44274016a4cf..704616fc61c0 100644
  --- a/bsd/conf/files
  +++ b/bsd/conf/files
 -@@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
-+@@ -109,6 +109,41 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
++@@ -109,6 +109,42 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
   bsd/dev/unix_startup.c			standard
   
   bsd/dev/monotonic.c optional monotonic
-@@ -73,6 +73,10 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -73,6 +73,11 @@ index 44274016a4cf..9cd24b42caca 100644
  +bsd/dev/redwood_virtio_input.c	standard
  +bsd/dev/redwood_goodix.c	standard
  +bsd/dev/redwood_buttons.c	standard
@@ -2927,37 +3151,38 @@ index 8f7dd87..5e96d8e 100644
 ++bsd/dev/redwood_tissot_emmc.c	standard
 ++bsd/dev/redwood_tissot_buttons.c	standard
 ++bsd/dev/redwood_tissot_rpm.c	standard
+++bsd/dev/redwood_tissot_gpu.c	standard
  +bsd/dev/redwood_battery.c	standard
  +bsd/dev/redwood_ufs.c	standard
  +bsd/dev/redwood_ufshc.c	standard
-@@ -103,7 +107,7 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -103,7 +108,7 @@ index 44274016a4cf..9cd24b42caca 100644
   bsd/dev/dev_perfmon.c optional config_perfmon
   
   bsd/libkern/crc32.c			standard
 -@@ -155,6 +186,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
-+@@ -155,6 +190,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
++@@ -155,6 +191,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
   bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
   bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
   bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
-@@ -118,7 +122,7 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -118,7 +123,7 @@ index 44274016a4cf..9cd24b42caca 100644
   
   bsd/miscfs/routefs/routefs_ops.c	optional routefs
   
 -@@ -361,6 +400,7 @@ bsd/security/audit/audit_syscalls.c		standard
-+@@ -361,6 +404,7 @@ bsd/security/audit/audit_syscalls.c		standard
++@@ -361,6 +405,7 @@ bsd/security/audit/audit_syscalls.c		standard
   bsd/security/audit/audit_worker.c		optional config_audit
   
   bsd/pthread/pthread_shims.c		standard
-@@ -126,7 +130,7 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -126,7 +131,7 @@ index 44274016a4cf..9cd24b42caca 100644
   bsd/pthread/pthread_priority.c		standard
   bsd/pthread/pthread_workqueue.c		standard
   
 -@@ -383,6 +423,7 @@ bsd/kern/kern_debug.c			standard
-+@@ -383,6 +427,7 @@ bsd/kern/kern_debug.c			standard
++@@ -383,6 +428,7 @@ bsd/kern/kern_debug.c			standard
   bsd/kern/kern_symfile.c			standard
   bsd/kern/kern_descrip.c			standard
   bsd/kern/kern_guarded.c			standard
-@@ -1680,10 +1684,19 @@ index 2b14eda8f68f..09337bad5b01 100644
+@@ -1680,10 +1685,19 @@ index 2b14eda8f68f..09337bad5b01 100644
  +#endif
       ")";
  diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
@@ -2979,7 +3204,7 @@ index 8f7dd87..5e96d8e 100644
   	assert(matching);
   	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
   
-@@ -1695,11 +1708,16 @@ index 5219fb0d9ed6..29978e9cff43 100644
+@@ -1695,11 +1709,16 @@ index 5219fb0d9ed6..29978e9cff43 100644
  +		bsdWait = kSecondScale / 10;
  +	}
  +
@@ -2997,7 +3222,7 @@ index 8f7dd87..5e96d8e 100644
   #endif /* __LP64__ */
   				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
   			}
-@@ -1717,6 +1735,37 @@ index 5219fb0d9ed6..29978e9cff43 100644
+@@ -1717,6 +1736,37 @@ index 5219fb0d9ed6..29978e9cff43 100644
   			regEntry->release();                                                            /* Toss the entry */
   		}
   	}
@@ -3036,7 +3261,7 @@ index 8f7dd87..5e96d8e 100644
  index 5fb0a52062e0..6c430c2b23c7 100644
  --- a/iokit/conf/files
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
-index 640b05d..a3c46df 100644
+index 640b05d..d25deaf 100644
 --- a/xnuloader/loader.c
 +++ b/xnuloader/loader.c
 @@ -15,7 +15,14 @@
@@ -3072,7 +3297,14 @@ index 640b05d..a3c46df 100644
  	uint64_t uart;                   /* PL011, 0 if none */
  	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
  	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
-@@ -530,6 +540,7 @@ struct platform {
+@@ -525,11 +535,14 @@ struct platform {
+ 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
+ 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
+ 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
++	const uint32_t *mpidrs;          /* when the cores' numbers fit no core_shift: all of them (cores of them), in
++	                                  * the order the kernel is to take them after the one it starts on */
+ };
+ 
  static const struct platform platform_qemu_virt = {
  	.name = "qemu-virt", .io_base = 0x08000000, .io_size = 0x08000000,
  	.gic_dist = 0x08000000, .gic_redist = 0x080A0000, .uart = 0x09000000, .psci_hvc = 1,
@@ -3080,7 +3312,7 @@ index 640b05d..a3c46df 100644
  	.cores = 8, .core_shift = 0,
  	/*
  	 * QEMU's emulated cores stop each other all the time (every flush of a page from all the
-@@ -558,8 +569,23 @@ static const struct platform platform_redwood = {
+@@ -558,8 +571,24 @@ static const struct platform platform_redwood = {
   * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
   * where each value comes from); a display that matches none is QEMU's ramfb.
   */
@@ -3089,12 +3321,13 @@ index 640b05d..a3c46df 100644
 +	 * Xiaomi Mi A1: Snapdragon 625 (MSM8953), eight Cortex-A53s in two clusters of four. Started
 +	 * by the boot shim in rpiios (mia1/shim), whose display is the splash memory LK leaves
 +	 * scanned out, switched to XRGB8888. GICv2 (qcom,msm-qgic2). The peripherals all sit below
-+	 * 0x10000000. Cores: the first cluster (MPIDR 0x0..0x3); the second is MPIDR 0x100..0x103,
-+	 * which core_shift cannot describe together with the first.
++	 * 0x10000000. Cores: the first cluster MPIDR 0x0..0x3, the second 0x100..0x103 (the same
++	 * Cortex-A53s; the first cluster's own neighbours come first).
 +	 */
 +	.name = "tissot", .io_base = 0x00400000, .io_size = 0x0FC00000,
 +	.gic_dist = 0x0B000000, .gic_redist = 0, .gic_cpu = 0x0B002000, .uart = 0,
-+	.cores = 4, .core_shift = 0,
++	.cores = 8, .core_shift = 0,
++	.mpidrs = (const uint32_t[]){ 0x0, 0x1, 0x2, 0x3, 0x100, 0x101, 0x102, 0x103 },
 +	.fb_base = 0x90001000,
 +};
 +
@@ -3104,7 +3337,7 @@ index 640b05d..a3c46df 100644
  };
  
  /* ------------------------------------------------------------------------ */
-@@ -594,8 +620,13 @@ enum {
+@@ -594,8 +623,13 @@ enum {
  	CTX_X18, CTX_X19, /* ... x30 */
  	CTX_LOG_PA = CTX_X19 + 12, CTX_LOG_LEN, CTX_REASON, CTX_ESR, CTX_ELR, CTX_FAR, CTX_LR, CTX_KSP,
  	CTX_TPIDR_EL1, CTX_TPIDR_EL0, CTX_TPIDRRO_EL0, CTX_SP_EL0, CTX_CONTEXTIDR, CTX_MDSCR, CTX_FPCR, CTX_FPSR,
@@ -3119,7 +3352,7 @@ index 640b05d..a3c46df 100644
  uint64_t loader_ctx[CTX_COUNT];
  int loader_save_ctx(void);
  void loader_return_stub(void);
-@@ -628,10 +659,13 @@ __asm__ (
+@@ -628,10 +662,13 @@ __asm__ (
          "  mrs x9, mdscr_el1\n     str x9, [x10, #320]\n"
          "  mrs x9, s3_3_c4_c4_0\n          str x9, [x10, #328]\n"
          "  mrs x9, s3_3_c4_c4_1\n          str x9, [x10, #336]\n"
@@ -3134,7 +3367,7 @@ index 640b05d..a3c46df 100644
          "  mrs x9, spsel\n"
          "  cbz x9, 1f\n"                  /* SP_EL0 is only accessible while running on SP_EL1 */
          "  mrs x9, sp_el0\n        str x9, [x10, #304]\n"
-@@ -651,9 +685,17 @@ __asm__ (
+@@ -651,9 +688,17 @@ __asm__ (
          "  msr daifset, #0xf\n"
          /* PSTATE bits the kernel may have left set. PAN in particular is fatal:
           * UEFI maps its memory as EL0-accessible, so with PAN every data access
@@ -3153,7 +3386,7 @@ index 640b05d..a3c46df 100644
          "  mrs x9, sctlr_el1\n"
          "  bic x9, x9, #0x1\n"
          "  bic x9, x9, #0x4\n"
-@@ -688,9 +730,12 @@ __asm__ (
+@@ -688,9 +733,12 @@ __asm__ (
          "  ldr x9, [x10, #296]\n msr tpidrro_el0, x9\n"
          "  ldr x9, [x10, #312]\n msr contextidr_el1, x9\n"
          "  ldr x9, [x10, #320]\n msr mdscr_el1, x9\n"
@@ -3166,7 +3399,7 @@ index 640b05d..a3c46df 100644
          "  ldr x9, [x10, #328]\n msr s3_3_c4_c4_0, x9\n"
          "  ldr x9, [x10, #336]\n msr s3_3_c4_c4_1, x9\n"
          "  ldr x9, [x10, #104]\n msr cntkctl_el1, x9\n"
-@@ -2312,8 +2357,10 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
+@@ -2312,8 +2360,10 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
  			watching_only = 1;
  			daif = READ_SYSREG(DAIF);
  			__asm__ volatile ("msr daifset, #0xf");
@@ -3179,7 +3412,7 @@ index 640b05d..a3c46df 100644
  		}
  		/* both are written by a core with its caches off: look at memory, not at our copy */
  		flush_dcache((uint64_t)(uintptr_t)&other_cpu_done, (uint64_t)(uintptr_t)&other_cpu_done + 8);
-@@ -2376,7 +2423,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
+@@ -2376,7 +2426,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
  	running_live = NULL;
  
  	if (watching_only) {
@@ -3190,7 +3423,7 @@ index 640b05d..a3c46df 100644
  		__asm__ volatile ("msr daif, %0" : : "r" (daif));
  	}
  	return status;
-@@ -2731,6 +2780,29 @@ choose_window(const struct payload_info *pi)
+@@ -2731,6 +2783,29 @@ choose_window(const struct payload_info *pi)
   */
  static int starts_with(const char *s, const char *prefix);
  
@@ -3220,7 +3453,7 @@ index 640b05d..a3c46df 100644
  static int
  run_kernel(int have_checkpoint, uint64_t checkpoint)
  {
-@@ -2824,6 +2896,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -2824,6 +2899,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  	}
  
  	/* --- load segments -------------------------------------------------- */
@@ -3230,7 +3463,7 @@ index 640b05d..a3c46df 100644
  	lc = (const struct load_command *)(mh + 1);
  	for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const uint8_t *)lc + lc->cmdsize)) {
  		const struct segment_command_64 *sg = (const void *)lc;
-@@ -2832,6 +2907,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -2832,6 +2910,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  		}
  		memset((void *)(sg->vmaddr + slide), 0, sg->vmsize);
  		memcpy((void *)(sg->vmaddr + slide), kernel + sg->fileoff, sg->filesize);
@@ -3240,7 +3473,40 @@ index 640b05d..a3c46df 100644
  	}
  	print("kernel loaded at pa %x..%x\n", kern_lo, kern_hi);
  	if (rd_resident) {
-@@ -3245,8 +3323,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3181,7 +3262,22 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	uint64_t cpu_mpidr[8] = { kernel_mpidr };
+ 	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
+ 
+-	if (more_cores) {
++	if (more_cores && plat->mpidrs != NULL) {
++		for (int i = 0; i < plat->cores; i++) {
++			uint64_t mpidr = plat->mpidrs[i];
++			int64_t state;
++
++			if (mpidr == this_mpidr || mpidr == kernel_mpidr) {
++				continue;
++			}
++			state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
++			if (state == 1 || state == PSCI_NOT_SUPPORTED) {
++				cpu_mpidr[cpu_count++] = mpidr;
++			} else if (state >= 0) {
++				print("core %x is not off (the firmware says %d): not the kernel's to take\n", mpidr, (uint64_t)state);
++			}
++		}
++	} else if (more_cores) {
+ 		for (int distance = 1; distance < plat->cores; distance++) {
+ 			for (int side = 0; side < 2; side++) {
+ 				int core = side == 0 ? boot_core + distance : boot_core - distance;
+@@ -3199,6 +3295,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 				}
+ 			}
+ 		}
++	}
++	if (more_cores) {
+ 		print("cores for the kernel, in the order it takes them:");
+ 		for (int i = 0; i < cpu_count; i++) {
+ 			print(" %x", cpu_mpidr[i]);
+@@ -3245,8 +3343,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  	}
  	dt_begin(&w, "gic");
  	dt_prop_str(&w, "device_type", "interrupt-controller");
@@ -3254,7 +3520,7 @@ index 640b05d..a3c46df 100644
  	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
  	dt_end(&w);
  	if (plat->uart != 0) {
-@@ -3907,8 +3988,11 @@ ramfb_phone_screen(void)
+@@ -3907,8 +4008,11 @@ ramfb_phone_screen(void)
  	dma.length = be32(sizeof(cfg));
  	dma.address = __builtin_bswap64((uint64_t)(uintptr_t)&cfg);
  	*(volatile uint64_t *)(FW_CFG_BASE + 16) = __builtin_bswap64((uint64_t)(uintptr_t)&dma);
@@ -3268,7 +3534,7 @@ index 640b05d..a3c46df 100644
  		return;
  	}
  	SCREEN.base = fb;
-@@ -3928,10 +4012,22 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -3928,10 +4032,22 @@ efi_main(efi_handle image, efi_system_table *st)
  	IMAGE = image;
  
  	BS->set_watchdog_timer(0, 0, 0, NULL);

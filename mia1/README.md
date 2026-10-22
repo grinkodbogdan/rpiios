@@ -39,7 +39,13 @@ aboot (LK) --fastboot boot--> shim (mia1/shim) --its own UEFI--> HackiOS loader 
    ```
    fastboot boot mia1-ios.img          # one core
    fastboot boot mia1-ios-4cpu.img     # four cores
+   fastboot boot mia1-ios-8cpu.img     # all eight (both clusters, MPIDR 0x0-0x3, 0x100-0x103)
+   fastboot boot mia1-ios-gpu.img      # one core; the Adreno 506 powered up and its registers read
    ```
+
+   Every image measures the processor's clock at boot (`tissot-gpu: this processor ... MHz`);
+   the GPU image adds its power-up stages (`redwood_tissot_gpu.c`, after ios-sailfish's first
+   GPU step). Both show in yellow on the next boot.
 
    (`prebuilt/`; `shim/build.sh OUT HACKIOS_TREE` builds them.) The screen shows the shim's and
    the loader's text, then the kernel's (`-v`). If it stops, it stays on the screen: a
