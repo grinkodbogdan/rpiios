@@ -129,6 +129,20 @@ efi_largest_free(uint64_t *size)
 	return best;
 }
 
+/* The i-th free range of the map, for the memory probe; -1 past the last. */
+int
+efi_free_range(int i, uint64_t *base, uint64_t *end)
+{
+	for (int k = 0; k < nranges; k++) {
+		if (ranges[k].type == EfiConventionalMemory && i-- == 0) {
+			*base = ranges[k].base;
+			*end = ranges[k].end;
+			return 0;
+		}
+	}
+	return -1;
+}
+
 static int
 all_free(uint64_t base, uint64_t end)
 {

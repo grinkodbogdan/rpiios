@@ -56,6 +56,7 @@ struct region {
 };
 void efi_memory_init(const struct ram_bank *banks, int nbanks, const struct region *reserved, int nreserved);
 uint64_t efi_largest_free(uint64_t *size);
+int efi_free_range(int i, uint64_t *base, uint64_t *end);
 void efi_reserve(uint64_t base, uint64_t size, uint32_t type);
 uint64_t efi_run_image(const void *pe, uint64_t pe_size, uint64_t load_at, uint64_t payload);
 

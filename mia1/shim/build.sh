@@ -54,6 +54,12 @@ if [ -n "${WDT_TESTS:-}" ]; then
 	done
 	exit 0
 fi
+if [ -n "${MEMPROBE:-}" ]; then
+	SHIM_CFLAGS="-DMEMPROBE" MEMPROBE= "$0" "$out/memprobe" "$hack" >/dev/null
+	cp "$out/memprobe/mia1-ios.img" "$out/mia1-memprobe.img"
+	echo "shim: $out/mia1-memprobe.img"
+	exit 0
+fi
 if [ -n "${SHIM_CMDLINE:-}" ]; then
 	image mia1-test "$SHIM_CMDLINE"
 	exit 0

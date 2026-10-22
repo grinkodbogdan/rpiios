@@ -30,6 +30,12 @@ extern char _head[], _image_end[];
 static const struct region firmware[] = {
 	{ 0x84a00000, 0x0d700000, 0 /* reserved */, "TrustZone apps, shared memory, modem, DSPs, display, video" },
 	{ 0x9ff00000, 0x00100000, 0, "persistent log" },
+	/*
+	 * Not in the published reserved-memory lists, but the phone resets (no fault, a reset a
+	 * moment later: an access the secure firmware does not allow) soon after the payload was
+	 * copied to 0x80a00000. Left alone until mia1-memprobe.img says what is there.
+	 */
+	{ 0x80000000, 0x04a00000, 0, "protected? (resets the phone when written)" },
 };
 
 /*
@@ -78,6 +84,37 @@ watchdog_watch(void)
 	}
 	say("\nstill here after %d s: going on\n", WDT_WATCH_S);
 }
+
+#ifdef MEMPROBE
+/*
+ * mia1-memprobe.img: every free 16 MB of RAM read and written back, one word in every 64 KB,
+ * with a pause after each, its address on the screen and in the persistent log first: when an
+ * access the secure firmware does not allow resets the phone, the last address said is where.
+ */
+static void
+memprobe(void)
+{
+	uint64_t base, end, hz = READ_SYSREG(cntfrq_el0);
+
+	say("memory probe: each free 16 MB is touched, then 0.3 s of waiting\n");
+	for (int i = 0; efi_free_range(i, &base, &end) == 0; i++) {
+		for (uint64_t chunk = base; chunk < end; chunk += 0x1000000) {
+			uint64_t t;
+
+			say(" %llx", (unsigned long long)chunk);
+			for (uint64_t a = chunk; a < chunk + 0x1000000 && a < end; a += 0x10000) {
+				volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)a;
+				*p = *p;
+			}
+			__asm__ volatile("dsb sy");
+			t = READ_SYSREG(cntpct_el0);
+			while (READ_SYSREG(cntpct_el0) - t < hz * 3 / 10) {
+			}
+		}
+	}
+	say("\nmemory probe: all of it can be written\n");
+}
+#endif
 
 struct container_entry {
 	char name[16];
@@ -153,16 +190,21 @@ shim_main(const void *fdt, uint64_t loaded_at)
 	reserved[nreserved++] = (struct region){ initrd, initrd_end - initrd, 2 /* loader data */, "ramdisk" };
 	efi_memory_init(banks, nbanks, reserved, nreserved);
 
-	/* the payload at the top of the largest block: the rest of it stays in one piece for the kernel */
+	/*
+	 * The payload stays where aboot put it, in the ramdisk (aboot's own choice of memory: known to
+	 * be writable); the loader's area for it (payload, then its panic log) runs on past the ramdisk.
+	 */
+	payload_at = (uint64_t)(uintptr_t)c + payload->offset;
+	efi_reserve(payload_at, PAYLOAD_SPACE, 2 /* loader data */);
 	largest = efi_largest_free(&largest_size);
+	say("payload at %llx (in the ramdisk); the kernel's block %llx..%llx (%llu MB)\n", (unsigned long long)payload_at,
+	    (unsigned long long)largest, (unsigned long long)(largest + largest_size), (unsigned long long)(largest_size >> 20));
 	if (largest_size < 0x40000000) {
 		stop("the largest free block is %llu MB: too little for iOS\n", (unsigned long long)(largest_size >> 20));
 	}
-	payload_at = (largest + largest_size - PAYLOAD_SPACE) & ~(MB2 - 1);
-	efi_reserve(payload_at, PAYLOAD_SPACE, 2 /* loader data */);
-	memcpy((void *)(uintptr_t)payload_at, (const uint8_t *)c + payload->offset, payload->size);
-	say("payload at %llx; the kernel's block %llx..%llx (%llu MB)\n", (unsigned long long)payload_at,
-	    (unsigned long long)largest, (unsigned long long)payload_at, (unsigned long long)((payload_at - largest) >> 20));
+#ifdef MEMPROBE
+	memprobe();
+#endif
 
 	efi_run_image((const uint8_t *)c + loader->offset, loader->size, 0, payload_at);
 	stop("the loader returned\n");
