@@ -27,10 +27,10 @@ index 8076cf0..73c3c29 100644
  	redwood_net_init();
 diff --git a/xnu/files/bsd/dev/redwood_tissot_buttons.c b/xnu/files/bsd/dev/redwood_tissot_buttons.c
 new file mode 100644
-index 0000000..46cfc5f
+index 0000000..0f707cb
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_buttons.c
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,383 @@
 +/*
 + * The buttons of the Xiaomi Mi A1 (tissot, MSM8953) -- power, volume up, volume down -- as a
 + * source of button records for /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg
@@ -119,13 +119,17 @@ index 0000000..46cfc5f
 +#define COMMAND_READ            (1u << 27)      /* "extended register read long"; [11:4] register, [2:0] bytes - 1 */
 +#define READ_TIMEOUT_US         2000
 +
-+static vm_offset_t arb_core, arb_observer;
++static vm_offset_t arb_core;
 +static uint32_t arb_channels;
 +
 +static struct {
 +	uint64_t reads, failed;
 +} bus;
 +
++/*
++ * The observer page of the channel that is that peripheral's, mapped on its own: the whole observer
++ * region is 8 MB, the kernel's whole window for device mappings (io_submap) as large as that.
++ */
 +static vm_offset_t
 +channel_of(uint16_t id)
 +{
@@ -133,7 +137,7 @@ index 0000000..46cfc5f
 +		uint32_t map = rd(arb_core + ARB_CHANNEL(n));
 +
 +		if (map != 0 && ((map >> 8) & 0xfff) == id) {
-+			return arb_observer + 0x8000UL * n + 0x1000UL * ARB_SYSTEM;
++			return ml_io_map(ARB_OBSERVER_PHYS + 0x8000UL * n + 0x1000UL * ARB_SYSTEM, 0x1000);
 +		}
 +	}
 +	return 0;
@@ -149,7 +153,6 @@ index 0000000..46cfc5f
 +		return state > 0;
 +	}
 +	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
-+	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
 +	version = rd(arb_core + ARB_VERSION);
 +	printf("tissot-spmi: PMIC arbiter at %#lx, version %#x\n", ARB_CORE_PHYS, version);
 +	if (version < ARB_VERSION_2 || version >= ARB_VERSION_3) {
@@ -319,7 +322,7 @@ index 0000000..46cfc5f
 +	uint8_t is[2], status;
 +
 +	printf("tissot-buttons: step 1: the PMIC arbiter\n");
-+	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
++	tlmm = ml_io_map(TLMM_PHYS + 0x1000UL * PIN_VOLUME_UP, 0x1000) - 0x1000UL * PIN_VOLUME_UP;   /* that pin's page alone */
 +	if (!arb_ready() || steps < 2) {
 +		goto pin;
 +	}
@@ -413,10 +416,10 @@ index 0000000..46cfc5f
 +}
 diff --git a/xnu/files/bsd/dev/redwood_tissot_emmc.c b/xnu/files/bsd/dev/redwood_tissot_emmc.c
 new file mode 100644
-index 0000000..274a7f2
+index 0000000..2554e7d
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_emmc.c
-@@ -0,0 +1,576 @@
+@@ -0,0 +1,577 @@
 +/*
 + * The Mi A1's storage (tissot: 64 GB of eMMC on the Snapdragon 625's SDCC1): a block device and a
 + * character device for the whole of it and for every GPT partition -- /dev/emmc, /dev/emmc_NAME
@@ -489,7 +492,7 @@ index 0000000..274a7f2
 + */
 +#define KEEP_PHYS               0x9ff00000UL
 +#define KEEP_MAGIC              0x31414d4950454b52ull
-+#define KEEP_BYTES              (0x100000u - 16)
++#define KEEP_BYTES              (0x10000u - 16)  /* its first 64 KB: as much as is mapped here */
 +
 +static volatile uint64_t *keep;
 +
@@ -514,7 +517,7 @@ index 0000000..274a7f2
 +	va_end(list);
 +	printf("%s", line);
 +	if (keep == NULL) {
-+		keep = (volatile uint64_t *)ml_io_map(KEEP_PHYS, 0x100000);
++		keep = (volatile uint64_t *)ml_io_map(KEEP_PHYS, 0x10000);
 +	}
 +	if (keep[0] != KEEP_MAGIC) {
 +		return;
@@ -909,7 +912,8 @@ index 0000000..274a7f2
 +		emmc.hc = qemu_sdhci();
 +	} else {
 +		emmc.core = ml_io_map(SDCC1_CORE_PHYS, 0x1000);        /* "hc" is in the same page */
-+		emmc.gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++		/* the SDCC1 clock registers' page alone (0x42000..): the kernel's device window is small */
++		emmc.gcc = ml_io_map(GCC_PHYS + 0x42000, 0x1000) - 0x42000;
 +		emmc.hc = emmc.core + (SDCC1_HC_PHYS - SDCC1_CORE_PHYS);
 +		emmc_log("mapped: core %#lx, gcc %#lx\n", (unsigned long)emmc.core, (unsigned long)emmc.gcc);
 +	}
@@ -1712,10 +1716,10 @@ index 0000000..1441783
 +#endif
 diff --git a/xnu/files/bsd/dev/redwood_tissot_touch.c b/xnu/files/bsd/dev/redwood_tissot_touch.c
 new file mode 100644
-index 0000000..ec68b89
+index 0000000..8ca2934
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_touch.c
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,510 @@
 +/*
 + * The touch screen of the Xiaomi Mi A1 (tissot, MSM8953): a FocalTech FT5x06-family controller
 + * at address 0x38 of the I2C bus of BLSP1 QUP3, as a source of touches for /dev/redwood-touch
@@ -1792,8 +1796,8 @@ index 0000000..ec68b89
 +
 +#define TLMM_PHYS               0x01000000UL
 +#define TLMM_SIZE               0x300000UL
-+#define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
-+#define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
++#define GPIO_CFG(n)             (pin_page(n))                   /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
++#define GPIO_IO(n)              (pin_page(n) + 4)               /* bit 0 in, bit 1 out */
 +#define PULL_NONE               0
 +#define PULL_UP                 3
 +
@@ -1802,7 +1806,20 @@ index 0000000..ec68b89
 +#define PIN_RESET               64
 +#define PIN_INT                 65
 +
-+static vm_offset_t tlmm;
++/* Each pin's page of the TLMM mapped on its own (the TLMM is 3 MB; the kernel's device window is 8 MB in all). */
++static vm_offset_t pin_pages[4];
++static const unsigned pin_numbers[4] = { PIN_SDA, PIN_SCL, PIN_RESET, PIN_INT };
++
++static vm_offset_t
++pin_page(unsigned pin)
++{
++	for (unsigned i = 0; i < 4; i++) {
++		if (pin_numbers[i] == pin) {
++			return pin_pages[i];
++		}
++	}
++	return 0;
++}
 +
 +static void
 +gpio_configure(unsigned pin, unsigned pull, unsigned ma, bool output)
@@ -2126,7 +2143,9 @@ index 0000000..ec68b89
 +	unsigned idle = 0;
 +	bool found = false;
 +
-+	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
++	for (unsigned i = 0; i < 4; i++) {
++		pin_pages[i] = ml_io_map(TLMM_PHYS + 0x1000UL * pin_numbers[i], 0x1000);
++	}
 +
 +	printf("tissot-touch: step 1: the controller's supply\n");
 +	supply_state();
