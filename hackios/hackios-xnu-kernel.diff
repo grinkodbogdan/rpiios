@@ -11,6 +11,1219 @@ index dd8667b..989d6b0 100755
    -accel tcg,tb-size=${QEMU_TB_MB:-384} \
    -drive if=pflash,format=raw,readonly=on,file="$EFI" \
    -drive if=pflash,format=raw,file=vars.fd \
+diff --git a/xnu/files/bsd/dev/redwood_input.c b/xnu/files/bsd/dev/redwood_input.c
+index 8076cf0..de5510a 100644
+--- a/xnu/files/bsd/dev/redwood_input.c
++++ b/xnu/files/bsd/dev/redwood_input.c
+@@ -218,6 +218,8 @@ redwood_input_init(void)
+ 	redwood_virtio_input_init();
+ 	redwood_goodix_init();
+ 	redwood_buttons_init();
++	redwood_tissot_touch_init();
++	redwood_tissot_buttons_init();
+ 	redwood_battery_init();
+ 	redwood_ufs_init();
+ 	redwood_net_init();
+diff --git a/xnu/files/bsd/dev/redwood_tissot_buttons.c b/xnu/files/bsd/dev/redwood_tissot_buttons.c
+new file mode 100644
+index 0000000..46cfc5f
+--- /dev/null
++++ b/xnu/files/bsd/dev/redwood_tissot_buttons.c
+@@ -0,0 +1,380 @@
++/*
++ * The buttons of the Xiaomi Mi A1 (tissot, MSM8953) -- power, volume up, volume down -- as a
++ * source of button records for /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg
++ * tissot=1 (or tissot_buttons=1): every address below belongs to that phone. The POCO's
++ * buttons=1 and touchscreen=1 must NOT be given on it; their addresses are another SoC's.
++ *
++ * Unlike the POCO, one of the three is a pin of the SoC:
++ *   power        KPDPWR_N of the power-on block ("PON", peripheral 0x08 of slave 0) of the PM8953
++ *   volume down  RESIN_N of the same block
++ *   volume up    GPIO85 of the SoC (TLMM), pulled up; the key pulls it low
++ * The PM8953 sits on the SPMI bus behind the SoC's PMIC arbiter, here of version 2 (the POCO's
++ * is version 5: the channel table moved, and the observer channels are 0x8000 apart, not 0x80).
++ * Reads go through the "observer" channels, which every system has for every peripheral.
++ *
++ * THIS DRIVER DOES NOT WRITE TO THE PMIC. The only thing written there is the command word that
++ * asks the arbiter for a read. The SoC pin of volume up is set to an input with its pull-up, as
++ * the phone's own device tree has it (gpio_key_default); that is a register of the SoC, which
++ * makes no supply.
++ *
++ * What a press is: the PON's "real time status" has a bit per key, set while the key is held;
++ * the pin's level is low while volume up is held. A thread looks 60 times a second, and a key has
++ * changed when two looks in a row say so. A key that reads as held before it has ever been seen
++ * released is not believed.
++ *
++ * The mapping: the Mi A1 has a power key on the side and two volume keys; its home button is a
++ * capacitive one under the glass that the touch controller does not report (it is the
++ * fingerprint sensor's). Power is the side button (REDWOOD_BUTTON_LOCK).
++ *
++ * The bring-up is made in steps, each said in the log before it is made. Boot-arg
++ * tissot_buttons_steps=N stops after the first N:
++ *   1  map the arbiter and read its version
++ *   2  find the channel of the power-on block
++ *   3  ask it what it is                                (the first transfer on the bus)
++ *   4  read what the keys say now; set up volume up's pin
++ *   5  watch them                                       (the default)
++ *
++ * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter version 2),
++ * drivers/input/misc/pm8941-pwrkey.c, drivers/pinctrl/qcom/pinctrl-msm8953.c, and the phone's
++ * device tree (arch/arm64/boot/dts/qcom/msm8953-xiaomi-tissot.dts, msm8953.dtsi, pm8953.dtsi).
++ */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/redwood_input.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++/* ---- the PMIC arbiter, version 2 ----------------------------------------------------------------- */
++
++#define ARB_CORE_PHYS           0x0200f000UL    /* "core": the version, and which peripheral each channel is */
++#define ARB_CORE_SIZE           0x1000UL
++#define ARB_OBSERVER_PHYS       0x02c00000UL    /* "obsrvr": 0x1000 per system within each channel's 0x8000 */
++#define ARB_OBSERVER_SIZE       0x800000UL
++#define ARB_SYSTEM              0               /* the device tree's "qcom,ee" */
++
++#define ARB_VERSION             0x000
++#define ARB_VERSION_2           0x20010000u
++#define ARB_VERSION_3           0x30000000u
++#define ARB_CHANNEL(n)          (0x800 + 4 * (n))       /* [19:8] slave and peripheral; 0: unused */
++#define ARB_MAX_CHANNELS        512             /* the table fills the rest of "core" */
++
++#define OBSERVER_COMMAND        0x00
++#define OBSERVER_STATUS         0x08
++#define OBSERVER_DATA0          0x18
++#define OBSERVER_DATA1          0x1c
++#define STATUS_DONE             0x1
++#define STATUS_FAILURE          0x2
++#define STATUS_DENIED           0x4
++#define STATUS_DROPPED          0x8
++#define COMMAND_READ            (1u << 27)      /* "extended register read long"; [11:4] register, [2:0] bytes - 1 */
++#define READ_TIMEOUT_US         2000
++
++static vm_offset_t arb_core, arb_observer;
++static uint32_t arb_channels;
++
++static struct {
++	uint64_t reads, failed;
++} bus;
++
++static vm_offset_t
++channel_of(uint16_t id)
++{
++	for (uint32_t n = 0; n < arb_channels; n++) {
++		uint32_t map = rd(arb_core + ARB_CHANNEL(n));
++
++		if (map != 0 && ((map >> 8) & 0xfff) == id) {
++			return arb_observer + 0x8000UL * n + 0x1000UL * ARB_SYSTEM;
++		}
++	}
++	return 0;
++}
++
++static bool
++arb_ready(void)
++{
++	static int state;               /* 0 not looked at, 1 usable, -1 not */
++	uint32_t version;
++
++	if (state != 0) {
++		return state > 0;
++	}
++	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
++	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
++	version = rd(arb_core + ARB_VERSION);
++	printf("tissot-spmi: PMIC arbiter at %#lx, version %#x\n", ARB_CORE_PHYS, version);
++	if (version < ARB_VERSION_2 || version >= ARB_VERSION_3) {
++		printf("tissot-spmi: this driver knows version 2 of the arbiter only\n");
++		state = -1;
++		return false;
++	}
++	arb_channels = ARB_MAX_CHANNELS;
++	state = 1;
++	return true;
++}
++
++/*
++ * Read `count` (1 to 8) registers of a PMIC peripheral (`id` = slave << 8 | peripheral) from
++ * register `reg` on. Returns NULL, or what went wrong. Also for the touch screen's driver, which
++ * looks at the regulator that powers it.
++ */
++const char *
++redwood_tissot_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count)
++{
++	static struct {
++		uint16_t id;
++		vm_offset_t channel;
++	} known[8];
++	vm_offset_t channel = 0;
++	uint64_t start, interval;
++	uint32_t status, data[2];
++
++	if (count == 0 || count > 8) {
++		return "a read is of 1 to 8 registers";
++	}
++	if (!arb_ready()) {
++		return "no arbiter this driver knows";
++	}
++	for (unsigned i = 0; i < 8 && known[i].channel != 0; i++) {
++		if (known[i].id == id) {
++			channel = known[i].channel;
++		}
++	}
++	if (channel == 0) {
++		channel = channel_of(id);
++		if (channel == 0) {
++			return "no channel of the arbiter is that peripheral";
++		}
++		for (unsigned i = 0; i < 8; i++) {
++			if (known[i].channel == 0) {
++				known[i].id = id;
++				known[i].channel = channel;
++				break;
++			}
++		}
++	}
++
++	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
++	start = mach_absolute_time();
++	redwood_spmi_lock();
++	wr(channel + OBSERVER_COMMAND, COMMAND_READ | (uint32_t)reg << 4 | (count - 1));
++	do {
++		status = rd(channel + OBSERVER_STATUS);
++	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
++	data[0] = rd(channel + OBSERVER_DATA0);
++	data[1] = count > 4 ? rd(channel + OBSERVER_DATA1) : 0;
++	redwood_spmi_unlock();
++
++	bus.reads++;
++	if (!(status & STATUS_DONE)) {
++		bus.failed++;
++		return "no answer from the arbiter";
++	}
++	if (status & (STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED)) {
++		bus.failed++;
++		return (status & STATUS_DENIED) ? "the arbiter refuses" : (status & STATUS_FAILURE) ?
++		       "the transfer failed (nobody at that address?)" : "the transfer was dropped";
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		bytes[i] = (uint8_t)(data[i / 4] >> (8 * (i % 4)));
++	}
++	return NULL;
++}
++
++/* ---- the keys -------------------------------------------------------------------------------------- */
++
++#define PON_ID                  0x008           /* slave 0, peripheral 0x08: registers 0x0800 */
++#define REG_TYPE                0x04
++#define REG_RT_STATUS           0x10
++#define PON_TYPE                0x01
++#define PON_KPDPWR              0x01            /* this generation's bits (pm8941-pwrkey.c) */
++#define PON_RESIN               0x02
++
++#define TLMM_PHYS               0x01000000UL
++#define TLMM_SIZE               0x300000UL
++#define PIN_VOLUME_UP           85
++#define PULL_UP                 3
++
++static vm_offset_t tlmm;
++
++#define POLL_MS                 16
++#define MINUTE_TICKS            (60 * 1000 / POLL_MS)
++
++static struct button {
++	const char *    name;
++	uint32_t        record;
++	bool            usable, live, last, down;
++	uint32_t        presses;
++} power = { .name = "power", .record = REDWOOD_BUTTON_LOCK },
++    volume_up = { .name = "volume up", .record = REDWOOD_BUTTON_VOLUME_UP },
++    volume_down = { .name = "volume down", .record = REDWOOD_BUTTON_VOLUME_DOWN };
++
++static void
++button_look(struct button *b, bool pressed)
++{
++	bool steady = pressed == b->last;
++
++	b->last = pressed;
++	if (!b->usable || !steady) {
++		return;
++	}
++	if (!b->live) {
++		if (!pressed) {
++			b->live = true;
++			printf("tissot-buttons: %s is released now: believed from here on\n", b->name);
++		}
++		return;
++	}
++	if (pressed == b->down) {
++		return;
++	}
++	b->down = pressed;
++	if (pressed) {
++		b->presses++;
++	}
++	printf("tissot-buttons: %s %s\n", b->name, pressed ? "PRESSED" : "released");
++	redwood_touch_post(pressed ? REDWOOD_BUTTON_DOWN : REDWOOD_BUTTON_UP, b->record, 0, 0);
++}
++
++static bool
++volume_up_held(void)
++{
++	return !(rd(tlmm + 0x1000UL * PIN_VOLUME_UP + 4) & 1);
++}
++
++static void
++buttons_poll(void)
++{
++	static unsigned said;
++	const char *problem;
++	uint8_t status;
++
++	if (power.usable) {
++		problem = redwood_tissot_spmi_read(PON_ID, REG_RT_STATUS, &status, 1);
++		if (problem == NULL) {
++			button_look(&power, status & PON_KPDPWR);
++			button_look(&volume_down, status & PON_RESIN);
++		} else if (said < 8) {
++			said++;
++			printf("tissot-buttons: reading the power-on block: %s\n", problem);
++		}
++	}
++	button_look(&volume_up, volume_up_held());
++}
++
++static void
++buttons_thread(void *parameter, __unused wait_result_t result)
++{
++	uint32_t steps = (uint32_t)(uintptr_t)parameter;
++	const char *problem;
++	uint8_t is[2], status;
++
++	printf("tissot-buttons: step 1: the PMIC arbiter\n");
++	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
++	if (!arb_ready() || steps < 2) {
++		goto pin;
++	}
++
++	printf("tissot-buttons: step 2: the channel of the PM8953's power-on block\n");
++	if (channel_of(PON_ID) == 0) {
++		printf("tissot-buttons: no channel of the arbiter is the power-on block\n");
++		goto pin;
++	}
++	if (steps < 3) {
++		goto pin;
++	}
++
++	printf("tissot-buttons: step 3: read the type of the power-on block (0x0804, 2 registers)\n");
++	problem = redwood_tissot_spmi_read(PON_ID, REG_TYPE, is, 2);
++	if (problem != NULL) {
++		printf("tissot-buttons: %s\n", problem);
++		goto pin;
++	}
++	printf("tissot-buttons: the power-on block says type %#x, subtype %#x\n", is[0], is[1]);
++	if (is[0] != PON_TYPE) {
++		printf("tissot-buttons: ... which is not a power-on block: power and volume down left alone\n");
++		goto pin;
++	}
++	if (steps < 4) {
++		goto pin;
++	}
++	problem = redwood_tissot_spmi_read(PON_ID, REG_RT_STATUS, &status, 1);
++	if (problem != NULL) {
++		printf("tissot-buttons: %s\n", problem);
++		goto pin;
++	}
++	printf("tissot-buttons: status %#x: power %s, volume down %s\n", status, (status & PON_KPDPWR) ? "HELD" : "released",
++	    (status & PON_RESIN) ? "HELD" : "released");
++	power.usable = volume_down.usable = true;
++	power.last = status & PON_KPDPWR;
++	volume_down.last = status & PON_RESIN;
++pin:
++	if (steps >= 4) {
++		/* an input of the GPIO function, 2 mA, pulled up: gpio_key_default */
++		wr(tlmm + 0x1000UL * PIN_VOLUME_UP, PULL_UP | 0 << 2 | 0 << 6);
++		delay_for_interval(1, NSEC_PER_MSEC);
++		volume_up.usable = true;
++		volume_up.last = volume_up_held();
++		printf("tissot-buttons: volume up (gpio%u) reads %s\n", PIN_VOLUME_UP, volume_up.last ? "LOW (held)" : "high (released)");
++	}
++	power.live = power.usable && !power.last;
++	volume_down.live = volume_down.usable && !volume_down.last;
++	volume_up.live = volume_up.usable && !volume_up.last;
++	if (steps < 5) {
++		printf("tissot-buttons: stopping here (tissot_buttons_steps=%u)\n", steps);
++		thread_terminate(current_thread());
++		return;
++	}
++
++	printf("tissot-buttons: step 5: watching%s%s%s, every %u ms\n", power.usable ? " power" : "",
++	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", POLL_MS);
++	for (unsigned tick = 1;; tick++) {
++		buttons_poll();
++		if (tick % MINUTE_TICKS == 0) {
++			printf("tissot-buttons: %u presses of power, %u of volume up, %u of volume down; %llu reads of the bus, "
++			    "%llu failed\n", power.presses, volume_up.presses, volume_down.presses, bus.reads, bus.failed);
++		}
++		if (bus.failed >= 1000 && bus.failed * 2 > bus.reads) {
++			printf("tissot-buttons: more than half of the reads fail: power and volume down given up\n");
++			power.usable = volume_down.usable = false;
++		}
++		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
++	}
++}
++
++void
++redwood_tissot_buttons_init(void)
++{
++	uint32_t enabled = 0, steps = 5;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("tissot_buttons", &enabled, sizeof(enabled))) {
++		PE_parse_boot_argn("tissot", &enabled, sizeof(enabled));
++	}
++	if (!enabled) {
++		return;
++	}
++	PE_parse_boot_argn("tissot_buttons_steps", &steps, sizeof(steps));
++	if (steps == 0) {
++		return;
++	}
++	if (kernel_thread_start(buttons_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/xnu/files/bsd/dev/redwood_tissot_touch.c b/xnu/files/bsd/dev/redwood_tissot_touch.c
+new file mode 100644
+index 0000000..ec68b89
+--- /dev/null
++++ b/xnu/files/bsd/dev/redwood_tissot_touch.c
+@@ -0,0 +1,495 @@
++/*
++ * The touch screen of the Xiaomi Mi A1 (tissot, MSM8953): a FocalTech FT5x06-family controller
++ * at address 0x38 of the I2C bus of BLSP1 QUP3, as a source of touches for /dev/redwood-touch
++ * (sys/redwood_input.h). Only with boot-arg tissot=1 (or tissot_touch=1): every address below
++ * belongs to that phone. The POCO's touchscreen=1 must NOT be given on it.
++ *
++ * There is no clock, pin, regulator or I2C framework in this kernel, so the driver does what
++ * it needs itself:
++ *   power    the controller's supply is LDO10 of the PM8953, which the RPM processor owns: it
++ *            cannot be switched from here without the RPM's request protocol (SMD), so the
++ *            driver reads the regulator's state through the PMIC arbiter and says whether it is
++ *            on (the bootloader leaves it on when it has shown its splash with the panel)
++ *   pins     SDA on GPIO10, SCL on GPIO11 (the QUP's "blsp_i2c3" function, not used here),
++ *            reset on GPIO64 (low = in reset), interrupt on GPIO65 (low = a report waits)
++ *   I2C      the two pins driven by hand, open drain: a pin is let go (an input; the pull-ups
++ *            make it high) or driven low, never driven high. About 100 kHz. The QUP's own I2C
++ *            engine would need its clocks voted in the global clock controller first.
++ *   chip     the FocalTech register map: 0x02 the number of fingers, then 6 bytes per finger
++ *            from 0x03 (event and X[11:8], X[7:0], id and Y[11:8], Y[7:0], weight, area);
++ *            0xA3 chip id, 0xA6 firmware version, 0xA8 vendor; 0xA4 = 0 makes the interrupt
++ *            line stay low while a finger is down instead of pulsing
++ * No interrupt is used: a thread looks at the interrupt line 125 times a second, reads the
++ * report when it is low or a finger was down, and reads one anyway every 80 ms in case the line
++ * says nothing.
++ *
++ * The bring-up is made in steps, each said in the log before it is made. Boot-arg
++ * tissot_touch_steps=N stops after the first N:
++ *   1  read the state of LDO10 (through the PMIC arbiter)
++ *   2  set up the pins, reset the controller
++ *   3  find it on the bus and read what it is
++ *   4  watch it                                         (the default)
++ * Boot-arg tissot_touch_flip=1/2/3: mirror X, Y or both.
++ *
++ * Register layouts: Linux drivers/input/touchscreen/edt-ft5x06.c, drivers/pinctrl/qcom/
++ * pinctrl-msm8953.c, drivers/regulator/qcom_spmi-regulator.c, and the phone's device tree
++ * (msm8953-xiaomi-tissot.dts: touchscreen@38, 1080 x 1920).
++ */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/redwood_input.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++static void
++sleep_us(uint32_t us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
++static void
++sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++/* ---- pins (TLMM) ------------------------------------------------------------------------------- */
++
++#define TLMM_PHYS               0x01000000UL
++#define TLMM_SIZE               0x300000UL
++#define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
++#define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
++#define PULL_NONE               0
++#define PULL_UP                 3
++
++#define PIN_SDA                 10
++#define PIN_SCL                 11
++#define PIN_RESET               64
++#define PIN_INT                 65
++
++static vm_offset_t tlmm;
++
++static void
++gpio_configure(unsigned pin, unsigned pull, unsigned ma, bool output)
++{
++	wr(GPIO_CFG(pin), pull | 0 << 2 | (ma / 2 - 1) << 6 | (output ? 1u << 9 : 0));
++}
++
++static void
++gpio_set(unsigned pin, bool high)
++{
++	wr(GPIO_IO(pin), high ? 2 : 0);
++}
++
++static bool
++gpio_get(unsigned pin)
++{
++	return rd(GPIO_IO(pin)) & 1;
++}
++
++/* ---- I2C by hand ------------------------------------------------------------------------------- */
++
++#define I2C_HALF_US             5               /* about 100 kHz */
++#define I2C_STRETCH_US          2000            /* how long a slave may hold the clock low */
++#define FT_ADDRESS              0x38
++
++/* open drain: low is the output enable with the level 0 (set once), high is letting go */
++static void
++line(unsigned pin, bool high)
++{
++	gpio_configure(pin, PULL_UP, 2, !high);
++}
++
++static void
++i2c_init(void)
++{
++	gpio_set(PIN_SDA, false);
++	gpio_set(PIN_SCL, false);
++	line(PIN_SDA, true);
++	line(PIN_SCL, true);
++	sleep_us(I2C_HALF_US);
++}
++
++static bool
++scl_high(void)
++{
++	line(PIN_SCL, true);
++	for (uint32_t waited = 0; !gpio_get(PIN_SCL); waited++) {
++		if (waited >= I2C_STRETCH_US) {
++			return false;
++		}
++		sleep_us(1);
++	}
++	sleep_us(I2C_HALF_US);
++	return true;
++}
++
++static void
++scl_low(void)
++{
++	line(PIN_SCL, false);
++	sleep_us(I2C_HALF_US);
++}
++
++static bool
++i2c_start(void)
++{
++	line(PIN_SDA, true);
++	if (!scl_high()) {
++		return false;
++	}
++	line(PIN_SDA, false);
++	sleep_us(I2C_HALF_US);
++	scl_low();
++	return true;
++}
++
++static void
++i2c_stop(void)
++{
++	line(PIN_SDA, false);
++	scl_high();
++	line(PIN_SDA, true);
++	sleep_us(I2C_HALF_US);
++}
++
++/* Returns true if the byte was acknowledged. */
++static bool
++i2c_put(uint8_t byte)
++{
++	bool ack;
++
++	for (int bit = 7; bit >= 0; bit--) {
++		line(PIN_SDA, byte >> bit & 1);
++		sleep_us(1);
++		if (!scl_high()) {
++			return false;
++		}
++		scl_low();
++	}
++	line(PIN_SDA, true);
++	if (!scl_high()) {
++		return false;
++	}
++	ack = !gpio_get(PIN_SDA);
++	scl_low();
++	return ack;
++}
++
++static uint8_t
++i2c_get(bool last)
++{
++	uint8_t byte = 0;
++
++	line(PIN_SDA, true);
++	for (int bit = 7; bit >= 0; bit--) {
++		scl_high();
++		byte = (uint8_t)(byte << 1 | gpio_get(PIN_SDA));
++		scl_low();
++	}
++	line(PIN_SDA, last);            /* acknowledged, but the last one */
++	sleep_us(1);
++	scl_high();
++	scl_low();
++	line(PIN_SDA, true);
++	return byte;
++}
++
++/* Nine clocks with SDA let go, then a stop: frees a slave that was left in the middle of a byte. */
++static void
++i2c_recover(void)
++{
++	line(PIN_SDA, true);
++	for (int i = 0; i < 9; i++) {
++		scl_high();
++		scl_low();
++	}
++	i2c_stop();
++}
++
++static struct {
++	uint32_t reads, failed;
++} bus;
++
++static bool
++ft_read(uint8_t reg, uint8_t *data, uint32_t length)
++{
++	bool ok = i2c_start() && i2c_put(FT_ADDRESS << 1) && i2c_put(reg) && i2c_start() && i2c_put(FT_ADDRESS << 1 | 1);
++
++	if (ok) {
++		for (uint32_t i = 0; i < length; i++) {
++			data[i] = i2c_get(i + 1 == length);
++		}
++	}
++	i2c_stop();
++	bus.reads++;
++	if (!ok) {
++		bus.failed++;
++		i2c_recover();
++	}
++	return ok;
++}
++
++static bool
++ft_write(uint8_t reg, uint8_t value)
++{
++	bool ok = i2c_start() && i2c_put(FT_ADDRESS << 1) && i2c_put(reg) && i2c_put(value);
++
++	i2c_stop();
++	if (!ok) {
++		i2c_recover();
++	}
++	return ok;
++}
++
++/* ---- the supply -------------------------------------------------------------------------------- */
++
++#define L10_ID                  0x149           /* slave 1, peripheral 0x49: LDO10 of the PM8953 */
++#define VREG_STATUS             0x08            /* [7] ready */
++#define VREG_VOLTAGE            0x40            /* range, then the step */
++#define VREG_ENABLE             0x46            /* [7] */
++
++static void
++supply_state(void)
++{
++	const char *problem;
++	uint8_t status, enable, voltage[2];
++
++	problem = redwood_tissot_spmi_read(L10_ID, VREG_STATUS, &status, 1);
++	if (problem == NULL) {
++		problem = redwood_tissot_spmi_read(L10_ID, VREG_ENABLE, &enable, 1);
++	}
++	if (problem == NULL) {
++		problem = redwood_tissot_spmi_read(L10_ID, VREG_VOLTAGE, voltage, 2);
++	}
++	if (problem != NULL) {
++		printf("tissot-touch: the state of LDO10 cannot be read: %s\n", problem);
++		return;
++	}
++	printf("tissot-touch: LDO10 (the controller's supply): %s, %s; voltage registers %02x %02x\n",
++	    (enable & 0x80) ? "enabled" : "NOT ENABLED by this system", (status & 0x80) ? "ready" : "NOT READY", voltage[0], voltage[1]);
++	if (!(status & 0x80)) {
++		printf("tissot-touch: the controller may have no power; switching it on is the RPM's to do, which this kernel "
++		    "cannot ask yet\n");
++	}
++}
++
++/* ---- the controller --------------------------------------------------------------------------- */
++
++#define FT_REG_TD_STATUS        0x02
++#define FT_REG_POINTS           0x03
++#define FT_REG_INT_MODE         0xa4            /* 0: the line stays low while touched; 1: a pulse per report */
++#define FT_REG_CHIP_ID          0xa3
++#define FT_REG_FIRMWARE         0xa6
++#define FT_REG_VENDOR           0xa8
++#define FT_MAX_TOUCHES          10
++#define FT_EVENT_UP             1
++#define FT_EVENT_NONE           3
++
++#define MAX_X                   1079
++#define MAX_Y                   1919
++#define POLL_US                 8000
++#define IDLE_LOOKS              (80000 / POLL_US)
++
++static uint32_t flip, max_touches = 5;
++
++static struct {
++	bool down, seen;
++	uint32_t x, y;
++} contact[FT_MAX_TOUCHES];
++
++static struct {
++	uint32_t reports, touches, last_x, last_y;
++} seen;
++
++static bool
++any_down(void)
++{
++	for (int i = 0; i < FT_MAX_TOUCHES; i++) {
++		if (contact[i].down) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++ft_report(const uint8_t *points, uint32_t count)
++{
++	static unsigned shown;
++
++	for (int i = 0; i < FT_MAX_TOUCHES; i++) {
++		contact[i].seen = false;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		const uint8_t *t = points + 6 * i;
++		uint32_t event = t[0] >> 6, id = t[2] >> 4;
++		uint32_t x = (t[0] & 0xf) << 8 | t[1], y = (t[2] & 0xf) << 8 | t[3];
++
++		if (id >= FT_MAX_TOUCHES || event == FT_EVENT_UP || event == FT_EVENT_NONE) {
++			continue;
++		}
++		if (shown < 40) {
++			shown++;
++			printf("tissot-touch: finger %u at %u, %u\n", id, x, y);
++		}
++		seen.touches++;
++		seen.last_x = x;
++		seen.last_y = y;
++		x = x >= MAX_X ? 65535 : x * 65535 / MAX_X;
++		y = y >= MAX_Y ? 65535 : y * 65535 / MAX_Y;
++		if (flip & 1) {
++			x = 65535 - x;
++		}
++		if (flip & 2) {
++			y = 65535 - y;
++		}
++		contact[id].seen = true;
++		if (!contact[id].down) {
++			redwood_touch_post(REDWOOD_TOUCH_DOWN, id, x, y);
++		} else if (contact[id].x != x || contact[id].y != y) {
++			redwood_touch_post(REDWOOD_TOUCH_MOVE, id, x, y);
++		}
++		contact[id].down = true;
++		contact[id].x = x;
++		contact[id].y = y;
++	}
++	for (uint32_t id = 0; id < FT_MAX_TOUCHES; id++) {
++		if (contact[id].down && !contact[id].seen) {
++			contact[id].down = false;
++			redwood_touch_post(REDWOOD_TOUCH_UP, id, contact[id].x, contact[id].y);
++		}
++	}
++}
++
++/* Read the number of fingers, then as many points as there are (one read for both when a finger is down). */
++static void
++ft_poll(void)
++{
++	uint8_t report[1 + 6 * FT_MAX_TOUCHES];
++	uint32_t count;
++
++	if (!ft_read(FT_REG_TD_STATUS, report, 1 + 6 * (any_down() ? max_touches : 0))) {
++		return;
++	}
++	count = report[0] & 0xf;
++	if (count > max_touches) {
++		count = 0;              /* 0xf: no report yet; anything else above: not a report */
++	}
++	if (count > 0 && !any_down() && !ft_read(FT_REG_POINTS, report + 1, 6 * count)) {
++		return;
++	}
++	seen.reports++;
++	ft_report(report + 1, count);
++}
++
++static void
++touch_thread(void *parameter, __unused wait_result_t result)
++{
++	uint32_t steps = (uint32_t)(uintptr_t)parameter;
++	uint8_t id[1], firmware[1], vendor[1];
++	unsigned idle = 0;
++	bool found = false;
++
++	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
++
++	printf("tissot-touch: step 1: the controller's supply\n");
++	supply_state();
++	if (steps < 2) {
++		goto out;
++	}
++
++	printf("tissot-touch: step 2: the pins (sda gpio%u, scl gpio%u, reset gpio%u, interrupt gpio%u), and a reset\n", PIN_SDA,
++	    PIN_SCL, PIN_RESET, PIN_INT);
++	gpio_configure(PIN_INT, PULL_UP, 2, false);
++	i2c_init();
++	gpio_set(PIN_RESET, false);
++	gpio_configure(PIN_RESET, PULL_NONE, 2, true);
++	sleep_ms(5);
++	gpio_set(PIN_RESET, true);
++	sleep_ms(300);                  /* as edt-ft5x06.c waits for the firmware to start */
++	printf("tissot-touch: out of reset; sda %s, scl %s, interrupt %s\n", gpio_get(PIN_SDA) ? "high" : "LOW",
++	    gpio_get(PIN_SCL) ? "high" : "LOW", gpio_get(PIN_INT) ? "high" : "low");
++	if (steps < 3) {
++		goto out;
++	}
++
++	printf("tissot-touch: step 3: read the chip id at %#x of address %#x\n", FT_REG_CHIP_ID, FT_ADDRESS);
++	for (int attempt = 0; attempt < 3 && !found; attempt++) {
++		if (attempt > 0) {
++			i2c_recover();
++			sleep_ms(20 * attempt);
++		}
++		found = ft_read(FT_REG_CHIP_ID, id, 1);
++	}
++	if (!found) {
++		printf("tissot-touch: nothing answers at address %#x: no touch screen\n", FT_ADDRESS);
++		goto out;
++	}
++	ft_read(FT_REG_FIRMWARE, firmware, 1);
++	ft_read(FT_REG_VENDOR, vendor, 1);
++	printf("tissot-touch: FocalTech chip id %#x, firmware %#x, vendor %#x\n", id[0], firmware[0], vendor[0]);
++	if (id[0] == 0x54 || id[0] == 0x64) {
++		max_touches = FT_MAX_TOUCHES;   /* the FT5x46 and FT8716 kinds report ten */
++	}
++	printf("tissot-touch: interrupt line held low while touched (0xa4 = 0): %s\n",
++	    ft_write(FT_REG_INT_MODE, 0) ? "done" : "NOT ACKNOWLEDGED");
++	if (steps < 4) {
++		goto out;
++	}
++
++	printf("tissot-touch: step 4: watching, up to %u fingers; the interrupt line looked at every %u us\n", max_touches, POLL_US);
++	for (unsigned tick = 1;; tick++) {
++		if (!gpio_get(PIN_INT) || any_down() || ++idle >= IDLE_LOOKS) {
++			idle = 0;
++			ft_poll();
++		}
++		if (tick % (60 * (1000000 / POLL_US)) == 0) {
++			printf("tissot-touch: so far %u reports, %u finger positions, the last at %u, %u; %u reads of the bus, "
++			    "%u failed\n", seen.reports, seen.touches, seen.last_x, seen.last_y, bus.reads, bus.failed);
++		}
++		sleep_us(POLL_US);
++	}
++out:
++	printf("tissot-touch: stopping here (tissot_touch_steps=%u)\n", steps);
++	thread_terminate(current_thread());
++}
++
++void
++redwood_tissot_touch_init(void)
++{
++	uint32_t enabled = 0, steps = 4;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("tissot_touch", &enabled, sizeof(enabled))) {
++		PE_parse_boot_argn("tissot", &enabled, sizeof(enabled));
++	}
++	if (!enabled) {
++		return;
++	}
++	PE_parse_boot_argn("tissot_touch_steps", &steps, sizeof(steps));
++	PE_parse_boot_argn("tissot_touch_flip", &flip, sizeof(flip));
++	if (steps == 0) {
++		return;
++	}
++	if (kernel_thread_start(touch_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/xnu/files/bsd/sys/redwood_input.h b/xnu/files/bsd/sys/redwood_input.h
+index bb8ad1b..dac71cd 100644
+--- a/xnu/files/bsd/sys/redwood_input.h
++++ b/xnu/files/bsd/sys/redwood_input.h
+@@ -48,6 +48,9 @@ bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */
+ void redwood_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
+ int redwood_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
+ /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/redwood_buttons.c) */
++void redwood_tissot_touch_init(void);   /* boot-arg tissot=1: the Mi A1's FocalTech touch screen */
++void redwood_tissot_buttons_init(void); /* boot-arg tissot=1: the Mi A1's power and volume keys */
++const char *redwood_tissot_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count);
+ void redwood_spmi_lock(void);
+ void redwood_spmi_unlock(void);
+ /*
+diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
+index 63ffd4b..7f6ed1d 100644
+--- a/xnu/files/osfmk/arm64/gic_v3_irq.c
++++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
+@@ -23,6 +23,12 @@
+  *
+  * Registers come from the device tree node /arm-io/gic:
+  *   reg = <distributor offset, size, redistributor offset, size>
++ *
++ * GICv2 (Qualcomm's older SoCs, such as the Snapdragon 625 of the Xiaomi Mi A1) works the same
++ * way with the older programming model, chosen when the processor has no GICv3 system-register
++ * interface (ID_AA64PFR0_EL1.GIC == 0): the second "reg" range is then the memory-mapped CPU
++ * interface, each processor's SGIs and PPIs are its banked copy of the distributor's first
++ * registers, an SPI goes to a processor through GICD_ITARGETSR, and SGIs are sent by GICD_SGIR.
+  */
+ #include <mach/mach_types.h>
+ #include <kern/debug.h>
+@@ -70,6 +76,17 @@
+ #define GICR_IPRIORITYR(n)      (GICR_SGI_BASE + 0x0400 + (n))
+ #define GICR_IGRPMODR0          (GICR_SGI_BASE + 0x0d00)
+ 
++#define GICD_CTLR_ENABLE_V2     (1u << 0)
++#define GICD_ITARGETSR(n)       (0x0800 + (n))
++#define GICD_SGIR               0x0f00
++#define GICC_CTLR               0x0000
++#define GICC_PMR                0x0004
++#define GICC_BPR                0x0008
++#define GICC_IAR                0x000c
++#define GICC_EOIR               0x0010
++#define GICC_APR0               0x00d0
++#define GICV2_SPURIOUS          1023
++
+ #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
+ #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
+ #define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
+@@ -81,6 +98,12 @@
+ static vm_offset_t gicd_base, gicr_base;
+ static vm_size_t   gicr_size;
+ static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
++static bool        gic_v2;                  /* GICv2: gicr_base is the CPU interface (GICC) */
++static struct {
++	uint32_t phys_id;                       /* MPIDR's low affinity fields */
++	uint8_t  mask;                          /* its CPU interface in GICD_ITARGETSR / GICD_SGIR */
++} gic_v2_cpu[MAX_CPUS];
++static bool        gic_v2_cpu_up[MAX_CPUS];
+ 
+ /*
+  * Acknowledged, not yet EOI'd; 0: none. The signal between processors is interrupt 0 and reads
+@@ -135,7 +158,9 @@ gic_write32(vm_offset_t addr, uint32_t value)
+ static void
+ gic_mask(uint32_t intid)
+ {
+-	if (intid < 32) {
++	if (intid < 32 && gic_v2) {
++		gic_write32(gicd_base + GICD_ICENABLER(0), 1u << intid);        /* this processor's bank */
++	} else if (intid < 32) {
+ 		gic_write32(gicr_cpu_base[cpu_number()] + GICR_ICENABLER0, 1u << intid);
+ 	} else {
+ 		gic_write32(gicd_base + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
+@@ -153,6 +178,15 @@ gic_send_sgi(uint32_t phys_id, uint32_t sgi)
+ {
+ 	uint64_t aff0 = phys_id & 0xff, aff1 = (phys_id >> 8) & 0xff;
+ 
++	if (gic_v2) {
++		for (unsigned i = 0; i < MAX_CPUS; i++) {
++			if (gic_v2_cpu_up[i] && gic_v2_cpu[i].phys_id == phys_id) {
++				__builtin_arm_dsb(DSB_ISHST);
++				gic_write32(gicd_base + GICD_SGIR, (uint32_t)gic_v2_cpu[i].mask << 16 | sgi);
++			}
++		}
++		return;
++	}
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", ((uint64_t)sgi << 24) | (aff1 << 16) | (1ULL << (aff0 & 15)));
+ 	__builtin_arm_isb(ISB_SY);
+ }
+@@ -193,7 +227,7 @@ gic_spi_handle(uint32_t intid)
+ static void
+ gic_distributor_settle(void)
+ {
+-	while (gic_read32(gicd_base + GICD_CTLR) & GICD_CTLR_RWP) {
++	while (!gic_v2 && (gic_read32(gicd_base + GICD_CTLR) & GICD_CTLR_RWP)) {
+ 		/* wait for the change to take effect */
+ 	}
+ }
+@@ -254,13 +288,20 @@ gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint
+ 	gic_v3_spi_mask(intid);
+ 	gic_write32(gicd_base + GICD_ICPENDR(intid / 32), 1u << (intid % 32));
+ 	gic_write32(gicd_base + GICD_ICACTIVER(intid / 32), 1u << (intid % 32));
+-	gic_write32(gicd_base + GICD_IGROUPR(intid / 32), gic_read32(gicd_base + GICD_IGROUPR(intid / 32)) | 1u << (intid % 32));
+-	gic_write32(gicd_base + GICD_IGRPMODR(intid / 32), gic_read32(gicd_base + GICD_IGRPMODR(intid / 32)) & ~(1u << (intid % 32)));
++	if (!gic_v2) {
++		/* (GICv2 at the non-secure level: the group registers belong to the firmware) */
++		gic_write32(gicd_base + GICD_IGROUPR(intid / 32), gic_read32(gicd_base + GICD_IGROUPR(intid / 32)) | 1u << (intid % 32));
++		gic_write32(gicd_base + GICD_IGRPMODR(intid / 32), gic_read32(gicd_base + GICD_IGRPMODR(intid / 32)) & ~(1u << (intid % 32)));
++	}
+ 	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(intid)) = GIC_PRIORITY_DEFAULT;
+ 	config = gic_read32(gicd_base + GICD_ICFGR(intid / 16)) & ~(3u << (intid % 16 * 2));
+ 	gic_write32(gicd_base + GICD_ICFGR(intid / 16), config | (edge ? 2u : 0u) << (intid % 16 * 2));
+-	/* GICD_IROUTER: Aff3 in [39:32], Aff2.Aff1.Aff0 in [23:0]; bit 31 (any processor) clear */
+-	*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = (mpidr & 0xff00000000ull) | (mpidr & 0xffffff);
++	if (gic_v2) {
++		*(volatile uint8_t *)(gicd_base + GICD_ITARGETSR(intid)) = gic_v2_cpu[cpu_number()].mask;
++	} else {
++		/* GICD_IROUTER: Aff3 in [39:32], Aff2.Aff1.Aff0 in [23:0]; bit 31 (any processor) clear */
++		*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = (mpidr & 0xff00000000ull) | (mpidr & 0xffffff);
++	}
+ 	gic_distributor_settle();
+ 	gic_v3_spi_unmask(intid);
+ 	return KERN_SUCCESS;
+@@ -296,14 +337,26 @@ gic_v3_spi_count(uint32_t intid)
+ 	return 0;
+ }
+ 
++/* End an acknowledged interrupt (the value read from the IAR, unchanged). */
++static void
++gic_end(uint64_t iar)
++{
++	if (gic_v2) {
++		gic_write32(gicr_base + GICC_EOIR, (uint32_t)iar);
++	} else {
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		__builtin_arm_isb(ISB_SY);
++	}
++}
++
+ static void
+ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub, __unused int source)
+ {
+ 	int cpu = cpu_number();
+ 
+ 	for (;;) {
+-		uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+-		uint32_t intid = (uint32_t)(iar & 0xffffff);
++		uint64_t iar = gic_v2 ? gic_read32(gicr_base + GICC_IAR) : __builtin_arm_rsr64("ICC_IAR1_EL1");
++		uint32_t intid = (uint32_t)(iar & (gic_v2 ? 0x3ff : 0xffffff));   /* v2: [12:10] is an SGI's sender */
+ 
+ 		if (intid >= GIC_INTID_SPURIOUS_MIN) {
+ 			break;
+@@ -328,8 +381,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
+ 			gic_last_unhandled = intid;
+ 		}
+ 
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+-		__builtin_arm_isb(ISB_SY);
++		gic_end(iar);
+ 		gic_active_iar[cpu] = 0;
+ 	}
+ }
+@@ -358,8 +410,7 @@ gic_v3_irq_quiesce(void)
+ 		}
+ 	}
+ 	if (gic_active_iar[cpu] != 0) {
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", gic_active_iar[cpu] & ~GIC_IAR_TAKEN);
+-		__builtin_arm_isb(ISB_SY);
++		gic_end(gic_active_iar[cpu] & ~GIC_IAR_TAKEN);
+ 		gic_active_iar[cpu] = 0;
+ 	}
+ }
+@@ -382,6 +433,15 @@ gic_v3_irq_cpu_shutdown(void)
+ 		return;
+ 	}
+ 	gic_v3_irq_quiesce();
++	if (gic_v2) {
++		/* this processor's bank of the distributor, then its CPU interface */
++		gic_write32(gicd_base + GICD_ICENABLER(0), 0xffffffffu);
++		gic_write32(gicd_base + GICD_ICPENDR(0), 0xffffffffu);
++		gic_write32(gicd_base + GICD_ICACTIVER(0), 0xffffffffu);
++		gic_write32(gicr_base + GICC_CTLR, 0);
++		__builtin_arm_dsb(DSB_SY);
++		return;
++	}
+ 	gicr = gicr_cpu_base[cpu_number()];
+ 	if (gicr != 0) {
+ 		gic_write32(gicr + GICR_ICENABLER0, 0xffffffffu);
+@@ -412,6 +472,49 @@ gic_find_redistributor(void)
+ 	panic("gic: no redistributor for MPIDR 0x%llx", mpidr);
+ }
+ 
++/* gic_v3_irq_cpu_init()'s GICv2 half: the same setup through the banked distributor and GICC. */
++static void
++gic_v2_cpu_init(int cpu)
++{
++	uint32_t mine = 1u << GIC_INTID_VTIMER;
++	uint32_t apr;
++
++	/* The first GICD_ITARGETSR bytes (SGIs, PPIs) read as this processor's own CPU interface mask */
++	gic_v2_cpu[cpu].mask = *(volatile uint8_t *)(gicd_base + GICD_ITARGETSR(0));
++	gic_v2_cpu[cpu].phys_id = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") & 0xffff);
++
++	if (ml_get_cpu_count() > 1) {
++		uint32_t sgis = (1u << GIC_SGI_SIGNAL) | (1u << GIC_SGI_STOP);
++
++		gic_write32(gicd_base + GICD_ICACTIVER(0), sgis);
++		gic_write32(gicd_base + GICD_ICPENDR(0), sgis);
++		*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_SGI_SIGNAL)) = GIC_PRIORITY_DEFAULT;
++		*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_SGI_STOP)) = GIC_PRIORITY_DEFAULT;
++		mine |= sgis;
++	}
++	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
++	gic_write32(gicd_base + GICD_ISENABLER(0), mine);
++
++	if (!(gic_read32(gicd_base + GICD_CTLR) & GICD_CTLR_ENABLE_V2)) {
++		gic_write32(gicd_base + GICD_CTLR, GICD_CTLR_ENABLE_V2);
++	}
++
++	/* No priority active (see the GICv3 case), all priorities accepted, then the interface on.
++	 * An interrupt left acknowledged by an earlier kernel is ended through the IAR's value. */
++	for (apr = 0; apr < 4; apr++) {
++		gic_write32(gicr_base + GICC_APR0 + 4 * apr, 0);
++	}
++	gic_write32(gicr_base + GICC_PMR, 0xff);
++	gic_write32(gicr_base + GICC_BPR, 0);
++	gic_write32(gicr_base + GICC_CTLR, 1);
++	__builtin_arm_dsb(DSB_SY);
++	gic_v2_cpu_up[cpu] = true;
++
++	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
++	kprintf("gic: v2, distributor %p, CPU interface %p, cpu %d (mask 0x%x), virtual timer on PPI %d\n",
++	    (void *)gicd_base, (void *)gicr_base, cpu, gic_v2_cpu[cpu].mask, GIC_INTID_VTIMER);
++}
++
+ /* Per-CPU bring-up: every processor calls this for itself, the boot processor first. */
+ void
+ gic_v3_irq_cpu_init(void)
+@@ -434,13 +537,20 @@ gic_v3_irq_cpu_init(void)
+ 		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
+ 
+ 		simple_lock_init(&gic_spi_lock, 0);
++		/* ID_AA64PFR0_EL1.GIC [27:24]: 0 = no GICv3 system-register interface, so a GICv2 */
++		gic_v2 = ((__builtin_arm_rsr64("ID_AA64PFR0_EL1") >> 24) & 0xf) == 0;
+ 		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
+ 		gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
+ 		gicr_size = reg[3];
+ 		if (gicd_base == 0 || gicr_base == 0) {
+ 			panic("gic: cannot map the distributor/redistributor");
+ 		}
+-	} else if (gicr_cpu_base[cpu] != 0) {
++	} else if (gicr_cpu_base[cpu] != 0 || gic_v2_cpu_up[cpu]) {
++		return;
++	}
++
++	if (gic_v2) {
++		gic_v2_cpu_init(cpu);
+ 		return;
+ 	}
+ 
+diff --git a/xnu/redwood.patch b/xnu/redwood.patch
+index 8f7dd87..f7cb451 100644
+--- a/xnu/redwood.patch
++++ b/xnu/redwood.patch
+@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
+  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
+  
+ diff --git a/bsd/conf/files b/bsd/conf/files
+-index 44274016a4cf..9cd24b42caca 100644
++index 44274016a4cf..4311189cc400 100644
+ --- a/bsd/conf/files
+ +++ b/bsd/conf/files
+-@@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
++@@ -109,6 +109,39 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+  bsd/dev/unix_startup.c			standard
+  
+  bsd/dev/monotonic.c optional monotonic
+@@ -73,6 +73,8 @@ index 44274016a4cf..9cd24b42caca 100644
+ +bsd/dev/redwood_virtio_input.c	standard
+ +bsd/dev/redwood_goodix.c	standard
+ +bsd/dev/redwood_buttons.c	standard
+++bsd/dev/redwood_tissot_touch.c	standard
+++bsd/dev/redwood_tissot_buttons.c	standard
+ +bsd/dev/redwood_battery.c	standard
+ +bsd/dev/redwood_ufs.c	standard
+ +bsd/dev/redwood_ufshc.c	standard
+@@ -103,7 +105,7 @@ index 44274016a4cf..9cd24b42caca 100644
+  bsd/dev/dev_perfmon.c optional config_perfmon
+  
+  bsd/libkern/crc32.c			standard
+-@@ -155,6 +186,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
++@@ -155,6 +188,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
+  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
+  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
+@@ -118,7 +120,7 @@ index 44274016a4cf..9cd24b42caca 100644
+  
+  bsd/miscfs/routefs/routefs_ops.c	optional routefs
+  
+-@@ -361,6 +400,7 @@ bsd/security/audit/audit_syscalls.c		standard
++@@ -361,6 +402,7 @@ bsd/security/audit/audit_syscalls.c		standard
+  bsd/security/audit/audit_worker.c		optional config_audit
+  
+  bsd/pthread/pthread_shims.c		standard
+@@ -126,7 +128,7 @@ index 44274016a4cf..9cd24b42caca 100644
+  bsd/pthread/pthread_priority.c		standard
+  bsd/pthread/pthread_workqueue.c		standard
+  
+-@@ -383,6 +423,7 @@ bsd/kern/kern_debug.c			standard
++@@ -383,6 +425,7 @@ bsd/kern/kern_debug.c			standard
+  bsd/kern/kern_symfile.c			standard
+  bsd/kern/kern_descrip.c			standard
+  bsd/kern/kern_guarded.c			standard
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
 index 640b05d..4a2d74b 100644
 --- a/xnuloader/loader.c
@@ -215,247 +1428,3 @@ index 640b05d..4a2d74b 100644
  	print("== XNULOADER v3 ==\n");
  	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
  	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
---- a/xnu/files/osfmk/arm64/gic_v3_irq.c	2026-10-22 07:00:14.326830300 +0000
-+++ b/xnu/files/osfmk/arm64/gic_v3_irq.c	2026-10-22 09:00:14.772693461 +0000
-@@ -23,6 +23,12 @@
-  *
-  * Registers come from the device tree node /arm-io/gic:
-  *   reg = <distributor offset, size, redistributor offset, size>
-+ *
-+ * GICv2 (Qualcomm's older SoCs, such as the Snapdragon 625 of the Xiaomi Mi A1) works the same
-+ * way with the older programming model, chosen when the processor has no GICv3 system-register
-+ * interface (ID_AA64PFR0_EL1.GIC == 0): the second "reg" range is then the memory-mapped CPU
-+ * interface, each processor's SGIs and PPIs are its banked copy of the distributor's first
-+ * registers, an SPI goes to a processor through GICD_ITARGETSR, and SGIs are sent by GICD_SGIR.
-  */
- #include <mach/mach_types.h>
- #include <kern/debug.h>
-@@ -70,6 +76,17 @@
- #define GICR_IPRIORITYR(n)      (GICR_SGI_BASE + 0x0400 + (n))
- #define GICR_IGRPMODR0          (GICR_SGI_BASE + 0x0d00)
- 
-+#define GICD_CTLR_ENABLE_V2     (1u << 0)
-+#define GICD_ITARGETSR(n)       (0x0800 + (n))
-+#define GICD_SGIR               0x0f00
-+#define GICC_CTLR               0x0000
-+#define GICC_PMR                0x0004
-+#define GICC_BPR                0x0008
-+#define GICC_IAR                0x000c
-+#define GICC_EOIR               0x0010
-+#define GICC_APR0               0x00d0
-+#define GICV2_SPURIOUS          1023
-+
- #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
- #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
- #define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
-@@ -81,6 +98,12 @@
- static vm_offset_t gicd_base, gicr_base;
- static vm_size_t   gicr_size;
- static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
-+static bool        gic_v2;                  /* GICv2: gicr_base is the CPU interface (GICC) */
-+static struct {
-+	uint32_t phys_id;                       /* MPIDR's low affinity fields */
-+	uint8_t  mask;                          /* its CPU interface in GICD_ITARGETSR / GICD_SGIR */
-+} gic_v2_cpu[MAX_CPUS];
-+static bool        gic_v2_cpu_up[MAX_CPUS];
- 
- /*
-  * Acknowledged, not yet EOI'd; 0: none. The signal between processors is interrupt 0 and reads
-@@ -135,7 +158,9 @@
- static void
- gic_mask(uint32_t intid)
- {
--	if (intid < 32) {
-+	if (intid < 32 && gic_v2) {
-+		gic_write32(gicd_base + GICD_ICENABLER(0), 1u << intid);        /* this processor's bank */
-+	} else if (intid < 32) {
- 		gic_write32(gicr_cpu_base[cpu_number()] + GICR_ICENABLER0, 1u << intid);
- 	} else {
- 		gic_write32(gicd_base + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
-@@ -153,6 +178,15 @@
- {
- 	uint64_t aff0 = phys_id & 0xff, aff1 = (phys_id >> 8) & 0xff;
- 
-+	if (gic_v2) {
-+		for (unsigned i = 0; i < MAX_CPUS; i++) {
-+			if (gic_v2_cpu_up[i] && gic_v2_cpu[i].phys_id == phys_id) {
-+				__builtin_arm_dsb(DSB_ISHST);
-+				gic_write32(gicd_base + GICD_SGIR, (uint32_t)gic_v2_cpu[i].mask << 16 | sgi);
-+			}
-+		}
-+		return;
-+	}
- 	__builtin_arm_wsr64("ICC_SGI1R_EL1", ((uint64_t)sgi << 24) | (aff1 << 16) | (1ULL << (aff0 & 15)));
- 	__builtin_arm_isb(ISB_SY);
- }
-@@ -193,7 +227,7 @@
- static void
- gic_distributor_settle(void)
- {
--	while (gic_read32(gicd_base + GICD_CTLR) & GICD_CTLR_RWP) {
-+	while (!gic_v2 && (gic_read32(gicd_base + GICD_CTLR) & GICD_CTLR_RWP)) {
- 		/* wait for the change to take effect */
- 	}
- }
-@@ -254,13 +288,20 @@
- 	gic_v3_spi_mask(intid);
- 	gic_write32(gicd_base + GICD_ICPENDR(intid / 32), 1u << (intid % 32));
- 	gic_write32(gicd_base + GICD_ICACTIVER(intid / 32), 1u << (intid % 32));
--	gic_write32(gicd_base + GICD_IGROUPR(intid / 32), gic_read32(gicd_base + GICD_IGROUPR(intid / 32)) | 1u << (intid % 32));
--	gic_write32(gicd_base + GICD_IGRPMODR(intid / 32), gic_read32(gicd_base + GICD_IGRPMODR(intid / 32)) & ~(1u << (intid % 32)));
-+	if (!gic_v2) {
-+		/* (GICv2 at the non-secure level: the group registers belong to the firmware) */
-+		gic_write32(gicd_base + GICD_IGROUPR(intid / 32), gic_read32(gicd_base + GICD_IGROUPR(intid / 32)) | 1u << (intid % 32));
-+		gic_write32(gicd_base + GICD_IGRPMODR(intid / 32), gic_read32(gicd_base + GICD_IGRPMODR(intid / 32)) & ~(1u << (intid % 32)));
-+	}
- 	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(intid)) = GIC_PRIORITY_DEFAULT;
- 	config = gic_read32(gicd_base + GICD_ICFGR(intid / 16)) & ~(3u << (intid % 16 * 2));
- 	gic_write32(gicd_base + GICD_ICFGR(intid / 16), config | (edge ? 2u : 0u) << (intid % 16 * 2));
--	/* GICD_IROUTER: Aff3 in [39:32], Aff2.Aff1.Aff0 in [23:0]; bit 31 (any processor) clear */
--	*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = (mpidr & 0xff00000000ull) | (mpidr & 0xffffff);
-+	if (gic_v2) {
-+		*(volatile uint8_t *)(gicd_base + GICD_ITARGETSR(intid)) = gic_v2_cpu[cpu_number()].mask;
-+	} else {
-+		/* GICD_IROUTER: Aff3 in [39:32], Aff2.Aff1.Aff0 in [23:0]; bit 31 (any processor) clear */
-+		*(volatile uint64_t *)(gicd_base + GICD_IROUTER(intid)) = (mpidr & 0xff00000000ull) | (mpidr & 0xffffff);
-+	}
- 	gic_distributor_settle();
- 	gic_v3_spi_unmask(intid);
- 	return KERN_SUCCESS;
-@@ -296,14 +337,26 @@
- 	return 0;
- }
- 
-+/* End an acknowledged interrupt (the value read from the IAR, unchanged). */
-+static void
-+gic_end(uint64_t iar)
-+{
-+	if (gic_v2) {
-+		gic_write32(gicr_base + GICC_EOIR, (uint32_t)iar);
-+	} else {
-+		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
-+		__builtin_arm_isb(ISB_SY);
-+	}
-+}
-+
- static void
- gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub, __unused int source)
- {
- 	int cpu = cpu_number();
- 
- 	for (;;) {
--		uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
--		uint32_t intid = (uint32_t)(iar & 0xffffff);
-+		uint64_t iar = gic_v2 ? gic_read32(gicr_base + GICC_IAR) : __builtin_arm_rsr64("ICC_IAR1_EL1");
-+		uint32_t intid = (uint32_t)(iar & (gic_v2 ? 0x3ff : 0xffffff));   /* v2: [12:10] is an SGI's sender */
- 
- 		if (intid >= GIC_INTID_SPURIOUS_MIN) {
- 			break;
-@@ -328,8 +381,7 @@
- 			gic_last_unhandled = intid;
- 		}
- 
--		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
--		__builtin_arm_isb(ISB_SY);
-+		gic_end(iar);
- 		gic_active_iar[cpu] = 0;
- 	}
- }
-@@ -358,8 +410,7 @@
- 		}
- 	}
- 	if (gic_active_iar[cpu] != 0) {
--		__builtin_arm_wsr64("ICC_EOIR1_EL1", gic_active_iar[cpu] & ~GIC_IAR_TAKEN);
--		__builtin_arm_isb(ISB_SY);
-+		gic_end(gic_active_iar[cpu] & ~GIC_IAR_TAKEN);
- 		gic_active_iar[cpu] = 0;
- 	}
- }
-@@ -382,6 +433,15 @@
- 		return;
- 	}
- 	gic_v3_irq_quiesce();
-+	if (gic_v2) {
-+		/* this processor's bank of the distributor, then its CPU interface */
-+		gic_write32(gicd_base + GICD_ICENABLER(0), 0xffffffffu);
-+		gic_write32(gicd_base + GICD_ICPENDR(0), 0xffffffffu);
-+		gic_write32(gicd_base + GICD_ICACTIVER(0), 0xffffffffu);
-+		gic_write32(gicr_base + GICC_CTLR, 0);
-+		__builtin_arm_dsb(DSB_SY);
-+		return;
-+	}
- 	gicr = gicr_cpu_base[cpu_number()];
- 	if (gicr != 0) {
- 		gic_write32(gicr + GICR_ICENABLER0, 0xffffffffu);
-@@ -412,6 +472,49 @@
- 	panic("gic: no redistributor for MPIDR 0x%llx", mpidr);
- }
- 
-+/* gic_v3_irq_cpu_init()'s GICv2 half: the same setup through the banked distributor and GICC. */
-+static void
-+gic_v2_cpu_init(int cpu)
-+{
-+	uint32_t mine = 1u << GIC_INTID_VTIMER;
-+	uint32_t apr;
-+
-+	/* The first GICD_ITARGETSR bytes (SGIs, PPIs) read as this processor's own CPU interface mask */
-+	gic_v2_cpu[cpu].mask = *(volatile uint8_t *)(gicd_base + GICD_ITARGETSR(0));
-+	gic_v2_cpu[cpu].phys_id = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") & 0xffff);
-+
-+	if (ml_get_cpu_count() > 1) {
-+		uint32_t sgis = (1u << GIC_SGI_SIGNAL) | (1u << GIC_SGI_STOP);
-+
-+		gic_write32(gicd_base + GICD_ICACTIVER(0), sgis);
-+		gic_write32(gicd_base + GICD_ICPENDR(0), sgis);
-+		*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_SGI_SIGNAL)) = GIC_PRIORITY_DEFAULT;
-+		*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_SGI_STOP)) = GIC_PRIORITY_DEFAULT;
-+		mine |= sgis;
-+	}
-+	*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
-+	gic_write32(gicd_base + GICD_ISENABLER(0), mine);
-+
-+	if (!(gic_read32(gicd_base + GICD_CTLR) & GICD_CTLR_ENABLE_V2)) {
-+		gic_write32(gicd_base + GICD_CTLR, GICD_CTLR_ENABLE_V2);
-+	}
-+
-+	/* No priority active (see the GICv3 case), all priorities accepted, then the interface on.
-+	 * An interrupt left acknowledged by an earlier kernel is ended through the IAR's value. */
-+	for (apr = 0; apr < 4; apr++) {
-+		gic_write32(gicr_base + GICC_APR0 + 4 * apr, 0);
-+	}
-+	gic_write32(gicr_base + GICC_PMR, 0xff);
-+	gic_write32(gicr_base + GICC_BPR, 0);
-+	gic_write32(gicr_base + GICC_CTLR, 1);
-+	__builtin_arm_dsb(DSB_SY);
-+	gic_v2_cpu_up[cpu] = true;
-+
-+	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
-+	kprintf("gic: v2, distributor %p, CPU interface %p, cpu %d (mask 0x%x), virtual timer on PPI %d\n",
-+	    (void *)gicd_base, (void *)gicr_base, cpu, gic_v2_cpu[cpu].mask, GIC_INTID_VTIMER);
-+}
-+
- /* Per-CPU bring-up: every processor calls this for itself, the boot processor first. */
- void
- gic_v3_irq_cpu_init(void)
-@@ -434,13 +537,20 @@
- 		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
- 
- 		simple_lock_init(&gic_spi_lock, 0);
-+		/* ID_AA64PFR0_EL1.GIC [27:24]: 0 = no GICv3 system-register interface, so a GICv2 */
-+		gic_v2 = ((__builtin_arm_rsr64("ID_AA64PFR0_EL1") >> 24) & 0xf) == 0;
- 		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
- 		gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
- 		gicr_size = reg[3];
- 		if (gicd_base == 0 || gicr_base == 0) {
- 			panic("gic: cannot map the distributor/redistributor");
- 		}
--	} else if (gicr_cpu_base[cpu] != 0) {
-+	} else if (gicr_cpu_base[cpu] != 0 || gic_v2_cpu_up[cpu]) {
-+		return;
-+	}
-+
-+	if (gic_v2) {
-+		gic_v2_cpu_init(cpu);
- 		return;
- 	}
- 
