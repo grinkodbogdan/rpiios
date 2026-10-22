@@ -196,6 +196,14 @@ shim_main(const void *fdt, uint64_t loaded_at)
 	 */
 	payload_at = (uint64_t)(uintptr_t)c + payload->offset;
 	efi_reserve(payload_at, PAYLOAD_SPACE, 2 /* loader data */);
+#ifdef HIGH_ONLY
+	/*
+	 * mia1-ios-high.img: nothing of the low bank but what aboot itself wrote (this shim, the device
+	 * tree, the ramdisk): the phone resets a moment after large writes there. The loader, the
+	 * kernel and iOS in the upper bank, where aboot keeps its own download buffer.
+	 */
+	efi_reserve(0x10000000, 0x70000000, 0);
+#endif
 	largest = efi_largest_free(&largest_size);
 	say("payload at %llx (in the ramdisk); the kernel's block %llx..%llx (%llu MB)\n", (unsigned long long)payload_at,
 	    (unsigned long long)largest, (unsigned long long)(largest + largest_size), (unsigned long long)(largest_size >> 20));

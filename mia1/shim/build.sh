@@ -54,6 +54,12 @@ if [ -n "${WDT_TESTS:-}" ]; then
 	done
 	exit 0
 fi
+if [ -n "${HIGH_ONLY:-}" ]; then
+	SHIM_CFLAGS="-DHIGH_ONLY" HIGH_ONLY= "$0" "$out/high" "$hack" >/dev/null
+	cp "$out/high/mia1-ios.img" "$out/mia1-ios-high.img"
+	echo "shim: $out/mia1-ios-high.img"
+	exit 0
+fi
 if [ -n "${MEMPROBE:-}" ]; then
 	SHIM_CFLAGS="-DMEMPROBE" MEMPROBE= "$0" "$out/memprobe" "$hack" >/dev/null
 	cp "$out/memprobe/mia1-ios.img" "$out/mia1-memprobe.img"
