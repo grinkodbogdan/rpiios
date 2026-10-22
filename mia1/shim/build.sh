@@ -45,7 +45,7 @@ image() {   # NAME CMDLINE
 }
 # tissot=1: the Mi A1's drivers (eMMC, touch, buttons); vtimer_ppi=20: its virtual timer's interrupt
 # (the MSM8953 wires the generic timers to PPIs 1-4); emmc_root: the iOS volume on userdata;
-# -v: the kernel's text on the screen, the only log there is
+# -v (mia1-ios-verbose.img): the kernel's and the daemons' text on the screen, over iOS's own
 if [ -n "${WDT_TESTS:-}" ]; then
 	# the watchdog tests: count 40 s, then (modes 8 and 4) boot as mia1-ios.img does
 	for mode in 0 8 4; do
@@ -83,5 +83,6 @@ if [ -n "${SHIM_CMDLINE:-}" ]; then
 	image mia1-test "$SHIM_CMDLINE"
 	exit 0
 fi
-image mia1-ios "-v tissot=1 vtimer_ppi=20 emmc_root=userdata"
-image mia1-ios-4cpu "-v tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=4"
+image mia1-ios "tissot=1 vtimer_ppi=20 emmc_root=userdata"
+image mia1-ios-verbose "-v tissot=1 vtimer_ppi=20 emmc_root=userdata"
+image mia1-ios-4cpu "tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=4"

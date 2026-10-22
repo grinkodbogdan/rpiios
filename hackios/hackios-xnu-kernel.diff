@@ -27,10 +27,10 @@ index 8076cf0..73c3c29 100644
  	redwood_net_init();
 diff --git a/xnu/files/bsd/dev/redwood_tissot_buttons.c b/xnu/files/bsd/dev/redwood_tissot_buttons.c
 new file mode 100644
-index 0000000..0f707cb
+index 0000000..7fbfa96
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_buttons.c
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,387 @@
 +/*
 + * The buttons of the Xiaomi Mi A1 (tissot, MSM8953) -- power, volume up, volume down -- as a
 + * source of button records for /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg
@@ -81,6 +81,10 @@ index 0000000..0f707cb
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern kern_return_t thread_terminate(thread_t thread);
++
++/* the bring-up's lines also into the log that survives a reset (redwood_tissot_emmc.c): the next boot shows them */
++extern void redwood_tissot_log(const char *format, ...) __printflike(1, 2);
++#define printf(...) redwood_tissot_log(__VA_ARGS__)
 +
 +static inline uint32_t
 +rd(vm_offset_t address)
@@ -284,7 +288,7 @@ index 0000000..0f707cb
 +	if (pressed) {
 +		b->presses++;
 +	}
-+	printf("tissot-buttons: %s %s\n", b->name, pressed ? "PRESSED" : "released");
++	(printf)("tissot-buttons: %s %s\n", b->name, pressed ? "PRESSED" : "released");   /* not kept: there are many */
 +	redwood_touch_post(pressed ? REDWOOD_BUTTON_DOWN : REDWOOD_BUTTON_UP, b->record, 0, 0);
 +}
 +
@@ -383,7 +387,7 @@ index 0000000..0f707cb
 +	for (unsigned tick = 1;; tick++) {
 +		buttons_poll();
 +		if (tick % MINUTE_TICKS == 0) {
-+			printf("tissot-buttons: %u presses of power, %u of volume up, %u of volume down; %llu reads of the bus, "
++			(printf)("tissot-buttons: %u presses of power, %u of volume up, %u of volume down; %llu reads of the bus, "
 +			    "%llu failed\n", power.presses, volume_up.presses, volume_down.presses, bus.reads, bus.failed);
 +		}
 +		if (bus.failed >= 1000 && bus.failed * 2 > bus.reads) {
@@ -1735,10 +1739,10 @@ index 0000000..5cd2ae9
 +#endif
 diff --git a/xnu/files/bsd/dev/redwood_tissot_touch.c b/xnu/files/bsd/dev/redwood_tissot_touch.c
 new file mode 100644
-index 0000000..8ca2934
+index 0000000..efbad23
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_touch.c
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,514 @@
 +/*
 + * The touch screen of the Xiaomi Mi A1 (tissot, MSM8953): a FocalTech FT5x06-family controller
 + * at address 0x38 of the I2C bus of BLSP1 QUP3, as a source of touches for /dev/redwood-touch
@@ -1786,6 +1790,10 @@ index 0000000..8ca2934
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern kern_return_t thread_terminate(thread_t thread);
++
++/* the bring-up's lines also into the log that survives a reset (redwood_tissot_emmc.c): the next boot shows them */
++extern void redwood_tissot_log(const char *format, ...) __printflike(1, 2);
++#define printf(...) redwood_tissot_log(__VA_ARGS__)
 +
 +static inline uint32_t
 +rd(vm_offset_t address)
@@ -2102,7 +2110,7 @@ index 0000000..8ca2934
 +		}
 +		if (shown < 40) {
 +			shown++;
-+			printf("tissot-touch: finger %u at %u, %u\n", id, x, y);
++			(printf)("tissot-touch: finger %u at %u, %u\n", id, x, y);
 +		}
 +		seen.touches++;
 +		seen.last_x = x;
@@ -2218,7 +2226,7 @@ index 0000000..8ca2934
 +			ft_poll();
 +		}
 +		if (tick % (60 * (1000000 / POLL_US)) == 0) {
-+			printf("tissot-touch: so far %u reports, %u finger positions, the last at %u, %u; %u reads of the bus, "
++			(printf)("tissot-touch: so far %u reports, %u finger positions, the last at %u, %u; %u reads of the bus, "
 +			    "%u failed\n", seen.reports, seen.touches, seen.last_x, seen.last_y, bus.reads, bus.failed);
 +		}
 +		sleep_us(POLL_US);

@@ -92,8 +92,7 @@ keep_start(void)
 		 * What the kernel said, if it got that far (after the loader's "jumping to"): the lines of
 		 * this port's own drivers and the panic, not the whole log the loader prints back.
 		 */
-		static const char *const wanted[] = { "jumping to", "tissot", "gic:", "IOFindBSDRoot", "BSD root", "panic(",
-		    "Panicked", "the run before" };
+		static const char *const wanted[] = { "tissot", "BSD root", "panic(", "Panicked" };
 		uint64_t start = 0, line = 0;
 		int shown = 0;
 
@@ -104,7 +103,7 @@ keep_start(void)
 		}
 		text_colour = 0xffd040;
 		say("--- the run before this one ended with (its kernel's own lines): ---\n");
-		for (uint64_t i = start; i < keep->len && shown < 40; i = line) {
+		for (uint64_t i = start; i < keep->len && shown < 45; i = line) {
 			char text[200];
 			uint64_t n = 0;
 
