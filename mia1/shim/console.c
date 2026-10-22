@@ -88,24 +88,51 @@ keep_start(void)
 	if (keep->magic == KEEP_MAGIC && keep->len > 0 && keep->len <= KEEP_BYTES) {
 		uint64_t from = keep->len > 1800 ? keep->len - 1800 : 0, hz = READ_SYSREG(cntfrq_el0), t;
 
-		/* what the kernel said, if it got that far: everything after the loader's last line */
+		/*
+		 * What the kernel said, if it got that far (after the loader's "jumping to"): the lines of
+		 * this port's own drivers and the panic, not the whole log the loader prints back.
+		 */
+		static const char *const wanted[] = { "jumping to", "tissot", "gic:", "IOFindBSDRoot", "BSD root", "panic(",
+		    "Panicked", "the run before" };
+		uint64_t start = 0, line = 0;
+		int shown = 0;
+
 		for (uint64_t i = 0; i + 10 < keep->len; i++) {
-			if (keep->text[i] == 'j' && keep->text[i + 1] == 'u' && keep->text[i + 2] == 'm' &&
-			    keep->text[i + 3] == 'p' && keep->text[i + 4] == 'i' && keep->text[i + 5] == 'n' &&
-			    keep->text[i + 6] == 'g' && keep->text[i + 7] == ' ' && keep->text[i + 8] == 't' &&
-			    keep->text[i + 9] == 'o') {
-				from = i;
+			if (memcmp((const void *)&keep->text[i], "jumping to", 10) == 0) {
+				start = i;
 			}
 		}
-		if (keep->len - from > 1800) {
-			from = keep->len - 1800;
-		}
 		text_colour = 0xffd040;
-		say("--- the run before this one ended with: ---\n");
-		for (uint64_t i = from; i < keep->len; i++) {
-			put_raw(keep->text[i]);
+		say("--- the run before this one ended with (its kernel's own lines): ---\n");
+		for (uint64_t i = start; i < keep->len && shown < 40; i = line) {
+			char text[200];
+			uint64_t n = 0;
+
+			for (line = i; line < keep->len && keep->text[line] != '\n'; line++) {
+				if (n + 1 < sizeof(text)) {
+					text[n++] = keep->text[line];
+				}
+			}
+			line++;
+			text[n] = 0;
+			for (unsigned w = 0; w < sizeof(wanted) / sizeof(wanted[0]); w++) {
+				uint64_t len = strlen(wanted[w]);
+
+				for (uint64_t k = 0; k + len <= n; k++) {
+					if (memcmp(text + k, wanted[w], len) == 0) {
+						for (uint64_t c = 0; c < n; c++) {
+							put_raw(text[c]);
+						}
+						put_raw('\n');
+						shown++;
+						w = 100;
+						break;
+					}
+				}
+			}
 		}
-		say("\n--- (end) ---\n");
+		(void)from;
+		say("--- (end) ---\n");
 		/* time for a photograph */
 		for (int left = 30; left > 0; left--) {
 			say("%d ", left);

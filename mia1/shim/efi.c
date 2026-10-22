@@ -385,12 +385,30 @@ get_time(struct efi_time *t, void *caps)
 	return EFI_UNSUPPORTED;
 }
 
+/*
+ * The loader asks for one after a kernel panic, its log shown. A minute for a photograph, then a
+ * reset through PSCI: a warm one, which keeps the memory, so that the next boot shows the kernel's
+ * own lines from the log kept there (console.c). Holding the power key loses them.
+ */
 static void EFIAPI
 reset_system(int type, efi_status status, uint64_t size, void *data)
 {
-	(void)size, (void)data;
-	stop("\nThe loader asked for a reset (type %d, status %llx): not done, so that this screen stays.\n", type,
-	    (unsigned long long)status);
+	uint64_t hz = READ_SYSREG(cntfrq_el0), t;
+
+	(void)size, (void)data, (void)type, (void)status;
+	say("\nThe loader asks for a reset. In 60 s, and the next boot shows what the kernel said:\n");
+	for (int left = 60; left > 0; left--) {
+		say("%d ", left);
+		t = READ_SYSREG(cntpct_el0);
+		while (READ_SYSREG(cntpct_el0) - t < hz) {
+		}
+	}
+	__asm__ volatile("dsb sy");
+	{
+		register uint64_t x0 __asm__("x0") = 0x84000009;        /* PSCI SYSTEM_RESET */
+		__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+	}
+	stop("\nPSCI did not reset the phone\n");
 }
 
 /* ---- the tables -------------------------------------------------------------------------------- */
