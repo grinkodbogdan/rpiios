@@ -1,5 +1,8 @@
 # HackiOS (iOS 16.5) on the Xiaomi Mi A1
 
+**It boots to the home screen** (2026-10-22, `first-home-screen.jpg`): one core, the iOS volume
+read from the eMMC's userdata partition, the display as LK left it switched to 32 bits a pixel.
+
 The Mi A1 (tissot, Snapdragon 625 / MSM8953, 4 GB) boots HackiOS's XNU and iOS 16.5 userland
 from its stock bootloader, with `fastboot boot`: nothing of the phone's firmware is replaced.
 
