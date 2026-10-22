@@ -8,8 +8,9 @@ No Apple files here.
 ## Result
 
 iOS 16.5 reaches the home screen in QEMU `virt` with `-cpu cortex-a53` (ARMv8.0, the
-Snapdragon 625's core in the Mi A1), using HackiOS's prebuilt kernel with PAN patched out.
-iOS 16.5's user space ran there with no illegal-instruction faults.
+Snapdragon 625's core in the Mi A1) and `gic-version=2` (the Snapdragon 625's interrupt
+controller), with the kernel built from source here and the loader changes below. iOS 16.5's
+user space ran there with no illegal-instruction faults.
 
 ## Files
 
@@ -19,7 +20,9 @@ iOS 16.5's user space ran there with no illegal-instruction faults.
       instructions out of `__TEXT_EXEC` in memory before starting it (writes -> NOP, reads ->
       "PAN set"); one kernel then runs on both kinds of core;
     - a core without the GICv3 system-register interface gets a GICv2 described in the
-      device tree (`arm,gic-v2`; second range = the CPU interface, `gic_cpu` per platform);
+      device tree (`arm,gic-v2`; second range = the CPU interface, `gic_cpu` per platform),
+      and the loader's own context save/restore skips the GICv3 registers there (and PAN/UAO
+      on cores without them);
     - the ramfb completion check read a non-volatile copy of the DMA control word, so the
       loader kept the firmware's 800x600 mode while QEMU showed its new 1125x2436 buffer
       (black screen with Ubuntu's AAVMF firmware);
@@ -48,6 +51,6 @@ GIT_DIR=.userland.git GIT_WORK_TREE=. git apply ../hackios-xnu-userland.diff
 ios165/fetch.sh && SKIP=kernel common/build.sh qemu-virt
 K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837
 mkdir -p $K && ../a53-kernel.py prebuilt/mach.development.bcm2837 $K/mach.development.bcm2837
-QEMU_CPU=cortex-a53 QEMU_EFI=/usr/share/AAVMF/AAVMF_CODE.fd QEMU_VARS=/usr/share/AAVMF/AAVMF_VARS.fd \
+QEMU_GIC=2 QEMU_CPU=cortex-a53 QEMU_EFI=/usr/share/AAVMF/AAVMF_CODE.fd QEMU_VARS=/usr/share/AAVMF/AAVMF_VARS.fd \
   QEMU_SMP=4 CMDLINE=cpus=4 qemu/run-ios.sh 1500
 ```
