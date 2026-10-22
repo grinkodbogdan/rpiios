@@ -54,6 +54,12 @@ if [ -n "${WDT_TESTS:-}" ]; then
 	done
 	exit 0
 fi
+if [ -n "${STEPS:-}" ]; then
+	SHIM_CFLAGS="-DSTEPS" STEPS= "$0" "$out/steps" "$hack" >/dev/null
+	cp "$out/steps/mia1-ios.img" "$out/mia1-steps.img"
+	echo "shim: $out/mia1-steps.img"
+	exit 0
+fi
 if [ -n "${HIGH_ONLY:-}" ]; then
 	SHIM_CFLAGS="-DHIGH_ONLY" HIGH_ONLY= "$0" "$out/high" "$hack" >/dev/null
 	cp "$out/high/mia1-ios.img" "$out/mia1-ios-high.img"

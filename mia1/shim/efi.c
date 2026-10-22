@@ -472,6 +472,22 @@ static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint64_t rd64(const uint8_t *p) { return rd32(p) | (uint64_t)rd32(p + 4) << 32; }
 
+/* mia1-steps.img: each step of starting the loader said, then 2 s of nothing, so that a reset is pinned to one */
+#ifdef STEPS
+static void
+step(const char *what)
+{
+	uint64_t t, hz = READ_SYSREG(cntfrq_el0);
+
+	say("step: %s\n", what);
+	t = READ_SYSREG(cntpct_el0);
+	while (READ_SYSREG(cntpct_el0) - t < 2 * hz) {
+	}
+}
+#else
+#define step(what) do { } while (0)
+#endif
+
 uint64_t
 efi_run_image(const void *image, uint64_t image_size, uint64_t load_at, uint64_t payload)
 {
@@ -507,7 +523,9 @@ efi_run_image(const void *image, uint64_t image_size, uint64_t load_at, uint64_t
 		    (unsigned long long)size_of_image);
 	}
 	at = (uint8_t *)(uintptr_t)load_at;
+	step("clear the loader's memory");
 	memset(at, 0, size_of_image);
+	step("copy its sections");
 	memcpy(at, pe, rd32(opt + 60));                 /* the headers */
 	for (uint32_t i = 0; i < nsections; i++) {
 		const uint8_t *s = sections + 40 * i;
@@ -515,6 +533,7 @@ efi_run_image(const void *image, uint64_t image_size, uint64_t load_at, uint64_t
 
 		memcpy(at + va, pe + raw_at, raw < vsize || vsize == 0 ? raw : vsize);
 	}
+	step("apply its relocations");
 	delta = load_at - image_base;
 	for (uint32_t off = 0; off < reloc_size;) {
 		const uint8_t *block = at + reloc_rva + off;
@@ -535,10 +554,13 @@ efi_run_image(const void *image, uint64_t image_size, uint64_t load_at, uint64_t
 		}
 		off += bytes;
 	}
+	step("clean the data cache, invalidate the instruction cache");
 	icache_sync_range(load_at, size_of_image);
+	step("make the UEFI tables");
 	tables(payload);
 	say("loader: %llu KB at %llx (linked at %llx), entry +%llx\n", (unsigned long long)(size_of_image >> 10),
 	    (unsigned long long)load_at, (unsigned long long)image_base, (unsigned long long)entry);
+	step("call the loader");
 	efi_main = (void *)(at + entry);
 	return efi_main((efi_handle)(uintptr_t)load_at, &st);
 }
