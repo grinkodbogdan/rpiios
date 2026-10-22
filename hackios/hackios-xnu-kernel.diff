@@ -1737,12 +1737,321 @@ index 0000000..5cd2ae9
 +}
 +
 +#endif
+diff --git a/xnu/files/bsd/dev/redwood_tissot_rpm.c b/xnu/files/bsd/dev/redwood_tissot_rpm.c
+new file mode 100644
+index 0000000..59487ec
+--- /dev/null
++++ b/xnu/files/bsd/dev/redwood_tissot_rpm.c
+@@ -0,0 +1,303 @@
++/*
++ * The Mi A1's (tissot, MSM8953) resource power manager, the RPM: the processor that owns the
++ * PMIC's regulators and the shared clocks. A supply the RPM owns is not to be written through
++ * the PMIC arbiter (the Pixel 1 port, ios-sailfish, saw the phone reset at that); it is asked
++ * for, as Linux does (qcom_smd-regulator.c) and as the phone's own boot loader does before it
++ * starts a kernel (LK: platform/msm_shared/{smd,rpm-smd,smem}.c, target/msm8953/init.c).
++ *
++ * The transport is SMD in shared memory -- not GLINK, which the Pixel's RPM speaks:
++ *   SMEM       0x86300000 (1 MB): a header (4 proc_comm entries, 32 version words, the heap
++ *              info) and then the table of items {allocated, offset, size, base_ext}
++ *   channels   item 13: up to 64 entries {name[20], cid, type, ref_count}; the RPM's is the one
++ *              of edge type 15 ("rpm_requests")
++ *   the channel  item 14 + cid: two stream records, ours (ch0) and the RPM's (ch1), each {state,
++ *              DTR, CTS, CD, RI, data_written, data_read, state_updated, mask_recv_intr,
++ *              read_index, write_index}; item 338 + cid: the two FIFOs, ours first
++ *   doorbell   bit 0 of the APCS IPC register 0x0b111008
++ * LK closes the channel before it starts us (rpm_smd_uninit); it is opened again here: ours to
++ * OPENING, the doorbell, the RPM answers OPENED, ours to OPENED.
++ *
++ * A request: a 20-byte SMD packet header {size, 0...}, then {"req", 20 + n}, {id, set 0 = active,
++ * resource type, resource id, n} and n bytes of {key, 4, value}. The RPM answers each one; the
++ * answer is read and said.
++ *
++ * Polled, one caller at a time (the touch screen's thread). Shared memory only with 32-bit
++ * accesses, through device mappings: nothing of it is cached here.
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void redwood_tissot_log(const char *format, ...) __printflike(1, 2);
++#define say(...) redwood_tissot_log("tissot-rpm: " __VA_ARGS__)
++
++#define SMEM_PHYS               0x86300000UL
++#define SMEM_ALLOC_INFO         208             /* 4 x 16 + 32 x 4 + 16 */
++#define SMEM_ITEMS              419
++#define ITEM_CHANNEL_TABLE      13
++#define ITEM_CHANNEL_BASE       14
++#define ITEM_FIFO_BASE          338
++#define EDGE_APPS_RPM           0x0f
++#define IPC_PHYS                0x0b111008UL
++
++enum { SS_CLOSED, SS_OPENING, SS_OPENED, SS_FLUSHING, SS_CLOSING, SS_RESET, SS_RESET_OPENING };
++
++/* one stream record: word offsets */
++enum { ST_STATE, ST_DTR, ST_CTS, ST_CD, ST_RI, ST_WRITTEN, ST_READ, ST_UPDATED, ST_MASK, ST_RIDX, ST_WIDX, ST_WORDS };
++
++#define RPM_REQ_MAGIC           0x00716572u     /* "req" */
++#define RES_LDOA                0x616f646cu     /* "ldoa" */
++#define KEY_SWEN                0x6e657773u     /* "swen" */
++#define KEY_UV                  0x00007675u     /* "uv" */
++
++static vm_offset_t smem_head, ipc;
++static volatile uint32_t *ours, *theirs;        /* ch0, ch1 */
++static vm_offset_t fifo_out, fifo_in;
++static uint32_t fifo_size, msg_id;
++static bool is_open;
++
++static LCK_GRP_DECLARE(rpm_lck_grp, "tissot-rpm");
++static LCK_MTX_DECLARE(rpm_lock, &rpm_lck_grp);
++
++static inline uint32_t
++rd(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++wr(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++static void
++doorbell(void)
++{
++	__builtin_arm_dsb(0xf);
++	wr(ipc, 1);
++}
++
++/* An SMEM item, mapped (device memory, its pages alone). 0 if there is none. */
++static vm_offset_t
++item(uint32_t n, uint32_t *size)
++{
++	vm_offset_t info = smem_head + SMEM_ALLOC_INFO + 16 * n;
++	uint64_t phys;
++	uint32_t off;
++
++	if (rd(info) == 0) {
++		return 0;
++	}
++	*size = rd(info + 8);
++	phys = rd(info + 12) != 0 ? rd(info + 12) : SMEM_PHYS;
++	phys += rd(info + 4);
++	off = (uint32_t)(phys & 0xfff);
++	return ml_io_map((vm_offset_t)(phys - off), round_page(*size + off)) + off;
++}
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static bool
++channel_open(void)
++{
++	uint32_t size, cid = ~0u;
++	vm_offset_t table, ch, fifo;
++	uint64_t until;
++
++	if (is_open) {
++		return true;
++	}
++	smem_head = ml_io_map(SMEM_PHYS, 0x2000);
++	ipc = ml_io_map(IPC_PHYS & ~0xfffUL, 0x1000) + (IPC_PHYS & 0xfff);
++	table = item(ITEM_CHANNEL_TABLE, &size);
++	if (table == 0) {
++		say("no channel table in shared memory (SMEM version words %x %x)\n", rd(smem_head + 64), rd(smem_head + 68));
++		return false;
++	}
++	for (uint32_t i = 0; i < 64 && (i + 1) * 32 <= size; i++) {
++		vm_offset_t e = table + 32 * i;
++
++		if ((rd(e + 24) & 0xff) == EDGE_APPS_RPM && rd(e) != 0) {
++			char name[21];
++
++			for (int k = 0; k < 20; k += 4) {
++				uint32_t w = rd(e + k);
++				memcpy(name + k, &w, 4);
++			}
++			name[20] = 0;
++			cid = rd(e + 20);
++			say("channel \"%s\": cid %u, type %#x\n", name, cid, rd(e + 24));
++			break;
++		}
++	}
++	if (cid == ~0u) {
++		say("no channel to the RPM in the table\n");
++		return false;
++	}
++	ch = item(ITEM_CHANNEL_BASE + cid, &size);
++	fifo = item(ITEM_FIFO_BASE + cid, &fifo_size);
++	if (ch == 0 || fifo == 0 || size < 2 * ST_WORDS * 4) {
++		say("the channel's records or FIFOs are missing\n");
++		return false;
++	}
++	ours = (volatile uint32_t *)ch;
++	theirs = ours + ST_WORDS;
++	fifo_size /= 2;
++	fifo_out = fifo;
++	fifo_in = fifo + fifo_size;
++	say("as LK left it: ours state %u, the RPM's %u; FIFOs 2 x %u bytes\n", ours[ST_STATE], theirs[ST_STATE], fifo_size);
++
++	/* open: ours to OPENING (indices from the start), the RPM's answer, ours to OPENED */
++	ours[ST_WIDX] = 0;
++	theirs[ST_RIDX] = 0;            /* (ch1.read_index is ours to keep: what we have read of their FIFO) */
++	ours[ST_MASK] = 0;
++	ours[ST_DTR] = ours[ST_CTS] = ours[ST_CD] = 0;
++	ours[ST_STATE] = SS_OPENING;
++	ours[ST_UPDATED] = 1;
++	doorbell();
++	until = now_ms() + 1000;
++	while (theirs[ST_STATE] != SS_OPENED && theirs[ST_STATE] != SS_OPENING && now_ms() < until) {
++	}
++	ours[ST_DTR] = ours[ST_CTS] = ours[ST_CD] = 1;
++	ours[ST_STATE] = SS_OPENED;
++	ours[ST_UPDATED] = 1;
++	doorbell();
++	until = now_ms() + 1000;
++	while (theirs[ST_STATE] != SS_OPENED && now_ms() < until) {
++	}
++	theirs[ST_UPDATED] = 0;
++	say("open: ours %u, the RPM's %u (%s)\n", ours[ST_STATE], theirs[ST_STATE],
++	    theirs[ST_STATE] == SS_OPENED ? "open" : "THE RPM DID NOT OPEN IT");
++	is_open = theirs[ST_STATE] == SS_OPENED;
++	return is_open;
++}
++
++static void
++fifo_write(const uint32_t *words, uint32_t n)
++{
++	uint32_t w = ours[ST_WIDX];
++
++	for (uint32_t i = 0; i < n; i++) {
++		wr(fifo_out + w, words[i]);
++		w += 4;
++		if (w >= fifo_size) {
++			w = 0;
++		}
++	}
++	ours[ST_WIDX] = w;
++}
++
++static uint32_t
++fifo_available(void)
++{
++	return (theirs[ST_WIDX] - theirs[ST_RIDX] + fifo_size) % fifo_size;
++}
++
++static void
++fifo_read(uint32_t *words, uint32_t n)
++{
++	uint32_t r = theirs[ST_RIDX];
++
++	for (uint32_t i = 0; i < n; i++) {
++		words[i] = rd(fifo_in + r);
++		r += 4;
++		if (r >= fifo_size) {
++			r = 0;
++		}
++	}
++	theirs[ST_RIDX] = r;
++}
++
++/*
++ * A request to the RPM's active set: resource `type` number `id`, with `n` key/value pairs.
++ * Returns 0, or -1 (no channel, no answer, or an answer that is not an acknowledgement).
++ */
++static int
++rpm_request(uint32_t type, uint32_t id, const uint32_t *kv, uint32_t n)
++{
++	uint32_t msg[5 + 2 + 5 + 3 * 8], len = 0, data = 12 * n, hdr[5], answer[16], words;
++	uint64_t until;
++	int result = -1;
++
++	if (n > 8) {
++		return -1;
++	}
++	lck_mtx_lock(&rpm_lock);
++	if (!channel_open()) {
++		goto out;
++	}
++	/* the SMD packet header, then the request */
++	msg[len++] = 8 + 20 + data;
++	msg[len++] = 0;
++	msg[len++] = 0;
++	msg[len++] = 0;
++	msg[len++] = 0;
++	msg[len++] = RPM_REQ_MAGIC;
++	msg[len++] = 20 + data;
++	msg[len++] = ++msg_id;
++	msg[len++] = 0;                 /* the active set */
++	msg[len++] = type;
++	msg[len++] = id;
++	msg[len++] = data;
++	for (uint32_t i = 0; i < n; i++) {
++		msg[len++] = kv[2 * i];
++		msg[len++] = 4;
++		msg[len++] = kv[2 * i + 1];
++	}
++	theirs[ST_READ] = 0;
++	fifo_write(msg, len);
++	__builtin_arm_dsb(0xf);
++	ours[ST_WRITTEN] = 1;
++	ours[ST_MASK] = 0;
++	doorbell();
++
++	/* the answer: a packet header, then {type, length, ...} */
++	until = now_ms() + 500;
++	while (fifo_available() < 20 && now_ms() < until) {
++	}
++	if (fifo_available() < 20) {
++		say("request %u: no answer\n", msg_id);
++		goto out;
++	}
++	fifo_read(hdr, 5);
++	words = (hdr[0] + 3) / 4;
++	while (fifo_available() < words * 4 && now_ms() < until) {
++	}
++	if (words > 16 || fifo_available() < words * 4) {
++		say("request %u: an answer of %u bytes that does not come\n", msg_id, hdr[0]);
++		goto out;
++	}
++	fifo_read(answer, words);
++	theirs[ST_WRITTEN] = 0;
++	ours[ST_READ] = 1;
++	ours[ST_MASK] = 1;
++	doorbell();
++	result = (answer[0] == RPM_REQ_MAGIC || answer[0] == 0x00646d63u /* "cmd" */) && answer[1] == 0x0c ? 0 : -1;
++	say("request %u (%c%c%c%c %u): answer %08x %08x %08x %08x %08x%s\n", msg_id, (char)(type & 0xff),
++	    (char)(type >> 8 & 0xff), (char)(type >> 16 & 0xff), (char)(type >> 24), id, answer[0], answer[1],
++	    words > 2 ? answer[2] : 0, words > 3 ? answer[3] : 0, words > 4 ? answer[4] : 0, result == 0 ? "" : " -- NOT AN ACKNOWLEDGEMENT");
++out:
++	lck_mtx_unlock(&rpm_lock);
++	return result;
++}
++
++/* LDO n of the PM8953 (the RPM's "ldoa" n) on at `uv` microvolts, or off. Returns 0 or -1. */
++int
++redwood_tissot_rpm_ldo(unsigned n, uint32_t uv, bool on)
++{
++	uint32_t kv[4] = { KEY_SWEN, on ? 1u : 0u, KEY_UV, uv };
++
++	return rpm_request(RES_LDOA, n, kv, on ? 2 : 1);
++}
 diff --git a/xnu/files/bsd/dev/redwood_tissot_touch.c b/xnu/files/bsd/dev/redwood_tissot_touch.c
 new file mode 100644
-index 0000000..efbad23
+index 0000000..bd39c28
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_touch.c
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,535 @@
 +/*
 + * The touch screen of the Xiaomi Mi A1 (tissot, MSM8953): a FocalTech FT5x06-family controller
 + * at address 0x38 of the I2C bus of BLSP1 QUP3, as a source of touches for /dev/redwood-touch
@@ -1751,10 +2060,9 @@ index 0000000..efbad23
 + *
 + * There is no clock, pin, regulator or I2C framework in this kernel, so the driver does what
 + * it needs itself:
-+ *   power    the controller's supply is LDO10 of the PM8953, which the RPM processor owns: it
-+ *            cannot be switched from here without the RPM's request protocol (SMD), so the
-+ *            driver reads the regulator's state through the PMIC arbiter and says whether it is
-+ *            on (the bootloader leaves it on when it has shown its splash with the panel)
++ *   power    the controller's supply is LDO10 of the PM8953, which the RPM processor owns: the
++ *            driver asks the RPM for it (redwood_tissot_rpm.c) and reads the regulator's state
++ *            through the PMIC arbiter before and after
 + *   pins     SDA on GPIO10, SCL on GPIO11 (the QUP's "blsp_i2c3" function, not used here),
 + *            reset on GPIO64 (low = in reset), interrupt on GPIO65 (low = a report waits)
 + *   I2C      the two pins driven by hand, open drain: a pin is let go (an input; the pull-ups
@@ -1770,7 +2078,7 @@ index 0000000..efbad23
 + *
 + * The bring-up is made in steps, each said in the log before it is made. Boot-arg
 + * tissot_touch_steps=N stops after the first N:
-+ *   1  read the state of LDO10 (through the PMIC arbiter)
++ *   1  read the state of LDO10 (through the PMIC arbiter), ask the RPM for the supplies
 + *   2  set up the pins, reset the controller
 + *   3  find it on the bus and read what it is
 + *   4  watch it                                         (the default)
@@ -1790,6 +2098,7 @@ index 0000000..efbad23
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern kern_return_t thread_terminate(thread_t thread);
++extern int redwood_tissot_rpm_ldo(unsigned n, uint32_t uv, bool on);    /* redwood_tissot_rpm.c */
 +
 +/* the bring-up's lines also into the log that survives a reset (redwood_tissot_emmc.c): the next boot shows them */
 +extern void redwood_tissot_log(const char *format, ...) __printflike(1, 2);
@@ -2047,10 +2356,30 @@ index 0000000..efbad23
 +	}
 +	printf("tissot-touch: LDO10 (the controller's supply): %s, %s; voltage registers %02x %02x\n",
 +	    (enable & 0x80) ? "enabled" : "NOT ENABLED by this system", (status & 0x80) ? "ready" : "NOT READY", voltage[0], voltage[1]);
-+	if (!(status & 0x80)) {
-+		printf("tissot-touch: the controller may have no power; switching it on is the RPM's to do, which this kernel "
-+		    "cannot ask yet\n");
++}
++
++/*
++ * Ask the RPM for LDO10 at 2.85 V (the controller's vcc-supply in the phone's device tree), and
++ * LDO5 and LDO6 at 1.8 V (the I/O rails: the bus's pull-ups among what they feed), as Linux's
++ * drivers would: votes on top of whatever LK left. Boot-arg tissot_rpm=0 leaves them alone.
++ */
++static void
++supply_on(void)
++{
++	uint32_t ask = 1;
++
++	PE_parse_boot_argn("tissot_rpm", &ask, sizeof(ask));
++	if (!ask) {
++		printf("tissot-touch: the supplies left as they are (tissot_rpm=0)\n");
++		return;
 +	}
++	printf("tissot-touch: asking the RPM for LDO5 and LDO6 (1.8 V) and LDO10 (2.85 V)\n");
++	if ((redwood_tissot_rpm_ldo(5, 1800000, true) | redwood_tissot_rpm_ldo(6, 1800000, true) |
++	    redwood_tissot_rpm_ldo(10, 2850000, true)) != 0) {
++		printf("tissot-touch: the RPM did not acknowledge every request\n");
++	}
++	sleep_ms(20);
++	supply_state();
 +}
 +
 +/* ---- the controller --------------------------------------------------------------------------- */
@@ -2176,6 +2505,7 @@ index 0000000..efbad23
 +
 +	printf("tissot-touch: step 1: the controller's supply\n");
 +	supply_state();
++	supply_on();
 +	if (steps < 2) {
 +		goto out;
 +	}
@@ -2573,7 +2903,7 @@ index 63ffd4b..46fb767 100644
  	}
  
 diff --git a/xnu/redwood.patch b/xnu/redwood.patch
-index 8f7dd87..cc2cfef 100644
+index 8f7dd87..5e96d8e 100644
 --- a/xnu/redwood.patch
 +++ b/xnu/redwood.patch
 @@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
@@ -2581,52 +2911,53 @@ index 8f7dd87..cc2cfef 100644
   
  diff --git a/bsd/conf/files b/bsd/conf/files
 -index 44274016a4cf..9cd24b42caca 100644
-+index 44274016a4cf..3e44e4a7c14b 100644
++index 44274016a4cf..15b259dca6ce 100644
  --- a/bsd/conf/files
  +++ b/bsd/conf/files
 -@@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
-+@@ -109,6 +109,40 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
++@@ -109,6 +109,41 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
   bsd/dev/unix_startup.c			standard
   
   bsd/dev/monotonic.c optional monotonic
-@@ -73,6 +73,9 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -73,6 +73,10 @@ index 44274016a4cf..9cd24b42caca 100644
  +bsd/dev/redwood_virtio_input.c	standard
  +bsd/dev/redwood_goodix.c	standard
  +bsd/dev/redwood_buttons.c	standard
 ++bsd/dev/redwood_tissot_touch.c	standard
 ++bsd/dev/redwood_tissot_emmc.c	standard
 ++bsd/dev/redwood_tissot_buttons.c	standard
+++bsd/dev/redwood_tissot_rpm.c	standard
  +bsd/dev/redwood_battery.c	standard
  +bsd/dev/redwood_ufs.c	standard
  +bsd/dev/redwood_ufshc.c	standard
-@@ -103,7 +106,7 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -103,7 +107,7 @@ index 44274016a4cf..9cd24b42caca 100644
   bsd/dev/dev_perfmon.c optional config_perfmon
   
   bsd/libkern/crc32.c			standard
 -@@ -155,6 +186,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
-+@@ -155,6 +189,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
++@@ -155,6 +190,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
   bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
   bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
   bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
-@@ -118,7 +121,7 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -118,7 +122,7 @@ index 44274016a4cf..9cd24b42caca 100644
   
   bsd/miscfs/routefs/routefs_ops.c	optional routefs
   
 -@@ -361,6 +400,7 @@ bsd/security/audit/audit_syscalls.c		standard
-+@@ -361,6 +403,7 @@ bsd/security/audit/audit_syscalls.c		standard
++@@ -361,6 +404,7 @@ bsd/security/audit/audit_syscalls.c		standard
   bsd/security/audit/audit_worker.c		optional config_audit
   
   bsd/pthread/pthread_shims.c		standard
-@@ -126,7 +129,7 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -126,7 +130,7 @@ index 44274016a4cf..9cd24b42caca 100644
   bsd/pthread/pthread_priority.c		standard
   bsd/pthread/pthread_workqueue.c		standard
   
 -@@ -383,6 +423,7 @@ bsd/kern/kern_debug.c			standard
-+@@ -383,6 +426,7 @@ bsd/kern/kern_debug.c			standard
++@@ -383,6 +427,7 @@ bsd/kern/kern_debug.c			standard
   bsd/kern/kern_symfile.c			standard
   bsd/kern/kern_descrip.c			standard
   bsd/kern/kern_guarded.c			standard
-@@ -1680,10 +1683,19 @@ index 2b14eda8f68f..09337bad5b01 100644
+@@ -1680,10 +1684,19 @@ index 2b14eda8f68f..09337bad5b01 100644
  +#endif
       ")";
  diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
@@ -2648,7 +2979,7 @@ index 8f7dd87..cc2cfef 100644
   	assert(matching);
   	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
   
-@@ -1695,11 +1707,16 @@ index 5219fb0d9ed6..29978e9cff43 100644
+@@ -1695,11 +1708,16 @@ index 5219fb0d9ed6..29978e9cff43 100644
  +		bsdWait = kSecondScale / 10;
  +	}
  +
@@ -2666,7 +2997,7 @@ index 8f7dd87..cc2cfef 100644
   #endif /* __LP64__ */
   				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
   			}
-@@ -1717,6 +1734,37 @@ index 5219fb0d9ed6..29978e9cff43 100644
+@@ -1717,6 +1735,37 @@ index 5219fb0d9ed6..29978e9cff43 100644
   			regEntry->release();                                                            /* Toss the entry */
   		}
   	}

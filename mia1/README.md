@@ -18,7 +18,9 @@ aboot (LK) --fastboot boot--> shim (mia1/shim) --its own UEFI--> HackiOS loader 
   payload (kernel, `root.apfs`, boot-args).
 - `emmc/emmc_core.h`: the eMMC (SDHCI) code; the kernel's `redwood_tissot_emmc.c` carries a copy.
 - The kernel side is in `../hackios/hackios-xnu-kernel.diff` (eMMC, touch, buttons, GICv2, the
-  `tissot` platform of the loader).
+  `tissot` platform of the loader, and `redwood_tissot_rpm.c`: requests to the RPM over SMD, the
+  way the Pixel 1 port ios-sailfish asks its RPM for supplies; the touch screen asks it for LDO10
+  (2.85 V) and LDO5/LDO6 (1.8 V) first. `tissot_rpm=0` skips that).
 
 ## Running it
 
