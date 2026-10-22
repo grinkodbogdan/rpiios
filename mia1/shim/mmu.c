@@ -28,6 +28,18 @@
 #define PXN             (1ull << 53)
 #define UXN             (1ull << 54)
 
+/*
+ * The firmware's own memory -- TrustZone and its applications, the hypervisor, shared memory, the
+ * modem's, the DSPs', video's (0x84a00000..0x92100000, the reserved-memory of msm8953.dtsi), and
+ * 0x80000000 up to it -- is not mapped at all, but for the display's memory inside it. Mapped as
+ * RAM, the Cortex-A53 reads it speculatively and prefetches into it on its own, and the secure
+ * firmware answers an access it does not allow with a reset of the phone, a few milliseconds
+ * later, wherever the code then is: what the first boots of the loader did (Linux keeps these
+ * regions "no-map" for the same reason).
+ */
+#define NOMAP_START     0x80000000ull
+#define NOMAP_END       0x92200000ull
+
 static uint64_t l1[512] __attribute__((aligned(4096)));
 static uint64_t l2[SPAN_GB][512] __attribute__((aligned(4096)));
 
@@ -53,6 +65,8 @@ mmu_on(const struct ram_bank *banks, int nbanks)
 
 			if ((a + MB2 > (FB_BASE & ~(MB2 - 1)) && a < FB_BASE + FB_REGION_SIZE) || a == 0x9fe00000) {
 				d |= ATTRIDX(ATTR_NC) | SH_INNER;
+			} else if (a >= NOMAP_START && a < NOMAP_END) {
+				d = 0;          /* not mapped at all: see NOMAP_START */
 			} else if (in_ram(banks, nbanks, a, MB2)) {
 				d |= ATTRIDX(ATTR_NORMAL) | SH_INNER;
 			} else {

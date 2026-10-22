@@ -28,7 +28,7 @@ extern char _head[], _image_end[];
 
 /* what the firmware keeps for itself (msm8953.dtsi and msm8953-xiaomi-tissot.dts, reserved-memory) */
 static const struct region firmware[] = {
-	{ 0x84a00000, 0x0d700000, 0 /* reserved */, "TrustZone apps, shared memory, modem, DSPs, display, video" },
+	{ 0x84a00000, 0x0d800000, 0 /* reserved */, "TrustZone apps, shared memory, modem, DSPs, display, video" },
 	{ 0x9ff00000, 0x00100000, 0, "persistent log" },
 	/*
 	 * Not in the published reserved-memory lists, but the phone resets (no fault, a reset a
