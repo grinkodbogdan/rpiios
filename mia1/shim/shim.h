@@ -12,10 +12,21 @@
 #define WRITE_SYSREG(r, v) __asm__ volatile("msr " #r ", %0" : : "r"((uint64_t)(v)))
 
 /* the display, as aboot leaves it: the panel in video mode, scanned out of its splash memory */
+#ifndef SHIM_UART
 #define FB_BASE         0x90001000UL
+#else
+#define FB_BASE         0x90101000UL    /* QEMU: not the phone's address, which the loader takes for the phone */
+#endif
 #define FB_REGION_SIZE  0x013ff000UL
-#define FB_WIDTH        1080u
-#define FB_HEIGHT       1920u
+#define PANEL_WIDTH     1080u
+#define PANEL_HEIGHT    1920u
+/*
+ * What is drawn into it: the panel's own size, or smaller and scaled up by the display
+ * processor (bootargs "fbw=750 fbh=1624", console.c)
+ */
+extern uint32_t fb_width, fb_height;
+#define FB_WIDTH        fb_width
+#define FB_HEIGHT       fb_height
 
 /* libc.c */
 void *memset(void *d, int c, size_t n);
@@ -29,7 +40,7 @@ int snprintf(char *out, size_t size, const char *fmt, ...) __attribute__((format
 void udelay(uint64_t us);
 
 /* console.c */
-void display_init(void);
+void display_init(uint32_t width, uint32_t height);
 void console_putc(char c);
 void keep_start(void);
 void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -42,6 +53,7 @@ struct ram_bank {
 };
 int fdt_memory(const void *fdt, struct ram_bank *banks, int max);
 int fdt_initrd(const void *fdt, uint64_t *start, uint64_t *end);
+uint32_t fdt_bootarg_u32(const void *fdt, const char *key);
 
 /* mmu.c */
 void mmu_on(const struct ram_bank *banks, int nbanks);

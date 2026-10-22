@@ -3,6 +3,7 @@
 # `fastboot boot`; a reboot brings back whatever was there):
 #   OUT/mia1-ios.img        the shim, HackiOS's loader and kernel: iOS from the userdata partition,
 #                           on all eight cores (both clusters)
+#   OUT/mia1-ios-fast.img   the same, iOS drawing at 750 x 1624 (fbscale=2) and the display scaling it up
 #   OUT/mia1-ios-1cpu.img   the same on one core; mia1-ios-4cpu.img on the first cluster's four
 #   OUT/mia1-ios-gpu.img    one core, and the Adreno 506 powered up and looked at (tissot_gpu=1)
 # Usage: build.sh OUT_DIR HACKIOS_TREE
@@ -37,13 +38,13 @@ dtc -q -I dts -O dtb -o "$out/tissot.dtb" "$here/tissot.dts"
 gzip -9 -n -c "$out/shim.bin" > "$out/shim.bin.gz"
 cat "$out/shim.bin.gz" "$out/tissot.dtb" > "$out/kernel-dtb"
 
-image() {   # NAME CMDLINE
+image() {   # NAME CMDLINE [SHIM_ARGS: the boot image's own command line, e.g. scale=720]
 	python3 "$hack/xnuloader/mkpayload.py" -o "$out/payload-$1.bin" kernel="$kernel" ramdisk="$hack/userland/root.apfs" \
 		--rdres 4000 --cmdline "$2 epoch=$(date +%s)" >/dev/null
 	python3 "$here/mkcontainer.py" "$out/ramdisk-$1" loader="$hack/xnuloader/loader.efi" payload="$out/payload-$1.bin"
 	python3 "$hack/prebuilt/uefi/mkbootimg.py" --header_version 0 --kernel "$out/kernel-dtb" \
-		--ramdisk "$out/ramdisk-$1" --base 0x80000000 --pagesize 2048 --cmdline "rpiios" -o "$out/$1.img"
-	echo "shim: $out/$1.img ($(stat -c %s "$out/$1.img") bytes): $2"
+		--ramdisk "$out/ramdisk-$1" --base 0x80000000 --pagesize 2048 --cmdline "rpiios${3:+ $3}" -o "$out/$1.img"
+	echo "shim: $out/$1.img ($(stat -c %s "$out/$1.img") bytes): $2${3:+ [shim: $3]}"
 }
 # tissot=1: the Mi A1's drivers (eMMC, touch, buttons); vtimer_ppi=20: its virtual timer's interrupt
 # (the MSM8953 wires the generic timers to PPIs 1-4); emmc_root: the iOS volume on userdata;
@@ -87,6 +88,7 @@ if [ -n "${SHIM_CMDLINE:-}" ]; then
 fi
 image mia1-ios "tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=8"
 image mia1-ios-verbose "-v tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=8"
+image mia1-ios-fast "tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=8 fbscale=2" "fbw=750 fbh=1624"
 image mia1-ios-1cpu "tissot=1 vtimer_ppi=20 emmc_root=userdata"
 image mia1-ios-4cpu "tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=4"
 image mia1-ios-gpu "tissot=1 vtimer_ppi=20 emmc_root=userdata tissot_gpu=1"

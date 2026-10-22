@@ -27,8 +27,43 @@
 #define FORMAT_RGB888           0x0002243fu     /* LK's */
 #define FORMAT_XRGB8888         0x000236ffu     /* 4 components of 8 bits, 4 bytes, 4 unpacked, tight */
 #define UNPACK_XRGB8888         0x03020001u     /* bytes in memory: blue, green, red, x */
+#define FLUSH_VIG0              (1u << 0)
 #define FLUSH_LM0               (1u << 6)
 #define FLUSH_CTL               (1u << 17)
+
+/*
+ * The scaled mode (bootargs fbw=W fbh=H, e.g. 750 x 1624: the iPhone X's screen at two pixels a
+ * point, what the kernel's fbscale=2 draws): the picture is drawn at that size and the VIG0 pipe
+ * -- the only one of this MDP with a scaler (Linux mdp5_cfg.c, msm8x53_config) -- reads it and
+ * scales it to the panel, bilinear, in place of the RGB pipe LK set up: the processor neither
+ * draws the panel's pixels nor works them out. Its source
+ * registers as Linux's mdp5_plane.c writes them; on this MDP (1.16) a pipe's buffer is its own
+ * (LK's has_fixed_size_smp()), so there is nothing to allocate.
+ */
+#define CTL0_LAYER0             (MDP_BASE + 0x2000 + 0x00)
+#define VIG0                    (MDP_BASE + 0x05000)
+#define SSPP_SRC_SIZE           0x00
+#define SSPP_SRC_IMG_SIZE       0x04
+#define SSPP_SRC_XY             0x08
+#define SSPP_OUT_SIZE           0x0c
+#define SSPP_OUT_XY             0x10
+#define SSPP_SRC_OP_MODE        0x38
+#define SSPP_REQPRIO_WM(n)      (0x50 + 4 * (n))
+#define SSPP_SRC_ADDR_SW_STATUS 0x70
+#define SSPP_DECIMATION         0xb4
+#define SSPP_PIX_EXT_LR(c)      (0x100 + 0x10 * (c))
+#define SSPP_PIX_EXT_TB(c)      (0x104 + 0x10 * (c))
+#define SSPP_PIX_EXT_REQ(c)     (0x108 + 0x10 * (c))
+#define VIG_OP_MODE             0x200           /* [17] CSC: off for RGB */
+#define VIG_SCALE_CONFIG        0x204
+#define VIG_PHASE_STEP_X        0x210
+#define VIG_PHASE_STEP_Y        0x214
+#define VIG_CR_PHASE_STEP_X     0x218
+#define VIG_CR_PHASE_STEP_Y     0x21c
+#define VIG_INIT_PHASE_X        0x220
+#define VIG_INIT_PHASE_Y        0x224
+#define OP_MODE_SW_PIX_EXT      (1u << 31)
+#define SCALE_XY_BILINEAR       0x00055503u     /* X and Y on; bilinear for every component */
 
 static const struct {
 	const char *name;
@@ -40,10 +75,11 @@ static const struct {
 };
 
 uint32_t display_bpp = 24;
+uint32_t fb_width = PANEL_WIDTH, fb_height = PANEL_HEIGHT;
 static const char *pipe_name = "none";
 static uint32_t old_format;
 
-#define SCALE                   3
+static uint32_t SCALE = 3;     /* the font's pixels per pixel: 2 in the scaled mode */
 #define CELL_W                  (6 * SCALE)
 #define CELL_H                  (13 * SCALE)
 #define COLS                    (FB_WIDTH / CELL_W)
@@ -172,28 +208,95 @@ pixel(uint32_t x, uint32_t y, uint32_t rgb)
 	}
 }
 
-void
-display_init(void)
+/* VIG0 reading the same memory at fb_width x fb_height, scaled up to the panel in place of `rgb` */
+static void
+scale_with_vig0(uint64_t rgb, uint32_t rgb_flush)
 {
+	uint32_t w = fb_width, h = fb_height, layer;
+	/* 2^21 is one source pixel per panel pixel (Linux: calc_phase_step()) */
+	uint32_t step_x = (uint32_t)(((uint64_t)w << 21) / PANEL_WIDTH), step_y = (uint32_t)(((uint64_t)h << 21) / PANEL_HEIGHT);
+
+	mmio_wr(VIG0 + SSPP_SRC0_ADDR, (uint32_t)FB_BASE);
+	mmio_wr(VIG0 + SSPP_SRC_YSTRIDE, w * 4);
+	mmio_wr(VIG0 + SSPP_SRC_IMG_SIZE, h << 16 | w);
+	mmio_wr(VIG0 + SSPP_SRC_SIZE, h << 16 | w);
+	mmio_wr(VIG0 + SSPP_SRC_XY, 0);
+	mmio_wr(VIG0 + SSPP_OUT_SIZE, PANEL_HEIGHT << 16 | PANEL_WIDTH);
+	mmio_wr(VIG0 + SSPP_OUT_XY, 0);
+	mmio_wr(VIG0 + SSPP_SRC_FORMAT, FORMAT_XRGB8888);
+	mmio_wr(VIG0 + SSPP_SRC_UNPACK, UNPACK_XRGB8888);
+	mmio_wr(VIG0 + SSPP_SRC_ADDR_SW_STATUS, 0);
+	mmio_wr(VIG0 + SSPP_DECIMATION, 0);
+	for (int i = 0; i < 3; i++) {
+		mmio_wr(VIG0 + SSPP_REQPRIO_WM(i), mmio_rd(rgb + SSPP_REQPRIO_WM(i)));
+		/* bilinear upscaling reads one pixel past the right and bottom edges: repeat the last */
+		mmio_wr(VIG0 + SSPP_PIX_EXT_LR(i), 1u << 16);
+		mmio_wr(VIG0 + SSPP_PIX_EXT_TB(i), 1u << 16);
+		mmio_wr(VIG0 + SSPP_PIX_EXT_REQ(i), (h + 1) << 16 | (w + 1));
+	}
+	mmio_wr(VIG0 + VIG_OP_MODE, 0);
+	mmio_wr(VIG0 + VIG_PHASE_STEP_X, step_x);
+	mmio_wr(VIG0 + VIG_PHASE_STEP_Y, step_y);
+	mmio_wr(VIG0 + VIG_CR_PHASE_STEP_X, step_x);
+	mmio_wr(VIG0 + VIG_CR_PHASE_STEP_Y, step_y);
+	mmio_wr(VIG0 + VIG_INIT_PHASE_X, 0);
+	mmio_wr(VIG0 + VIG_INIT_PHASE_Y, 0);
+	mmio_wr(VIG0 + VIG_SCALE_CONFIG, SCALE_XY_BILINEAR);
+	mmio_wr(VIG0 + SSPP_SRC_OP_MODE, OP_MODE_SW_PIX_EXT);
+	/* the mixer's stage of the RGB pipe (CTL_LAYER: VIG0 [2:0], RGB0 [11:9]) to VIG0 */
+	layer = mmio_rd(CTL0_LAYER0);
+	mmio_wr(CTL0_LAYER0, (layer & ~(7u << 9 | 7u)) | ((layer >> 9) & 7));
+	mmio_wr(MDP_CTL0_FLUSH, FLUSH_VIG0 | rgb_flush | FLUSH_LM0 | FLUSH_CTL);
+	say("Mi A1 shim: drawn at %ux%u, scaled to %ux%u by VIG0 (mixer layer %x -> %x, phase steps %x %x)\n", w, h,
+	    PANEL_WIDTH, PANEL_HEIGHT, layer, mmio_rd(CTL0_LAYER0), step_x, step_y);
+}
+
+/* A picture of width x height scaled to the panel (up, at most 3 times), or 0, 0: the panel's own size */
+static int
+scaled_size(uint32_t width, uint32_t height)
+{
+	if (width < PANEL_WIDTH / 3 || width >= PANEL_WIDTH || height < PANEL_HEIGHT / 3 || height > 2 * PANEL_HEIGHT) {
+		return 0;
+	}
+	fb_width = width & ~1u;
+	fb_height = height & ~1u;
+	SCALE = 2;
+	return 1;
+}
+
+void
+display_init(uint32_t width, uint32_t height)
+{
+#ifdef SHIM_UART
+	/* QEMU (qemu-shim.sh) has no MDP: with fbw/fbh a picture in memory alone, read back with pmemsave */
+	if (scaled_size(width, height)) {
+		display_bpp = 32;
+		memset((void *)FB_BASE, 0, PANEL_WIDTH * PANEL_HEIGHT * 4);
+		pipe_name = "none (QEMU: memory only)";
+	}
+#endif
 	for (unsigned i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
 		uint64_t base = MDP_BASE + pipes[i].offset;
 
-		if (mmio_rd(base + SSPP_SRC0_ADDR) != (uint32_t)FB_BASE) {
+		if (display_bpp == 32 || mmio_rd(base + SSPP_SRC0_ADDR) != (uint32_t)FB_BASE) {
 			continue;
 		}
 		old_format = mmio_rd(base + SSPP_SRC_FORMAT);
 		/* black in the new layout first, then the switch: one frame of the old reading of it at most */
-		memset((void *)FB_BASE, 0, FB_WIDTH * FB_HEIGHT * 4);
+		memset((void *)FB_BASE, 0, PANEL_WIDTH * PANEL_HEIGHT * 4);
 		mmio_wr(base + SSPP_SRC_FORMAT, FORMAT_XRGB8888);
 		mmio_wr(base + SSPP_SRC_UNPACK, UNPACK_XRGB8888);
-		mmio_wr(base + SSPP_SRC_YSTRIDE, FB_WIDTH * 4);
+		mmio_wr(base + SSPP_SRC_YSTRIDE, PANEL_WIDTH * 4);
 		mmio_wr(MDP_CTL0_FLUSH, pipes[i].flush | FLUSH_LM0 | FLUSH_CTL);
 		display_bpp = 32;
 		pipe_name = pipes[i].name;
+		if (base != VIG0 && scaled_size(width, height)) {
+			scale_with_vig0(base, pipes[i].flush);
+		}
 		break;
 	}
 	if (display_bpp != 32) {
-		memset((void *)FB_BASE, 0, FB_WIDTH * FB_HEIGHT * 3);
+		memset((void *)FB_BASE, 0, PANEL_WIDTH * PANEL_HEIGHT * 3);
 	}
 	say("Mi A1 shim: display %ux%u, %u bits a pixel (pipe %s, format was %x)\n", FB_WIDTH, FB_HEIGHT, display_bpp,
 	    pipe_name, old_format);

@@ -16,6 +16,12 @@ aboot (LK) --fastboot boot--> shim (mia1/shim) --its own UEFI--> HackiOS loader 
   builds a memory map from the RAM banks aboot reports, and runs HackiOS's `loader.efi` under a
   minimal UEFI of its own (`efi.c`). Its ramdisk is a MIA1BOOT container: the loader and its
   payload (kernel, `root.apfs`, boot-args).
+- The fast image: HackiOS's framebuffer tells iOS it has an iPhone X screen (1125 x 2436) and
+  scales every frame onto the panel with the processor. `fbscale=2` makes iOS draw the same
+  screen at two pixels a point (750 x 1624, 2.25 times fewer); the shim (bootargs `fbw=750
+  fbh=1624`) hands the loader a framebuffer of exactly that size and has the MDP's VIG0 pipe, the
+  one with a scaler, stretch it to the panel. The processor draws less and scales nothing.
+  (`qemu-750x1624.png`: the same chain under QEMU, `mia1/qemu-shim.sh` with `SHIM_ARGS`.)
 - `emmc/emmc_core.h`: the eMMC (SDHCI) code; the kernel's `redwood_tissot_emmc.c` carries a copy.
 - The kernel side is in `../hackios/hackios-xnu-kernel.diff` (eMMC, touch, buttons, GICv2, the
   `tissot` platform of the loader, and `redwood_tissot_rpm.c`: requests to the RPM over SMD, the
@@ -37,6 +43,7 @@ aboot (LK) --fastboot boot--> shim (mia1/shim) --its own UEFI--> HackiOS loader 
 2. Every boot:
 
    ```
+   fastboot boot mia1-ios-fast.img     # eight cores; iOS draws at 750x1624, the display scales it
    fastboot boot mia1-ios.img          # all eight cores (both clusters, MPIDR 0x0-0x3, 0x100-0x103)
    fastboot boot mia1-ios-1cpu.img     # one core
    fastboot boot mia1-ios-4cpu.img     # the first cluster's four

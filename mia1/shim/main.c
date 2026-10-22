@@ -252,7 +252,7 @@ shim_main(const void *fdt, uint64_t loaded_at)
 		nbanks = 1;
 	}
 	mmu_on(banks, nbanks);
-	display_init();
+	display_init(fdt_bootarg_u32(fdt, "fbw"), fdt_bootarg_u32(fdt, "fbh"));
 	keep_start();
 #ifdef GICTEST
 	gictest();

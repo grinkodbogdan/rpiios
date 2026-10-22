@@ -137,6 +137,40 @@ initrd_each(void *c, const char *node, const char *name, const uint8_t *value, u
 	}
 }
 
+struct bootarg_ctx {
+	const char *key;
+	uint32_t value;
+};
+
+static void
+bootarg_each(void *c, const char *node, const char *name, const uint8_t *value, uint32_t len)
+{
+	struct bootarg_ctx *b = c;
+	size_t klen = strlen(b->key);
+
+	if (strcmp(node, "chosen") != 0 || strcmp(name, "bootargs") != 0) {
+		return;
+	}
+	for (uint32_t i = 0; i + klen < len; i++) {
+		if ((i == 0 || value[i - 1] == ' ') && memcmp(value + i, b->key, klen) == 0 && value[i + klen] == '=') {
+			b->value = 0;
+			for (uint32_t k = i + klen + 1; k < len && value[k] >= '0' && value[k] <= '9'; k++) {
+				b->value = b->value * 10 + (value[k] - '0');
+			}
+		}
+	}
+}
+
+/* KEY=NUMBER in /chosen/bootargs (the boot image's command line, with what aboot adds); 0 if absent */
+uint32_t
+fdt_bootarg_u32(const void *fdt, const char *key)
+{
+	struct bootarg_ctx b = { key, 0 };
+
+	walk(fdt, bootarg_each, &b);
+	return b.value;
+}
+
 int
 fdt_initrd(const void *fdt, uint64_t *start, uint64_t *end)
 {

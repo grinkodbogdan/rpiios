@@ -3261,7 +3261,7 @@ index 8f7dd87..18db2f7 100644
  index 5fb0a52062e0..6c430c2b23c7 100644
  --- a/iokit/conf/files
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
-index 640b05d..d25deaf 100644
+index 640b05d..7fb7ea5 100644
 --- a/xnuloader/loader.c
 +++ b/xnuloader/loader.c
 @@ -15,7 +15,14 @@
@@ -3473,7 +3473,22 @@ index 640b05d..d25deaf 100644
  	}
  	print("kernel loaded at pa %x..%x\n", kern_lo, kern_hi);
  	if (rd_resident) {
-@@ -3181,7 +3262,22 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3057,8 +3138,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	dt_prop_u64(&w, "dram-base", phys_base);
+ 	dt_prop_u64(&w, "dram-size", win_size);
+ 	dt_prop_u32(&w, "debug-enabled", 1);
+-	/* what MobileGestalt answers "main screen scale" from: 3 device pixels per point */
+-	dt_prop_u32(&w, "display-scale", 3);
++	/*
++	 * what MobileGestalt answers "main screen scale" from: 3 device pixels per point, or 2 for a
++	 * picture under 1000 pixels wide (the Mi A1's scaled mode, 720 x 1280: the same 360 x 640
++	 * points as its panel's own 1080 x 1920 at 3)
++	 */
++	dt_prop_u32(&w, "display-scale", SCREEN.base != 0 && SCREEN.width < 1000 ? 2 : 3);
+ 	dt_prop_u32(&w, "display-rotation", 0);
+ 	/* how the kernel is to ask the firmware for more cores (PSCI) */
+ 	dt_prop_str(&w, "psci-method", plat->psci_hvc ? "hvc" : "smc");
+@@ -3181,7 +3266,22 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  	uint64_t cpu_mpidr[8] = { kernel_mpidr };
  	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
  
@@ -3497,7 +3512,7 @@ index 640b05d..d25deaf 100644
  		for (int distance = 1; distance < plat->cores; distance++) {
  			for (int side = 0; side < 2; side++) {
  				int core = side == 0 ? boot_core + distance : boot_core - distance;
-@@ -3199,6 +3295,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3199,6 +3299,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  				}
  			}
  		}
@@ -3506,7 +3521,7 @@ index 640b05d..d25deaf 100644
  		print("cores for the kernel, in the order it takes them:");
  		for (int i = 0; i < cpu_count; i++) {
  			print(" %x", cpu_mpidr[i]);
-@@ -3245,8 +3343,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3245,8 +3347,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  	}
  	dt_begin(&w, "gic");
  	dt_prop_str(&w, "device_type", "interrupt-controller");
@@ -3520,7 +3535,7 @@ index 640b05d..d25deaf 100644
  	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
  	dt_end(&w);
  	if (plat->uart != 0) {
-@@ -3907,8 +4008,11 @@ ramfb_phone_screen(void)
+@@ -3907,8 +4012,11 @@ ramfb_phone_screen(void)
  	dma.length = be32(sizeof(cfg));
  	dma.address = __builtin_bswap64((uint64_t)(uintptr_t)&cfg);
  	*(volatile uint64_t *)(FW_CFG_BASE + 16) = __builtin_bswap64((uint64_t)(uintptr_t)&dma);
@@ -3534,7 +3549,7 @@ index 640b05d..d25deaf 100644
  		return;
  	}
  	SCREEN.base = fb;
-@@ -3928,10 +4032,22 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -3928,10 +4036,22 @@ efi_main(efi_handle image, efi_system_table *st)
  	IMAGE = image;
  
  	BS->set_watchdog_timer(0, 0, 0, NULL);
