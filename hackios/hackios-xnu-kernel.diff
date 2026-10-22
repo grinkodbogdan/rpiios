@@ -2522,10 +2522,26 @@ index 8f7dd87..50e0d11 100644
  index 5fb0a52062e0..6c430c2b23c7 100644
  --- a/iokit/conf/files
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
-index 640b05d..4a2d74b 100644
+index 640b05d..a3c46df 100644
 --- a/xnuloader/loader.c
 +++ b/xnuloader/loader.c
-@@ -81,6 +81,7 @@ struct segment_command_64 {
+@@ -15,7 +15,14 @@
+ /* ------------------------------------------------------------------------ */
+ /* Fixed conventions shared with the boot shim, the packer and the kernel   */
+ 
+-#define PAYLOAD_BASE        0xF0000000ULL
++/*
++ * Where the payload is: here, unless the firmware says otherwise in a configuration table
++ * ("MIA1 payload": the Mi A1's boot shim, which puts it at the top of the largest block of RAM
++ * so that the rest of that block stays in one piece for the kernel).
++ */
++static uint64_t payload_base = 0xF0000000ULL;
++#define PAYLOAD_BASE        payload_base
++#define MIA1_PAYLOAD_GUID   { 0x4d494131, 0x7061, 0x796c, { 0x6f, 0x61, 0x64, 0x00, 0x74, 0x69, 0x73, 0x73 } }
+ #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
+ 
+ struct payload_header { uint32_t magic; uint32_t size; };
+@@ -81,6 +88,7 @@ struct segment_command_64 {
  /* ------------------------------------------------------------------------ */
  /* Globals and small helpers                                                */
  
@@ -2533,7 +2549,7 @@ index 640b05d..4a2d74b 100644
  static efi_system_table *ST;
  static efi_boot_services *BS;
  static efi_handle IMAGE;
-@@ -517,6 +518,8 @@ struct platform {
+@@ -517,6 +525,8 @@ struct platform {
  	const char *name;
  	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
  	uint64_t gic_dist, gic_redist;   /* GICv3 */
@@ -2542,7 +2558,7 @@ index 640b05d..4a2d74b 100644
  	uint64_t uart;                   /* PL011, 0 if none */
  	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
  	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
-@@ -530,6 +533,7 @@ struct platform {
+@@ -530,6 +540,7 @@ struct platform {
  static const struct platform platform_qemu_virt = {
  	.name = "qemu-virt", .io_base = 0x08000000, .io_size = 0x08000000,
  	.gic_dist = 0x08000000, .gic_redist = 0x080A0000, .uart = 0x09000000, .psci_hvc = 1,
@@ -2550,7 +2566,31 @@ index 640b05d..4a2d74b 100644
  	.cores = 8, .core_shift = 0,
  	/*
  	 * QEMU's emulated cores stop each other all the time (every flush of a page from all the
-@@ -594,8 +598,13 @@ enum {
+@@ -558,8 +569,23 @@ static const struct platform platform_redwood = {
+  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
+  * where each value comes from); a display that matches none is QEMU's ramfb.
+  */
++static const struct platform platform_tissot = {
++	/*
++	 * Xiaomi Mi A1: Snapdragon 625 (MSM8953), eight Cortex-A53s in two clusters of four. Started
++	 * by the boot shim in rpiios (mia1/shim), whose display is the splash memory LK leaves
++	 * scanned out, switched to XRGB8888. GICv2 (qcom,msm-qgic2). The peripherals all sit below
++	 * 0x10000000. Cores: the first cluster (MPIDR 0x0..0x3); the second is MPIDR 0x100..0x103,
++	 * which core_shift cannot describe together with the first.
++	 */
++	.name = "tissot", .io_base = 0x00400000, .io_size = 0x0FC00000,
++	.gic_dist = 0x0B000000, .gic_redist = 0, .gic_cpu = 0x0B002000, .uart = 0,
++	.cores = 4, .core_shift = 0,
++	.fb_base = 0x90001000,
++};
++
+ static const struct platform *const platforms[] = {
+ 	&platform_redwood,
++	&platform_tissot,
+ };
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -594,8 +620,13 @@ enum {
  	CTX_X18, CTX_X19, /* ... x30 */
  	CTX_LOG_PA = CTX_X19 + 12, CTX_LOG_LEN, CTX_REASON, CTX_ESR, CTX_ELR, CTX_FAR, CTX_LR, CTX_KSP,
  	CTX_TPIDR_EL1, CTX_TPIDR_EL0, CTX_TPIDRRO_EL0, CTX_SP_EL0, CTX_CONTEXTIDR, CTX_MDSCR, CTX_FPCR, CTX_FPSR,
@@ -2565,7 +2605,7 @@ index 640b05d..4a2d74b 100644
  uint64_t loader_ctx[CTX_COUNT];
  int loader_save_ctx(void);
  void loader_return_stub(void);
-@@ -628,10 +637,13 @@ __asm__ (
+@@ -628,10 +659,13 @@ __asm__ (
          "  mrs x9, mdscr_el1\n     str x9, [x10, #320]\n"
          "  mrs x9, s3_3_c4_c4_0\n          str x9, [x10, #328]\n"
          "  mrs x9, s3_3_c4_c4_1\n          str x9, [x10, #336]\n"
@@ -2580,7 +2620,7 @@ index 640b05d..4a2d74b 100644
          "  mrs x9, spsel\n"
          "  cbz x9, 1f\n"                  /* SP_EL0 is only accessible while running on SP_EL1 */
          "  mrs x9, sp_el0\n        str x9, [x10, #304]\n"
-@@ -651,9 +663,17 @@ __asm__ (
+@@ -651,9 +685,17 @@ __asm__ (
          "  msr daifset, #0xf\n"
          /* PSTATE bits the kernel may have left set. PAN in particular is fatal:
           * UEFI maps its memory as EL0-accessible, so with PAN every data access
@@ -2599,7 +2639,7 @@ index 640b05d..4a2d74b 100644
          "  mrs x9, sctlr_el1\n"
          "  bic x9, x9, #0x1\n"
          "  bic x9, x9, #0x4\n"
-@@ -688,9 +708,12 @@ __asm__ (
+@@ -688,9 +730,12 @@ __asm__ (
          "  ldr x9, [x10, #296]\n msr tpidrro_el0, x9\n"
          "  ldr x9, [x10, #312]\n msr contextidr_el1, x9\n"
          "  ldr x9, [x10, #320]\n msr mdscr_el1, x9\n"
@@ -2612,7 +2652,7 @@ index 640b05d..4a2d74b 100644
          "  ldr x9, [x10, #328]\n msr s3_3_c4_c4_0, x9\n"
          "  ldr x9, [x10, #336]\n msr s3_3_c4_c4_1, x9\n"
          "  ldr x9, [x10, #104]\n msr cntkctl_el1, x9\n"
-@@ -2312,8 +2335,10 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
+@@ -2312,8 +2357,10 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
  			watching_only = 1;
  			daif = READ_SYSREG(DAIF);
  			__asm__ volatile ("msr daifset, #0xf");
@@ -2625,7 +2665,7 @@ index 640b05d..4a2d74b 100644
  		}
  		/* both are written by a core with its caches off: look at memory, not at our copy */
  		flush_dcache((uint64_t)(uintptr_t)&other_cpu_done, (uint64_t)(uintptr_t)&other_cpu_done + 8);
-@@ -2376,7 +2401,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
+@@ -2376,7 +2423,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
  	running_live = NULL;
  
  	if (watching_only) {
@@ -2636,7 +2676,7 @@ index 640b05d..4a2d74b 100644
  		__asm__ volatile ("msr daif, %0" : : "r" (daif));
  	}
  	return status;
-@@ -2731,6 +2758,29 @@ choose_window(const struct payload_info *pi)
+@@ -2731,6 +2780,29 @@ choose_window(const struct payload_info *pi)
   */
  static int starts_with(const char *s, const char *prefix);
  
@@ -2666,7 +2706,7 @@ index 640b05d..4a2d74b 100644
  static int
  run_kernel(int have_checkpoint, uint64_t checkpoint)
  {
-@@ -2824,6 +2874,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -2824,6 +2896,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  	}
  
  	/* --- load segments -------------------------------------------------- */
@@ -2676,7 +2716,7 @@ index 640b05d..4a2d74b 100644
  	lc = (const struct load_command *)(mh + 1);
  	for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const uint8_t *)lc + lc->cmdsize)) {
  		const struct segment_command_64 *sg = (const void *)lc;
-@@ -2832,6 +2885,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -2832,6 +2907,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  		}
  		memset((void *)(sg->vmaddr + slide), 0, sg->vmsize);
  		memcpy((void *)(sg->vmaddr + slide), kernel + sg->fileoff, sg->filesize);
@@ -2686,7 +2726,7 @@ index 640b05d..4a2d74b 100644
  	}
  	print("kernel loaded at pa %x..%x\n", kern_lo, kern_hi);
  	if (rd_resident) {
-@@ -3245,8 +3301,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3245,8 +3323,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  	}
  	dt_begin(&w, "gic");
  	dt_prop_str(&w, "device_type", "interrupt-controller");
@@ -2700,7 +2740,7 @@ index 640b05d..4a2d74b 100644
  	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
  	dt_end(&w);
  	if (plat->uart != 0) {
-@@ -3907,8 +3966,11 @@ ramfb_phone_screen(void)
+@@ -3907,8 +3988,11 @@ ramfb_phone_screen(void)
  	dma.length = be32(sizeof(cfg));
  	dma.address = __builtin_bswap64((uint64_t)(uintptr_t)&cfg);
  	*(volatile uint64_t *)(FW_CFG_BASE + 16) = __builtin_bswap64((uint64_t)(uintptr_t)&dma);
@@ -2714,7 +2754,7 @@ index 640b05d..4a2d74b 100644
  		return;
  	}
  	SCREEN.base = fb;
-@@ -3928,6 +3990,10 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -3928,10 +4012,22 @@ efi_main(efi_handle image, efi_system_table *st)
  	IMAGE = image;
  
  	BS->set_watchdog_timer(0, 0, 0, NULL);
@@ -2725,3 +2765,15 @@ index 640b05d..4a2d74b 100644
  	print("== XNULOADER v3 ==\n");
  	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
  	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
+ 
++	for (uint64_t i = 0; ST->tables != NULL && i < ST->nr_tables; i++) {
++		static const efi_guid mia1_guid = MIA1_PAYLOAD_GUID;
++
++		if (memcmp(&ST->tables[i].guid, &mia1_guid, sizeof(mia1_guid)) == 0) {
++			payload_base = (uint64_t)(uintptr_t)ST->tables[i].table;
++			print("payload at %x (the firmware's table)\n", payload_base);
++		}
++	}
+ 	PLAT = &platform_qemu_virt;
+ 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
+ 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
