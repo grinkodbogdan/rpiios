@@ -1,6 +1,6 @@
 # HackiOS (iOS 16.5) on the Xiaomi Mi A1
 
-**It boots to the home screen** (2026-10-22, `first-home-screen.jpg`): one core, the iOS volume
+**It boots to the home screen** (2026-10-22, `first-home-screen.jpg`): one core at first, now all eight, the iOS volume
 read from the eMMC's userdata partition, the display as LK left it switched to 32 bits a pixel.
 
 The Mi A1 (tissot, Snapdragon 625 / MSM8953, 4 GB) boots HackiOS's XNU and iOS 16.5 userland
@@ -37,9 +37,9 @@ aboot (LK) --fastboot boot--> shim (mia1/shim) --its own UEFI--> HackiOS loader 
 2. Every boot:
 
    ```
-   fastboot boot mia1-ios.img          # one core
-   fastboot boot mia1-ios-4cpu.img     # four cores
-   fastboot boot mia1-ios-8cpu.img     # all eight (both clusters, MPIDR 0x0-0x3, 0x100-0x103)
+   fastboot boot mia1-ios.img          # all eight cores (both clusters, MPIDR 0x0-0x3, 0x100-0x103)
+   fastboot boot mia1-ios-1cpu.img     # one core
+   fastboot boot mia1-ios-4cpu.img     # the first cluster's four
    fastboot boot mia1-ios-gpu.img      # one core; the Adreno 506 powered up and its registers read
    ```
 

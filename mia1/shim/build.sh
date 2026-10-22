@@ -1,9 +1,9 @@
 #!/bin/bash
 # Build the Mi A1 boot images for the stock bootloader (nothing is written to the phone by
 # `fastboot boot`; a reboot brings back whatever was there):
-#   OUT/mia1-ios.img        the shim, HackiOS's loader and kernel: iOS from the userdata partition
-#   OUT/mia1-ios-4cpu.img   the same on all four cores of the first cluster
-#   OUT/mia1-ios-8cpu.img   the same on all eight cores (both clusters)
+#   OUT/mia1-ios.img        the shim, HackiOS's loader and kernel: iOS from the userdata partition,
+#                           on all eight cores (both clusters)
+#   OUT/mia1-ios-1cpu.img   the same on one core; mia1-ios-4cpu.img on the first cluster's four
 #   OUT/mia1-ios-gpu.img    one core, and the Adreno 506 powered up and looked at (tissot_gpu=1)
 # Usage: build.sh OUT_DIR HACKIOS_TREE
 # HACKIOS_TREE: a HackiOS checkout with hackios/hackios-xnu-kernel.diff applied, the kernel,
@@ -85,8 +85,8 @@ if [ -n "${SHIM_CMDLINE:-}" ]; then
 	image mia1-test "$SHIM_CMDLINE"
 	exit 0
 fi
-image mia1-ios "tissot=1 vtimer_ppi=20 emmc_root=userdata"
-image mia1-ios-verbose "-v tissot=1 vtimer_ppi=20 emmc_root=userdata"
+image mia1-ios "tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=8"
+image mia1-ios-verbose "-v tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=8"
+image mia1-ios-1cpu "tissot=1 vtimer_ppi=20 emmc_root=userdata"
 image mia1-ios-4cpu "tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=4"
-image mia1-ios-8cpu "tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=8"
 image mia1-ios-gpu "tissot=1 vtimer_ppi=20 emmc_root=userdata tissot_gpu=1"
