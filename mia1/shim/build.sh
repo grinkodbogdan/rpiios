@@ -19,7 +19,7 @@ for f in "$kernel" "$hack/xnuloader/loader.efi" "$hack/userland/root.apfs"; do
 done
 
 flags=(--target=aarch64-none-elf -mgeneral-regs-only -ffreestanding -fno-builtin -nostdlib
-       -fpie -fno-stack-protector -O2 -Wall -Wextra -Werror -Wno-format -I"$hack/xnuloader" $SHIM_CFLAGS)
+       -fpie -fno-stack-protector -mstrict-align -O2 -Wall -Wextra -Werror -Wno-format -I"$hack/xnuloader" $SHIM_CFLAGS)
 objs=()
 for src in start.S main.c console.c efi.c fdt.c mmu.c libc.c; do
 	clang "${flags[@]}" -c "$here/$src" -o "$out/${src%.*}.o"
