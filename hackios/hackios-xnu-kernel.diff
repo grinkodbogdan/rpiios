@@ -1,0 +1,31 @@
+diff --git a/qemu/run.sh b/qemu/run.sh
+index dd8667b..bab6abc 100755
+--- a/qemu/run.sh
++++ b/qemu/run.sh
+@@ -16,7 +16,7 @@ cp "${QEMU_VARS:-/usr/share/edk2/aarch64/QEMU_VARS.fd}" vars.fd 2>/dev/null
+ # the one built here, or else the one that comes with the repository
+ L=../xnuloader/loader.efi; [ -f $L ] || L=../prebuilt/loader.efi
+ mkdir -p esp/EFI/BOOT && cp -u $L esp/EFI/BOOT/BOOTAA64.EFI
+-timeout "$T" qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a76 -smp ${QEMU_SMP:-1} -m ${QEMU_MEM:-6G} \
++timeout "$T" qemu-system-aarch64 -M virt,gic-version=3 -cpu ${QEMU_CPU:-cortex-a76} -smp ${QEMU_SMP:-1} -m ${QEMU_MEM:-6G} \
+   -accel tcg,tb-size=${QEMU_TB_MB:-384} \
+   -drive if=pflash,format=raw,readonly=on,file="$EFI" \
+   -drive if=pflash,format=raw,file=vars.fd \
+diff --git a/xnuloader/loader.c b/xnuloader/loader.c
+index 640b05d..8a363ef 100644
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -3907,8 +3907,11 @@ ramfb_phone_screen(void)
+ 	dma.length = be32(sizeof(cfg));
+ 	dma.address = __builtin_bswap64((uint64_t)(uintptr_t)&cfg);
+ 	*(volatile uint64_t *)(FW_CFG_BASE + 16) = __builtin_bswap64((uint64_t)(uintptr_t)&dma);
+-	if (dma.control != 0) {
+-		print("ramfb: control %x after the request\n", (uint64_t)be32(dma.control));
++	/* QEMU clears the control word when the transfer is done: read it from memory, not from what
++	 * the compiler remembers having stored */
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (*(volatile uint32_t *)&dma.control != 0) {
++		print("ramfb: control %x after the request\n", (uint64_t)be32(*(volatile uint32_t *)&dma.control));
+ 		return;
+ 	}
+ 	SCREEN.base = fb;
