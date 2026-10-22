@@ -364,6 +364,7 @@ msm_clocks(struct emmc *e)
 	if (e->gcc == 0) {
 		return 0;
 	}
+	emmc_log("%s: reading the SDCC1 clock registers\n", e->name);
 	if (emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR) & CBCR_OFF) {
 		emmc_wr32(e->gcc + GCC_SDCC1_AHB_CBCR, emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR) | CBCR_ENABLE);
 	}
@@ -438,6 +439,8 @@ emmc_init(struct emmc *e)
 		 * HS400 behind in Qualcomm's own registers (clock selection, DLL), which an SDHCI reset
 		 * does not touch. The core is in its old (MCI) mode after it.
 		 */
+		emmc_log("%s: Qualcomm core: version %x, MCI_POWER %x, HC_MODE %x; resetting it\n", e->name,
+		    emmc_rd32(e->core + MSM_VERSION), emmc_rd32(e->core + 0x00), emmc_rd32(e->core + MSM_HC_MODE));
 		emmc_wr32(e->core + 0x00, emmc_rd32(e->core + 0x00) | 1u << 7);
 		for (int i = 0; i < 10000 && (emmc_rd32(e->core + 0x00) & 1u << 7); i++) {
 			emmc_udelay(1);
@@ -447,6 +450,7 @@ emmc_init(struct emmc *e)
 		emmc_wr32(e->core + MSM_HC_MODE, emmc_rd32(e->core + MSM_HC_MODE) | 1u | 1u << 13);
 		emmc_log("%s: Qualcomm SDCC %x, SDHCI mode on\n", e->name, emmc_rd32(e->core + MSM_VERSION));
 	}
+	emmc_log("%s: SDHCI reset (present %x)\n", e->name, hc_rd(e, SDHCI_PRESENT));
 	if (emmc_reset(e, RESET_ALL) != 0) {
 		return -1;
 	}

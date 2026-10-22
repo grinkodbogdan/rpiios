@@ -413,10 +413,10 @@ index 0000000..46cfc5f
 +}
 diff --git a/xnu/files/bsd/dev/redwood_tissot_emmc.c b/xnu/files/bsd/dev/redwood_tissot_emmc.c
 new file mode 100644
-index 0000000..90b5c59
+index 0000000..274a7f2
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_emmc.c
-@@ -0,0 +1,562 @@
+@@ -0,0 +1,576 @@
 +/*
 + * The Mi A1's storage (tissot: 64 GB of eMMC on the Snapdragon 625's SDCC1): a block device and a
 + * character device for the whole of it and for every GPT partition -- /dev/emmc, /dev/emmc_NAME
@@ -491,10 +491,21 @@ index 0000000..90b5c59
 +#define KEEP_MAGIC              0x31414d4950454b52ull
 +#define KEEP_BYTES              (0x100000u - 16)
 +
++static volatile uint64_t *keep;
++
++/* One character into the kept log, from anywhere (an interrupt too): nothing until a line has mapped it. */
++void
++redwood_tissot_keep_char(char c)
++{
++	if (keep != NULL && keep[0] == KEEP_MAGIC && keep[1] < KEEP_BYTES) {
++		((volatile char *)keep)[16 + keep[1]] = c;
++		keep[1] = keep[1] + 1;
++	}
++}
++
 +void
 +redwood_tissot_log(const char *format, ...)
 +{
-+	static volatile uint64_t *keep;
 +	char line[256];
 +	va_list list;
 +
@@ -893,12 +904,14 @@ index 0000000..90b5c59
 +	if (!phone && !pci) {
 +		return;
 +	}
++	emmc_log("init: %s\n", pci ? "QEMU's sdhci-pci" : "the phone's SDCC1");
 +	if (pci) {
 +		emmc.hc = qemu_sdhci();
 +	} else {
 +		emmc.core = ml_io_map(SDCC1_CORE_PHYS, 0x1000);        /* "hc" is in the same page */
 +		emmc.gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
 +		emmc.hc = emmc.core + (SDCC1_HC_PHYS - SDCC1_CORE_PHYS);
++		emmc_log("mapped: core %#lx, gcc %#lx\n", (unsigned long)emmc.core, (unsigned long)emmc.gcc);
 +	}
 +	if (emmc.hc == 0) {
 +		return;
@@ -942,6 +955,7 @@ index 0000000..90b5c59
 +{
 +	static uint8_t block[512];
 +
++	emmc_log("root %s asked for\n", name);
 +	redwood_tissot_emmc_init();
 +	if (!ready) {
 +		return NODEV;
@@ -981,10 +995,10 @@ index 0000000..90b5c59
 +}
 diff --git a/xnu/files/bsd/dev/redwood_tissot_emmc_core.h b/xnu/files/bsd/dev/redwood_tissot_emmc_core.h
 new file mode 100644
-index 0000000..0c180db
+index 0000000..1441783
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_emmc_core.h
-@@ -0,0 +1,707 @@
+@@ -0,0 +1,711 @@
 +/*
 + * eMMC (and SD) over an SDHCI controller, by programmed I/O: what the Mi A1's boot shim and its
 + * kernel driver (bsd/dev/redwood_tissot_emmc.c, which carries a copy of this file) both use to
@@ -1351,6 +1365,7 @@ index 0000000..0c180db
 +	if (e->gcc == 0) {
 +		return 0;
 +	}
++	emmc_log("%s: reading the SDCC1 clock registers\n", e->name);
 +	if (emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR) & CBCR_OFF) {
 +		emmc_wr32(e->gcc + GCC_SDCC1_AHB_CBCR, emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR) | CBCR_ENABLE);
 +	}
@@ -1425,6 +1440,8 @@ index 0000000..0c180db
 +		 * HS400 behind in Qualcomm's own registers (clock selection, DLL), which an SDHCI reset
 +		 * does not touch. The core is in its old (MCI) mode after it.
 +		 */
++		emmc_log("%s: Qualcomm core: version %x, MCI_POWER %x, HC_MODE %x; resetting it\n", e->name,
++		    emmc_rd32(e->core + MSM_VERSION), emmc_rd32(e->core + 0x00), emmc_rd32(e->core + MSM_HC_MODE));
 +		emmc_wr32(e->core + 0x00, emmc_rd32(e->core + 0x00) | 1u << 7);
 +		for (int i = 0; i < 10000 && (emmc_rd32(e->core + 0x00) & 1u << 7); i++) {
 +			emmc_udelay(1);
@@ -1434,6 +1451,7 @@ index 0000000..0c180db
 +		emmc_wr32(e->core + MSM_HC_MODE, emmc_rd32(e->core + MSM_HC_MODE) | 1u | 1u << 13);
 +		emmc_log("%s: Qualcomm SDCC %x, SDHCI mode on\n", e->name, emmc_rd32(e->core + MSM_VERSION));
 +	}
++	emmc_log("%s: SDHCI reset (present %x)\n", e->name, hc_rd(e, SDHCI_PRESENT));
 +	if (emmc_reset(e, RESET_ALL) != 0) {
 +		return -1;
 +	}
@@ -2225,7 +2243,7 @@ index bb8ad1b..c2ca3c3 100644
  void redwood_spmi_unlock(void);
  /*
 diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
-index 63ffd4b..7f6ed1d 100644
+index 63ffd4b..2b6879e 100644
 --- a/xnu/files/osfmk/arm64/gic_v3_irq.c
 +++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
 @@ -23,6 +23,12 @@
@@ -2333,7 +2351,7 @@ index 63ffd4b..7f6ed1d 100644
  	gic_distributor_settle();
  	gic_v3_spi_unmask(intid);
  	return KERN_SUCCESS;
-@@ -296,14 +337,26 @@ gic_v3_spi_count(uint32_t intid)
+@@ -296,14 +337,30 @@ gic_v3_spi_count(uint32_t intid)
  	return 0;
  }
  
@@ -2349,6 +2367,10 @@ index 63ffd4b..7f6ed1d 100644
 +	}
 +}
 +
++extern void redwood_tissot_log(const char *format, ...);
++extern void redwood_tissot_keep_char(char c);
++static uint64_t gic_timer_ticks;
++
  static void
  gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub, __unused int source)
  {
@@ -2362,7 +2384,18 @@ index 63ffd4b..7f6ed1d 100644
  
  		if (intid >= GIC_INTID_SPURIOUS_MIN) {
  			break;
-@@ -328,8 +381,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
+@@ -311,6 +368,10 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
+ 		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
+ 
+ 		if (intid == GIC_INTID_VTIMER) {
++			/* the Mi A1's log that survives a reset: a dot every 100 timer interrupts */
++			if (++gic_timer_ticks % 100 == 1) {
++				redwood_tissot_keep_char('.');
++			}
+ 			/* same sequence as the FIQ path in sleh_fiq() */
+ 			getCpuDatap()->cpu_decrementer = -1; /* Large */
+ 			rtclock_intr(TRUE);
+@@ -328,8 +389,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
  			gic_last_unhandled = intid;
  		}
  
@@ -2372,7 +2405,7 @@ index 63ffd4b..7f6ed1d 100644
  		gic_active_iar[cpu] = 0;
  	}
  }
-@@ -358,8 +410,7 @@ gic_v3_irq_quiesce(void)
+@@ -358,8 +418,7 @@ gic_v3_irq_quiesce(void)
  		}
  	}
  	if (gic_active_iar[cpu] != 0) {
@@ -2382,7 +2415,7 @@ index 63ffd4b..7f6ed1d 100644
  		gic_active_iar[cpu] = 0;
  	}
  }
-@@ -382,6 +433,15 @@ gic_v3_irq_cpu_shutdown(void)
+@@ -382,6 +441,15 @@ gic_v3_irq_cpu_shutdown(void)
  		return;
  	}
  	gic_v3_irq_quiesce();
@@ -2398,7 +2431,7 @@ index 63ffd4b..7f6ed1d 100644
  	gicr = gicr_cpu_base[cpu_number()];
  	if (gicr != 0) {
  		gic_write32(gicr + GICR_ICENABLER0, 0xffffffffu);
-@@ -412,6 +472,49 @@ gic_find_redistributor(void)
+@@ -412,6 +480,54 @@ gic_find_redistributor(void)
  	panic("gic: no redistributor for MPIDR 0x%llx", mpidr);
  }
  
@@ -2443,12 +2476,17 @@ index 63ffd4b..7f6ed1d 100644
 +	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
 +	kprintf("gic: v2, distributor %p, CPU interface %p, cpu %d (mask 0x%x), virtual timer on PPI %d\n",
 +	    (void *)gicd_base, (void *)gicr_base, cpu, gic_v2_cpu[cpu].mask, GIC_INTID_VTIMER);
++	if (PE_parse_boot_argn("tissot", &apr, sizeof(apr)) && cpu == 0) {
++		redwood_tissot_log("gic: v2 up: GICD_CTLR %x, IGROUPR0 %x, ISENABLER0 %x, GICC_CTLR %x, PMR %x, mask %x\n",
++		    gic_read32(gicd_base + GICD_CTLR), gic_read32(gicd_base + 0x80), gic_read32(gicd_base + GICD_ISENABLER(0)),
++		    gic_read32(gicr_base + GICC_CTLR), gic_read32(gicr_base + GICC_PMR), gic_v2_cpu[cpu].mask);
++	}
 +}
 +
  /* Per-CPU bring-up: every processor calls this for itself, the boot processor first. */
  void
  gic_v3_irq_cpu_init(void)
-@@ -434,13 +537,20 @@ gic_v3_irq_cpu_init(void)
+@@ -434,13 +550,20 @@ gic_v3_irq_cpu_init(void)
  		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
  
  		simple_lock_init(&gic_spi_lock, 0);
@@ -2471,7 +2509,7 @@ index 63ffd4b..7f6ed1d 100644
  	}
  
 diff --git a/xnu/redwood.patch b/xnu/redwood.patch
-index 8f7dd87..50e0d11 100644
+index 8f7dd87..cc2cfef 100644
 --- a/xnu/redwood.patch
 +++ b/xnu/redwood.patch
 @@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
@@ -2524,37 +2562,47 @@ index 8f7dd87..50e0d11 100644
   bsd/kern/kern_symfile.c			standard
   bsd/kern/kern_descrip.c			standard
   bsd/kern/kern_guarded.c			standard
-@@ -1680,10 +1683,18 @@ index 2b14eda8f68f..09337bad5b01 100644
+@@ -1680,10 +1683,19 @@ index 2b14eda8f68f..09337bad5b01 100644
  +#endif
       ")";
  diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 -index 5219fb0d9ed6..29978e9cff43 100644
-+index 5219fb0d9ed6..792e258dcabb 100644
++index 5219fb0d9ed6..58f06d933903 100644
  --- a/iokit/bsddev/IOKitBSDInit.cpp
  +++ b/iokit/bsddev/IOKitBSDInit.cpp
 -@@ -683,7 +683,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
-+@@ -62,6 +62,7 @@ extern "C" {
++@@ -62,6 +62,8 @@ extern "C" {
 + 
 + extern dev_t mdevadd(int devid, uint64_t base, unsigned int size, int phys);
 + extern dev_t mdevlookup(int devid);
 ++extern dev_t redwood_tissot_emmc_root(const char *name);
+++extern void redwood_tissot_log(const char *format, ...);
 + extern void mdevremoveall(void);
 + extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
 + extern void di_root_ramfile(IORegistryEntry * entry);
-+@@ -683,7 +684,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++@@ -683,10 +685,19 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
   	assert(matching);
   	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
   
-@@ -1699,7 +1710,7 @@ index 5219fb0d9ed6..29978e9cff43 100644
+@@ -1695,11 +1707,16 @@ index 5219fb0d9ed6..29978e9cff43 100644
+ +		bsdWait = kSecondScale / 10;
+ +	}
+ +
+++	redwood_tissot_log("IOFindBSDRoot: waiting %llu ms for the BSD service (timer interrupts needed)\n", bsdWait / kMillisecondScale);
+ +	if ((service = IOService::waitForMatchingService(matching, bsdWait))) {
   		OSSafeReleaseNULL(service);
   	} else {
   		IOLog("!BSD\n");
 -@@ -762,6 +769,17 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
-+@@ -762,10 +770,48 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+++		redwood_tissot_log("IOFindBSDRoot: the wait is over\n");
++ 	}
++ 	matching->release();
++ 	matching = NULL;
++@@ -762,10 +773,48 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
   #endif /* __LP64__ */
   				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
   			}
-@@ -1717,6 +1728,37 @@ index 5219fb0d9ed6..29978e9cff43 100644
+@@ -1717,6 +1734,37 @@ index 5219fb0d9ed6..29978e9cff43 100644
   			regEntry->release();                                                            /* Toss the entry */
   		}
   	}
