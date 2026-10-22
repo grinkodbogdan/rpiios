@@ -41,6 +41,15 @@ user space ran there with no illegal-instruction faults.
     (channel table at core+0x800, observer channels 0x8000 apart), read only as theirs;
     volume up from TLMM GPIO85 (active low, pulled up). Power is the side button.
     `tissot_buttons_steps=N`. Also exports `redwood_tissot_spmi_read()`.
+  - `xnu/files/bsd/dev/redwood_tissot_emmc.c` (+ `redwood_tissot_emmc_core.h`, the same file as
+    `mia1/emmc/emmc_core.h`): the Mi A1's eMMC on SDCC1, by programmed I/O, redoing what LK's
+    `target_uninit` undoes (card asleep, SDHCI mode off): clocks, Qualcomm's power-control
+    handshake, CMD0/CMD1, 8 lines at 50 MHz. `/dev/emmc_NAME` for every GPT partition, and the
+    root from one of them with `emmc_root=NAME` (`iokit/bsddev/IOKitBSDInit.cpp`; `rd` stays `md0`
+    so the boot is still a RAM-disk boot to the kernel and launchd). Writes go to memory, never to
+    the eMMC. The 2.4 GB system image does not fit in the Mi A1's RAM; this reads it from storage.
+    `emmc_pci=1`: the same code on QEMU's `sdhci-pci` + SD card (`mia1/qemu-emmc.sh`); there it
+    boots iOS 16.5 to the home screen on a Cortex-A53, GICv2, 4 GB (`mia1/emmc-root-qemu.png`).
   - Both are off unless boot-arg `tissot=1` (or `tissot_touch=1` / `tissot_buttons=1`);
     their `touchscreen=1`/`buttons=1` must not be given on the Mi A1 (other SoC's addresses).
   - `qemu/run.sh`: `QEMU_CPU` and `QEMU_GIC` select the CPU model and GIC version.

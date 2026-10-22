@@ -12,13 +12,14 @@ index dd8667b..989d6b0 100755
    -drive if=pflash,format=raw,readonly=on,file="$EFI" \
    -drive if=pflash,format=raw,file=vars.fd \
 diff --git a/xnu/files/bsd/dev/redwood_input.c b/xnu/files/bsd/dev/redwood_input.c
-index 8076cf0..de5510a 100644
+index 8076cf0..73c3c29 100644
 --- a/xnu/files/bsd/dev/redwood_input.c
 +++ b/xnu/files/bsd/dev/redwood_input.c
-@@ -218,6 +218,8 @@ redwood_input_init(void)
+@@ -218,6 +218,9 @@ redwood_input_init(void)
  	redwood_virtio_input_init();
  	redwood_goodix_init();
  	redwood_buttons_init();
++	redwood_tissot_emmc_init();
 +	redwood_tissot_touch_init();
 +	redwood_tissot_buttons_init();
  	redwood_battery_init();
@@ -410,6 +411,1216 @@ index 0000000..46cfc5f
 +		thread_deallocate(thread);
 +	}
 +}
+diff --git a/xnu/files/bsd/dev/redwood_tissot_emmc.c b/xnu/files/bsd/dev/redwood_tissot_emmc.c
+new file mode 100644
+index 0000000..6f41bb9
+--- /dev/null
++++ b/xnu/files/bsd/dev/redwood_tissot_emmc.c
+@@ -0,0 +1,528 @@
++/*
++ * The Mi A1's storage (tissot: 64 GB of eMMC on the Snapdragon 625's SDCC1): a block device and a
++ * character device for the whole of it and for every GPT partition -- /dev/emmc, /dev/emmc_NAME
++ * and /dev/remmc, /dev/remmc_NAME -- and the root filesystem from one of them with emmc_root=NAME.
++ * Only with boot-arg tissot_emmc=1 (or tissot=1): every address below belongs to that phone.
++ *
++ * Why a root on the storage, where the POCO's is a RAM disk: the iOS image (userland/system.apfs,
++ * 2.4 GB) is held in memory there, the POCO has 8 GB; the Mi A1 has 4, with the modem's and the
++ * firmware's regions cut out of it, and no 2.4 GB piece of it is left beside the kernel. So the
++ * image is written to a partition from the computer (fastboot flash userdata system.apfs) and
++ * read from there, block by block, as the APFS driver asks for them.
++ *
++ * Nothing is ever written to the eMMC. The root takes writes all the same -- a RAM disk root
++ * does, and user space expects to -- into memory: a written block is kept in a table of 4 KB
++ * pages, and a read of it is served from there (the same as the Raspberry Pi port's root). They
++ * last until the phone restarts.
++ *
++ * There is no storage driver below this one: the controller is driven directly, by programmed
++ * I/O, one request at a time, by the code in redwood_tissot_emmc_core.h (the boot shim's own,
++ * mia1/emmc/emmc_core.h in rpiios: the same file). The bootloader leaves the card asleep and the
++ * controller off; that code wakes both.
++ *
++ * For QEMU, which has no eMMC model: with emmc_pci=1 instead, the same driver reads an SD card
++ * on QEMU's sdhci-pci (-device sdhci-pci -device sd-card,drive=D), found through the PCI
++ * configuration space of QEMU's "virt" machine. That is how this driver is tested.
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <miscfs/devfs/devfs.h>
++#include <pexpert/pexpert.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/systm.h>
++#include <sys/uio.h>
++#include <sys/redwood_input.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++static uint32_t
++emmc_rd32(uintptr_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static void
++emmc_wr32(uintptr_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++static void
++emmc_udelay(uint32_t us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
++#define emmc_log(...) printf("tissot-emmc: " __VA_ARGS__)
++
++#include "redwood_tissot_emmc_core.h"
++
++/* the phone */
++#define SDCC1_HC_PHYS           0x07824900UL
++#define SDCC1_CORE_PHYS         0x07824000UL
++#define GCC_PHYS                0x01800000UL
++#define GCC_SIZE                0x80000UL
++
++/* QEMU virt: PCI configuration space (ECAM) above 4 GB, and memory for a BAR nobody gave out */
++#define QEMU_ECAM_PHYS          0x4010000000ULL
++#define QEMU_ECAM_LOW_PHYS      0x3f000000ULL           /* with highmem=off */
++#define QEMU_BAR_SPARE          0x10f00000u
++#define SDHCI_PCI_ID            0x00071b36u             /* Red Hat's sdhci-pci */
++
++#define MAX_PARTS               128
++#define PAGE_BYTES              4096u
++#define OVERLAY_BUCKETS         4096
++
++struct part {
++	char            name[37];
++	uint64_t        first, sectors;         /* of 512 bytes */
++	uint32_t        bsize;                  /* the block size the device is counted in (spec_open sets 512) */
++};
++
++static struct emmc emmc = { .name = "tissot-emmc" };
++static struct part parts[MAX_PARTS];            /* 0: the whole device */
++static uint32_t nparts;
++static int bmajor = -1, cmajor = -1;
++static bool ready, tried;
++static uint8_t *bounce;                         /* one request's worth, for the controller */
++#define BOUNCE_BYTES            (256u * 1024)
++
++static LCK_GRP_DECLARE(emmc_lck_grp, "tissot-emmc");
++static LCK_MTX_DECLARE(emmc_lock, &emmc_lck_grp);
++
++/* ---- what has been written: kept in memory ------------------------------------------------------- */
++
++struct overlay_page {
++	struct overlay_page *   next;
++	uint32_t                part;
++	uint64_t                page;           /* byte offset / PAGE_BYTES, in the partition */
++	uint8_t                 data[PAGE_BYTES];
++};
++
++static struct overlay_page *overlay[OVERLAY_BUCKETS];
++static uint64_t overlay_pages;
++
++static struct overlay_page *
++overlay_find(uint32_t part, uint64_t page)
++{
++	struct overlay_page *o = overlay[(page * 31 + part) % OVERLAY_BUCKETS];
++
++	while (o != NULL && (o->part != part || o->page != page)) {
++		o = o->next;
++	}
++	return o;
++}
++
++/* ---- reads and writes -------------------------------------------------------------------------- */
++
++/* Sectors of a partition from the eMMC, through the bounce buffer. The lock is held. */
++static int
++emmc_read_sectors(uint32_t part, uint64_t sector, uint64_t count, uint8_t *to)
++{
++	while (count > 0) {
++		uint32_t now = count > BOUNCE_BYTES / 512 ? BOUNCE_BYTES / 512 : (uint32_t)count;
++
++		if (emmc_io(&emmc, parts[part].first + sector, now, bounce, 0) != 0) {
++			return EIO;
++		}
++		memcpy(to, bounce, (size_t)now * 512);
++		sector += now;
++		count -= now;
++		to += (uint64_t)now * 512;
++	}
++	return 0;
++}
++
++/* `length` bytes from `offset` of a partition (both multiples of 512): the eMMC, then what was written over it. */
++static int
++part_read(uint32_t part, uint64_t offset, uint8_t *to, uint64_t length)
++{
++	int error;
++
++	lck_mtx_lock(&emmc_lock);
++	error = emmc_read_sectors(part, offset / 512, length / 512, to);
++	if (error == 0 && overlay_pages != 0) {
++		for (uint64_t page = offset / PAGE_BYTES; page * PAGE_BYTES < offset + length; page++) {
++			struct overlay_page *o = overlay_find(part, page);
++			uint64_t from, end;
++
++			if (o == NULL) {
++				continue;
++			}
++			from = page * PAGE_BYTES > offset ? page * PAGE_BYTES : offset;
++			end = (page + 1) * PAGE_BYTES < offset + length ? (page + 1) * PAGE_BYTES : offset + length;
++			memcpy(to + (from - offset), o->data + (from - page * PAGE_BYTES), end - from);
++		}
++	}
++	lck_mtx_unlock(&emmc_lock);
++	return error;
++}
++
++/* Into memory, never to the eMMC: a page first written is filled from the eMMC, then written over. */
++static int
++part_write(uint32_t part, uint64_t offset, const uint8_t *from, uint64_t length)
++{
++	int error = 0;
++
++	lck_mtx_lock(&emmc_lock);
++	for (uint64_t page = offset / PAGE_BYTES; error == 0 && page * PAGE_BYTES < offset + length; page++) {
++		struct overlay_page *o = overlay_find(part, page);
++		uint64_t start, end;
++
++		if (o == NULL) {
++			o = kalloc_type(struct overlay_page, Z_WAITOK | Z_ZERO);
++			if (o == NULL) {
++				error = ENOSPC;
++				break;
++			}
++			o->part = part;
++			o->page = page;
++			if ((page + 1) * PAGE_BYTES <= parts[part].sectors * 512) {
++				error = emmc_read_sectors(part, page * (PAGE_BYTES / 512), PAGE_BYTES / 512, o->data);
++			}
++			if (error != 0) {
++				kfree_type(struct overlay_page, o);
++				break;
++			}
++			o->next = overlay[(page * 31 + part) % OVERLAY_BUCKETS];
++			overlay[(page * 31 + part) % OVERLAY_BUCKETS] = o;
++			overlay_pages++;
++		}
++		start = page * PAGE_BYTES > offset ? page * PAGE_BYTES : offset;
++		end = (page + 1) * PAGE_BYTES < offset + length ? (page + 1) * PAGE_BYTES : offset + length;
++		memcpy(o->data + (start - page * PAGE_BYTES), from + (start - offset), end - start);
++	}
++	lck_mtx_unlock(&emmc_lock);
++	return error;
++}
++
++/* ---- the devices ------------------------------------------------------------------------------- */
++
++static int
++emmc_open(dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	return ready && (uint32_t)minor(dev) < nparts ? 0 : ENXIO;
++}
++
++static int
++emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	return 0;
++}
++
++static void
++emmc_strategy(buf_t bp)
++{
++	uint32_t part = (uint32_t)minor(buf_device(bp));
++	uint64_t offset, length, size;
++	int error;
++
++	if (!ready || part >= nparts) {
++		buf_seterror(bp, ENXIO);
++		buf_biodone(bp);
++		return;
++	}
++	size = parts[part].sectors * 512;
++	offset = (uint64_t)buf_blkno(bp) * parts[part].bsize;
++	length = buf_count(bp);
++	if (offset >= size || (offset | length) % 512 != 0) {
++		buf_seterror(bp, offset == size ? 0 : EINVAL);
++		buf_setresid(bp, buf_count(bp));
++		buf_biodone(bp);
++		return;
++	}
++	if (offset + length > size) {
++		length = size - offset;
++	}
++	if (buf_flags(bp) & B_READ) {
++		error = part_read(part, offset, (uint8_t *)buf_dataptr(bp), length);
++	} else {
++		error = part_write(part, offset, (const uint8_t *)buf_dataptr(bp), length);
++	}
++	buf_setresid(bp, (uint32_t)(buf_count(bp) - (error ? 0 : length)));
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++emmc_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int fflag, __unused proc_t p)
++{
++	uint32_t part = (uint32_t)minor(dev);
++
++	if (!ready || part >= nparts) {
++		return ENXIO;
++	}
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*(uint32_t *)data = parts[part].bsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (*(uint32_t *)data < 512 || *(uint32_t *)data > PAGE_BYTES || (*(uint32_t *)data & (*(uint32_t *)data - 1)) != 0) {
++			return EINVAL;
++		}
++		parts[part].bsize = *(uint32_t *)data;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*(uint32_t *)data = 512;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*(uint64_t *)data = parts[part].sectors * 512 / parts[part].bsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*(uint32_t *)data = 1;          /* into memory */
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*(uint64_t *)data = BOUNCE_BYTES / parts[part].bsize;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++emmc_psize(dev_t dev)
++{
++	uint32_t part = (uint32_t)minor(dev);
++
++	return ready && part < nparts ? (int)parts[part].bsize : -1;
++}
++
++/* /dev/remmc_NAME: through memory of this kernel's (uiomove), never the reader's own. */
++static int
++emmc_rw(dev_t dev, struct uio *uio, int write)
++{
++	uint32_t part = (uint32_t)minor(dev);
++	uint64_t size;
++	uint8_t *buffer;
++	int error = 0;
++
++	if (!ready || part >= nparts) {
++		return ENXIO;
++	}
++	size = parts[part].sectors * 512;
++	if (uio_offset(uio) < 0 || uio_offset(uio) % 512 != 0 || uio_resid(uio) % 512 != 0) {
++		return EINVAL;
++	}
++	buffer = kalloc_data(BOUNCE_BYTES, Z_WAITOK);
++	if (buffer == NULL) {
++		return ENOMEM;
++	}
++	while (error == 0 && uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < size) {
++		uint64_t at = (uint64_t)uio_offset(uio), want = (uint64_t)uio_resid(uio);
++
++		want = want > BOUNCE_BYTES ? BOUNCE_BYTES : want;
++		want = want > size - at ? size - at : want;
++		if (write) {
++			error = uiomove((caddr_t)buffer, (int)want, uio);
++			if (error == 0) {
++				error = part_write(part, at, buffer, want);
++			}
++		} else {
++			error = part_read(part, at, buffer, want);
++			if (error == 0) {
++				error = uiomove((caddr_t)buffer, (int)want, uio);
++			}
++		}
++	}
++	kfree_data(buffer, BOUNCE_BYTES);
++	return error;
++}
++
++static int
++emmc_cread(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return emmc_rw(dev, uio, 0);
++}
++
++static int
++emmc_cwrite(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return emmc_rw(dev, uio, 1);
++}
++
++static const struct bdevsw emmc_bdevsw = {
++	.d_open = emmc_open, .d_close = emmc_close, .d_strategy = emmc_strategy, .d_ioctl = emmc_ioctl,
++	.d_dump = eno_dump, .d_psize = emmc_psize, .d_type = D_DISK,
++};
++
++static const struct cdevsw emmc_cdevsw = {
++	.d_open = emmc_open, .d_close = emmc_close, .d_read = emmc_cread, .d_write = emmc_cwrite,
++	.d_ioctl = emmc_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = D_DISK,
++};
++
++/* ---- bring-up ---------------------------------------------------------------------------------- */
++
++static int
++add_part(__unused void *context, const struct emmc_part *p)
++{
++	if (nparts >= MAX_PARTS) {
++		return 1;
++	}
++	strlcpy(parts[nparts].name, p->name, sizeof(parts[nparts].name));
++	parts[nparts].first = p->first;
++	parts[nparts].sectors = p->sectors;
++	parts[nparts].bsize = 512;
++	nparts++;
++	return 0;
++}
++
++/* QEMU: the first sdhci-pci on bus 0, its BAR given an address if the firmware gave it none. */
++static uintptr_t
++qemu_sdhci(void)
++{
++	uint64_t ecams[2] = { QEMU_ECAM_PHYS, QEMU_ECAM_LOW_PHYS };
++
++	for (int e = 0; e < 2; e++) {
++		vm_offset_t ecam = ml_io_map((vm_offset_t)ecams[e], 32 * 0x8000);
++
++		for (uint32_t device = 0; device < 32; device++) {
++			vm_offset_t config = ecam + device * 0x8000;
++			uint32_t bar;
++
++			if (emmc_rd32(config) != SDHCI_PCI_ID) {
++				continue;
++			}
++			bar = emmc_rd32(config + 0x10) & ~0xfu;
++			if (bar == 0) {
++				emmc_wr32(config + 0x10, QEMU_BAR_SPARE);
++				bar = QEMU_BAR_SPARE;
++			}
++			emmc_wr32(config + 0x04, emmc_rd32(config + 0x04) | 2);    /* memory space on */
++			printf("tissot-emmc: sdhci-pci at 00:%02x.0 (ECAM %#llx), registers at %#x\n", device, ecams[e], bar);
++			return ml_io_map(bar, 0x1000);
++		}
++	}
++	printf("tissot-emmc: emmc_pci=1 but no sdhci-pci on bus 0\n");
++	return 0;
++}
++
++static void
++make_nodes(void)
++{
++	for (uint32_t n = 0; n < nparts; n++) {
++		char name[48];
++
++		snprintf(name, sizeof(name), n == 0 ? "emmc" : "emmc_%s", parts[n].name);
++		devfs_make_node(makedev(bmajor, n), DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "%s", name);
++		devfs_make_node(makedev(cmajor, n), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "r%s", name);
++	}
++}
++
++void
++redwood_tissot_emmc_init(void)
++{
++	uint32_t phone = 0, pci = 0;
++	static uint8_t sector[512];
++
++	if (tried) {
++		return;
++	}
++	tried = true;
++	if (!PE_parse_boot_argn("tissot_emmc", &phone, sizeof(phone))) {
++		PE_parse_boot_argn("tissot", &phone, sizeof(phone));
++	}
++	PE_parse_boot_argn("emmc_pci", &pci, sizeof(pci));
++	if (!phone && !pci) {
++		return;
++	}
++	if (pci) {
++		emmc.hc = qemu_sdhci();
++	} else {
++		emmc.core = ml_io_map(SDCC1_CORE_PHYS, 0x1000);        /* "hc" is in the same page */
++		emmc.gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++		emmc.hc = emmc.core + (SDCC1_HC_PHYS - SDCC1_CORE_PHYS);
++	}
++	if (emmc.hc == 0) {
++		return;
++	}
++	bounce = kalloc_data(BOUNCE_BYTES, Z_WAITOK);
++	lck_mtx_lock(&emmc_lock);
++	if (bounce == NULL || emmc_init(&emmc) != 0) {
++		lck_mtx_unlock(&emmc_lock);
++		printf("tissot-emmc: no storage\n");
++		return;
++	}
++	strlcpy(parts[0].name, "(whole)", sizeof(parts[0].name));
++	parts[0].first = 0;
++	parts[0].sectors = emmc.sectors;
++	parts[0].bsize = 512;
++	nparts = 1;
++	emmc_gpt_walk(&emmc, sector, add_part, NULL);
++	lck_mtx_unlock(&emmc_lock);
++
++	bmajor = bdevsw_add(-1, &emmc_bdevsw);
++	cmajor = cdevsw_add(-1, &emmc_cdevsw);
++	if (bmajor < 0 || cmajor < 0) {
++		printf("tissot-emmc: no device numbers left\n");
++		return;
++	}
++	ready = true;
++	make_nodes();
++	printf("tissot-emmc: %u partitions:", nparts - 1);
++	for (uint32_t n = 1; n < nparts; n++) {
++		printf(" %s (%llu MB)", parts[n].name, parts[n].sectors / 2048);
++	}
++	printf("\n");
++}
++
++/*
++ * The root, for IOFindBSDRoot: emmc_root=NAME (here "emmc_NAME"). NODEV if there is no such partition. The partition
++ * is to hold an APFS container (fastboot flash NAME userland/system.apfs): said if it does not.
++ */
++dev_t
++redwood_tissot_emmc_root(const char *name)
++{
++	static uint8_t block[512];
++
++	redwood_tissot_emmc_init();
++	if (!ready) {
++		return NODEV;
++	}
++	for (uint32_t n = 0; n < nparts; n++) {
++		char full[48];
++
++		snprintf(full, sizeof(full), n == 0 ? "emmc" : "emmc_%s", parts[n].name);
++		if (strcmp(full, name) != 0) {
++			continue;
++		}
++		if (part_read(n, 0, block, 512) == 0) {
++			printf("tissot-emmc: root %s: %s\n", name,
++			    memcmp(block + 32, "NXSB", 4) == 0 ? "an APFS container" : "NOT an APFS container (was the image written to it?)");
++		}
++		return makedev(bmajor, n);
++	}
++	printf("tissot-emmc: no partition %s for the root\n", name);
++	return NODEV;
++}
++
++/* one of this driver's devices (the APFS driver puts requests to it together: each costs a transfer) */
++bool
++redwood_tissot_emmc_dev(dev_t dev)
++{
++	return ready && (major(dev) == bmajor || major(dev) == cmajor);
++}
++
++/* A line for the log: what has been read, and how much is held in memory for writes. */
++void
++redwood_tissot_emmc_report(void)
++{
++	if (ready) {
++		printf("tissot-emmc: %llu reads (%llu MB), %llu errors; %llu pages written into memory (%llu MB)\n", emmc.reads,
++		    emmc.read_sectors / 2048, emmc.errors, overlay_pages, overlay_pages * PAGE_BYTES >> 20);
++	}
++}
+diff --git a/xnu/files/bsd/dev/redwood_tissot_emmc_core.h b/xnu/files/bsd/dev/redwood_tissot_emmc_core.h
+new file mode 100644
+index 0000000..6f54a7e
+--- /dev/null
++++ b/xnu/files/bsd/dev/redwood_tissot_emmc_core.h
+@@ -0,0 +1,670 @@
++/*
++ * eMMC (and SD) over an SDHCI controller, by programmed I/O: what the Mi A1's boot shim and its
++ * kernel driver (bsd/dev/redwood_tissot_emmc.c, which carries a copy of this file) both use to
++ * read the phone's storage. No interrupts, no DMA, one request at a time.
++ *
++ * The Mi A1's eMMC is on the Snapdragon 625's SDCC1: a standard SDHCI register block ("hc",
++ * 0x07824900) beside Qualcomm's own ("core", 0x07824000). The bootloader (LK's aboot) puts the
++ * card to sleep and switches the controller out of SDHCI mode before it starts us
++ * (target_uninit: mmc_put_card_to_sleep, sdhci_mode_disable), so everything is done again here,
++ * in the order LK's platform/msm_shared/sdhci_msm.c and mmc_sdhci.c do it:
++ *   - the SDCC1 clocks on and the core clock at 50 MHz (GCC: GPLL0 / 16)
++ *   - SDHCI mode on, a reset, Qualcomm's power-control handshake acknowledged
++ *   - the card from sleep to idle (CMD0), then identified and selected at 400 kHz
++ *   - 8 data lines, high speed timing, 50 MHz (a card that refuses stays at 1 line, 25 MHz)
++ * The same code reads an SD card in a plain SDHCI (msm = 0: QEMU's sdhci-pci, which has no
++ * eMMC model, and the Mi A1's microSD slot on SDCC2).
++ *
++ * The includer defines, before including this file:
++ *   uint32_t emmc_rd32(uintptr_t address), void emmc_wr32(uintptr_t address, uint32_t value)
++ *   void emmc_udelay(uint32_t microseconds)
++ *   void emmc_log(const char *format, ...)       (printf-like: %s %u %x %llx are used)
++ *
++ * Register layouts: the SD Host Controller Simplified Specification 3.00; JEDEC eMMC 5.0
++ * (JESD84-B50); LK (lk2nd) platform/msm_shared/{sdhci,sdhci_msm,mmc_sdhci}.c,
++ * platform/msm8953/{msm8953-clock.c,include/platform/iomap.h}; Linux drivers/mmc/host/sdhci-msm.c.
++ */
++#ifndef EMMC_CORE_H
++#define EMMC_CORE_H
++
++/* ---- SDHCI ------------------------------------------------------------------------------------- */
++
++#define SDHCI_ARGUMENT2         0x00
++#define SDHCI_BLOCK             0x04            /* [11:0] size, [31:16] count */
++#define SDHCI_ARGUMENT          0x08
++#define SDHCI_COMMAND           0x0c            /* [15:0] transfer mode, [31:16] command: one write */
++#define SDHCI_RESPONSE          0x10            /* 4 words */
++#define SDHCI_DATA              0x20
++#define SDHCI_PRESENT           0x24
++#define SDHCI_HOST_CONTROL      0x28            /* [7:0] host control 1, [15:8] power */
++#define SDHCI_CLOCK             0x2c            /* [15:0] clock, [19:16] timeout, [26:24] reset */
++#define SDHCI_INT_STATUS        0x30            /* [15:0] normal, [31:16] errors */
++#define SDHCI_INT_ENABLE        0x34
++#define SDHCI_SIGNAL_ENABLE     0x38
++#define SDHCI_CONTROL2          0x3c            /* [31:16] host control 2 */
++#define SDHCI_CAPS              0x40
++#define SDHCI_VERSION           0xfc            /* [23:16] specification version */
++
++#define PRESENT_CMD_INHIBIT     (1u << 0)
++#define PRESENT_DAT_INHIBIT     (1u << 1)
++#define PRESENT_CARD            (1u << 16)
++
++#define HOST_4BIT               (1u << 1)
++#define HOST_HIGH_SPEED         (1u << 2)
++#define HOST_8BIT               (1u << 5)
++#define POWER_ON                (1u << 8)
++#define POWER_180               (5u << 9)
++#define POWER_330               (7u << 9)
++
++#define CLOCK_INTERNAL          (1u << 0)
++#define CLOCK_STABLE            (1u << 1)
++#define CLOCK_CARD              (1u << 2)
++#define TIMEOUT_MAX             (0xeu << 16)
++#define RESET_ALL               (1u << 24)
++#define RESET_CMD               (1u << 25)
++#define RESET_DATA              (1u << 26)
++
++#define INT_COMMAND_DONE        (1u << 0)
++#define INT_TRANSFER_DONE       (1u << 1)
++#define INT_READ_READY          (1u << 5)
++#define INT_WRITE_READY         (1u << 4)
++#define INT_ERROR               (1u << 15)
++#define INT_ERRORS              0xffff0000u
++
++#define MODE_BLOCK_COUNT        (1u << 1)
++#define MODE_AUTO_CMD12         (1u << 2)
++#define MODE_READ               (1u << 4)
++#define MODE_MULTI              (1u << 5)
++
++#define RESP_NONE               0
++#define RESP_136                1
++#define RESP_48                 2
++#define RESP_48_BUSY            3
++#define CMD_CRC                 (1u << 3)
++#define CMD_INDEX               (1u << 4)
++#define CMD_DATA                (1u << 5)
++#define R1                      (RESP_48 | CMD_CRC | CMD_INDEX)
++#define R1B                     (RESP_48_BUSY | CMD_CRC | CMD_INDEX)
++#define R2                      (RESP_136 | CMD_CRC)
++#define R3                      RESP_48
++
++/* ---- Qualcomm's side of SDCC (the "core" registers) and its clocks ------------------------------ */
++
++#define MSM_HC_MODE             0x78            /* [0] SDHCI mode, [13] FF_CLK_SW_RST_DIS */
++#define MSM_PWRCTL_STATUS       0xdc            /* [0] bus on, [1] bus off, [2] I/O low, [3] I/O high */
++#define MSM_PWRCTL_MASK         0xe0
++#define MSM_PWRCTL_CLEAR        0xe4
++#define MSM_PWRCTL_CTL          0xe8            /* [0] bus on/off done, [2] I/O switch done */
++#define MSM_VERSION             0x50
++#define MSM_VENDOR_SPEC         0x10c           /* of "hc" */
++#define MSM_VENDOR_CAPS0        0x11c           /* of "hc": capabilities as the controller says them */
++
++#define GCC_SDCC1_CMD_RCGR      0x42004         /* of the global clock controller, 0x01800000 */
++#define GCC_SDCC1_CFG_RCGR      0x42008
++#define GCC_SDCC1_APPS_CBCR     0x42018
++#define GCC_SDCC1_AHB_CBCR      0x4201c
++#define RCGR_UPDATE             (1u << 0)
++#define CBCR_ENABLE             (1u << 0)
++#define CBCR_OFF                (1u << 31)
++#define GPLL0_SOURCE            1
++#define SDCC_CLOCK_HZ           50000000u       /* GPLL0 (800 MHz) / 16 */
++
++/* ---- the card ---------------------------------------------------------------------------------- */
++
++#define EXT_CSD_PARTITION_CONFIG 179            /* [2:0] which area is accessed: 0 the user area */
++#define EXT_CSD_BUS_WIDTH       183
++#define EXT_CSD_HS_TIMING       185
++#define EXT_CSD_REV             192
++#define EXT_CSD_SECTORS         212             /* 4 bytes, little endian */
++
++struct emmc {
++	/* filled in by the includer */
++	uintptr_t       hc;             /* the SDHCI registers */
++	uintptr_t       core;           /* Qualcomm's, 0 for a plain SDHCI */
++	uintptr_t       gcc;            /* the global clock controller, 0 to leave the clock as it is */
++	const char *    name;
++	/* what the card is */
++	int             sd;             /* an SD card, not eMMC */
++	int             sectors_addressed; /* high capacity: the argument is a sector, not a byte */
++	uint32_t        rca;
++	uint64_t        sectors;        /* of 512 bytes, in the user area */
++	uint32_t        width;          /* data lines */
++	uint32_t        hz;
++	uint32_t        cid[4];
++	/* how it has gone */
++	uint64_t        reads, read_sectors, writes, written_sectors, errors;
++	uint32_t        last_error;     /* SDHCI's error bits of the last failure */
++	uint32_t        base_hz;
++};
++
++static inline uint32_t
++hc_rd(struct emmc *e, uint32_t reg)
++{
++	return emmc_rd32(e->hc + reg);
++}
++
++static inline void
++hc_wr(struct emmc *e, uint32_t reg, uint32_t value)
++{
++	emmc_wr32(e->hc + reg, value);
++}
++
++static int
++emmc_wait(struct emmc *e, uint32_t reg, uint32_t mask, uint32_t want, uint32_t us)
++{
++	for (uint32_t waited = 0; (hc_rd(e, reg) & mask) != want; waited++) {
++		if (waited >= us) {
++			return -1;
++		}
++		emmc_udelay(1);
++	}
++	return 0;
++}
++
++/*
++ * Qualcomm's controller asks software, through its "power irq", whether a change of bus power or
++ * of I/O voltage has been made, and holds the change until it is told so. Nothing takes that
++ * interrupt here, so the request is looked for and acknowledged after every such change.
++ */
++static void
++msm_power_ack(struct emmc *e, uint32_t us)
++{
++	uint32_t status = 0;
++
++	if (e->core == 0) {
++		return;
++	}
++	for (uint32_t waited = 0; waited < us; waited += 10) {
++		status = emmc_rd32(e->core + MSM_PWRCTL_STATUS);
++		if (status != 0) {
++			break;
++		}
++		emmc_udelay(10);
++	}
++	if (status == 0) {
++		return;
++	}
++	emmc_wr32(e->core + MSM_PWRCTL_CLEAR, status);
++	emmc_wr32(e->core + MSM_PWRCTL_CTL, ((status & 3) ? 1u : 0) | ((status & 0xc) ? 4u : 0));
++}
++
++static int
++emmc_reset(struct emmc *e, uint32_t which)
++{
++	hc_wr(e, SDHCI_CLOCK, hc_rd(e, SDHCI_CLOCK) | which);
++	if (emmc_wait(e, SDHCI_CLOCK, which, 0, 100000) != 0) {
++		emmc_log("%s: the controller does not come out of reset (%x)\n", e->name, hc_rd(e, SDHCI_CLOCK));
++		return -1;
++	}
++	return 0;
++}
++
++static int
++emmc_set_clock(struct emmc *e, uint32_t hz)
++{
++	uint32_t divider = 0, clock;
++
++	if (hz < e->base_hz) {
++		for (divider = 1; divider < 0x3ff && e->base_hz / (2 * divider) > hz; divider++) {
++		}
++	}
++	hc_wr(e, SDHCI_CLOCK, hc_rd(e, SDHCI_CLOCK) & ~0xffffu);
++	clock = (divider & 0xff) << 8 | ((divider >> 8) & 3) << 6 | CLOCK_INTERNAL;
++	hc_wr(e, SDHCI_CLOCK, (hc_rd(e, SDHCI_CLOCK) & ~0xfffffu) | clock | TIMEOUT_MAX);
++	if (emmc_wait(e, SDHCI_CLOCK, CLOCK_STABLE, CLOCK_STABLE, 100000) != 0) {
++		emmc_log("%s: the clock does not settle\n", e->name);
++		return -1;
++	}
++	hc_wr(e, SDHCI_CLOCK, hc_rd(e, SDHCI_CLOCK) | CLOCK_CARD);
++	e->hz = divider ? e->base_hz / (2 * divider) : e->base_hz;
++	emmc_udelay(1000);
++	return 0;
++}
++
++/* One command. `response` gets 1 word (48-bit responses) or 4 (136-bit). Returns 0 or -1. */
++static int
++emmc_command(struct emmc *e, uint32_t index, uint32_t argument, uint32_t flags, uint32_t mode, uint32_t *response)
++{
++	uint32_t status, inhibit = PRESENT_CMD_INHIBIT;
++
++	if ((flags & 3) == RESP_48_BUSY || (flags & CMD_DATA)) {
++		inhibit |= PRESENT_DAT_INHIBIT;
++	}
++	if (emmc_wait(e, SDHCI_PRESENT, inhibit, 0, 100000) != 0) {
++		emmc_log("%s: CMD%u: the controller stays busy (%x)\n", e->name, index, hc_rd(e, SDHCI_PRESENT));
++		emmc_reset(e, RESET_CMD | RESET_DATA);
++		return -1;
++	}
++	hc_wr(e, SDHCI_INT_STATUS, 0xffffffffu);
++	hc_wr(e, SDHCI_ARGUMENT, argument);
++	hc_wr(e, SDHCI_COMMAND, (index << 8 | flags) << 16 | mode);
++	for (uint32_t waited = 0;; waited++) {
++		status = hc_rd(e, SDHCI_INT_STATUS);
++		if (status & (INT_COMMAND_DONE | INT_ERROR)) {
++			break;
++		}
++		if (waited >= 1000000) {
++			emmc_log("%s: CMD%u: no answer\n", e->name, index);
++			emmc_reset(e, RESET_CMD | RESET_DATA);
++			return -1;
++		}
++		emmc_udelay(1);
++	}
++	if (status & INT_ERROR) {
++		e->last_error = status & INT_ERRORS;
++		hc_wr(e, SDHCI_INT_STATUS, status);
++		emmc_reset(e, RESET_CMD | RESET_DATA);
++		return -1;
++	}
++	hc_wr(e, SDHCI_INT_STATUS, INT_COMMAND_DONE);
++	if (response != NULL) {
++		response[0] = hc_rd(e, SDHCI_RESPONSE);
++		if ((flags & 3) == RESP_136) {
++			response[1] = hc_rd(e, SDHCI_RESPONSE + 4);
++			response[2] = hc_rd(e, SDHCI_RESPONSE + 8);
++			response[3] = hc_rd(e, SDHCI_RESPONSE + 12);
++		}
++	}
++	if ((flags & 3) == RESP_48_BUSY) {
++		if (emmc_wait(e, SDHCI_INT_STATUS, INT_TRANSFER_DONE | INT_ERROR, INT_TRANSFER_DONE, 1000000) != 0 &&
++		    emmc_wait(e, SDHCI_PRESENT, PRESENT_DAT_INHIBIT, 0, 1000000) != 0) {
++			emmc_log("%s: CMD%u: the card stays busy\n", e->name, index);
++			return -1;
++		}
++		hc_wr(e, SDHCI_INT_STATUS, INT_TRANSFER_DONE);
++	}
++	return 0;
++}
++
++/*
++ * Data: `count` blocks of 512 bytes. Reads fill `buffer`, writes take from it. The words go through
++ * the data port as they come; a 32-bit buffer is not required (bytes are assembled).
++ */
++static int
++emmc_data(struct emmc *e, uint32_t index, uint32_t argument, uint32_t count, uint8_t *buffer, int write)
++{
++	uint32_t mode = (write ? 0 : MODE_READ) | MODE_BLOCK_COUNT, status;
++
++	if (count > 1) {
++		mode |= MODE_MULTI | MODE_AUTO_CMD12;
++	}
++	hc_wr(e, SDHCI_BLOCK, count << 16 | 512);
++	if (emmc_command(e, index, argument, R1 | CMD_DATA, mode, NULL) != 0) {
++		e->errors++;
++		return -1;
++	}
++	for (uint32_t block = 0; block < count; block++) {
++		uint32_t ready = write ? INT_WRITE_READY : INT_READ_READY;
++
++		for (uint32_t waited = 0;; waited++) {
++			status = hc_rd(e, SDHCI_INT_STATUS);
++			if (status & (ready | INT_ERROR)) {
++				break;
++			}
++			if (waited >= 2000000) {
++				emmc_log("%s: CMD%u: block %u of %u never came\n", e->name, index, block, count);
++				goto failed;
++			}
++			emmc_udelay(1);
++		}
++		if (status & INT_ERROR) {
++			e->last_error = status & INT_ERRORS;
++			emmc_log("%s: CMD%u: error %x at block %u of %u\n", e->name, index, e->last_error >> 16, block, count);
++			goto failed;
++		}
++		hc_wr(e, SDHCI_INT_STATUS, ready);
++		for (uint32_t i = 0; i < 512; i += 4) {
++			uint8_t *p = buffer + 512 * block + i;
++
++			if (write) {
++				hc_wr(e, SDHCI_DATA, (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24);
++			} else {
++				uint32_t word = hc_rd(e, SDHCI_DATA);
++
++				p[0] = (uint8_t)word;
++				p[1] = (uint8_t)(word >> 8);
++				p[2] = (uint8_t)(word >> 16);
++				p[3] = (uint8_t)(word >> 24);
++			}
++		}
++	}
++	if (emmc_wait(e, SDHCI_INT_STATUS, INT_TRANSFER_DONE, INT_TRANSFER_DONE, 2000000) != 0) {
++		emmc_log("%s: CMD%u: the transfer does not end\n", e->name, index);
++		goto failed;
++	}
++	hc_wr(e, SDHCI_INT_STATUS, INT_TRANSFER_DONE);
++	return 0;
++failed:
++	e->errors++;
++	hc_wr(e, SDHCI_INT_STATUS, 0xffffffffu);
++	emmc_reset(e, RESET_CMD | RESET_DATA);
++	if (count > 1) {
++		emmc_command(e, 12, 0, R1B, 0, NULL);  /* stop the card's transfer, if it is still in one */
++	}
++	return -1;
++}
++
++/* The SDCC1 clocks on, and the core clock at SDCC_CLOCK_HZ. */
++static void
++msm_clocks(struct emmc *e)
++{
++	if (e->gcc == 0) {
++		return;
++	}
++	emmc_wr32(e->gcc + GCC_SDCC1_AHB_CBCR, emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR) | CBCR_ENABLE);
++	/* GPLL0 / 16: the divider field is 2 * 16 - 1, no M/N */
++	emmc_wr32(e->gcc + GCC_SDCC1_CFG_RCGR, (2 * 16 - 1) | GPLL0_SOURCE << 8);
++	emmc_wr32(e->gcc + GCC_SDCC1_CMD_RCGR, emmc_rd32(e->gcc + GCC_SDCC1_CMD_RCGR) | RCGR_UPDATE);
++	for (int i = 0; i < 1000 && (emmc_rd32(e->gcc + GCC_SDCC1_CMD_RCGR) & RCGR_UPDATE); i++) {
++		emmc_udelay(1);
++	}
++	emmc_wr32(e->gcc + GCC_SDCC1_APPS_CBCR, emmc_rd32(e->gcc + GCC_SDCC1_APPS_CBCR) | CBCR_ENABLE);
++	for (int i = 0; i < 1000 && (emmc_rd32(e->gcc + GCC_SDCC1_APPS_CBCR) & CBCR_OFF); i++) {
++		emmc_udelay(1);
++	}
++	emmc_log("%s: clocks: ahb %x, apps %x, rcg %x\n", e->name, emmc_rd32(e->gcc + GCC_SDCC1_AHB_CBCR),
++	    emmc_rd32(e->gcc + GCC_SDCC1_APPS_CBCR), emmc_rd32(e->gcc + GCC_SDCC1_CFG_RCGR));
++}
++
++static int
++emmc_sd_identify(struct emmc *e, uint32_t *r)
++{
++	uint32_t ocr = 0;
++
++	e->sd = 1;
++	if (emmc_command(e, 8, 0x1aa, R1, 0, r) != 0 || (r[0] & 0xfff) != 0x1aa) {
++		emmc_log("%s: neither an eMMC nor a version 2 SD card answers\n", e->name);
++		return -1;
++	}
++	for (int tries = 0; tries < 1000; tries++) {
++		if (emmc_command(e, 55, 0, R1, 0, r) != 0 || emmc_command(e, 41, 0x40ff8000, R3, 0, r) != 0) {
++			return -1;
++		}
++		ocr = r[0];
++		if (ocr & 0x80000000u) {
++			break;
++		}
++		emmc_udelay(1000);
++	}
++	if (!(ocr & 0x80000000u)) {
++		emmc_log("%s: the SD card stays busy (OCR %x)\n", e->name, ocr);
++		return -1;
++	}
++	e->sectors_addressed = (ocr >> 30) & 1;
++	return 0;
++}
++
++/*
++ * Bring the controller and the card up, to the transfer state with the user area selected.
++ * Returns 0 or -1; what happened is in the log.
++ */
++static int
++emmc_init(struct emmc *e)
++{
++	uint32_t r[4], ocr = 0, caps;
++	static uint8_t ext_csd[512];
++
++	e->sd = 0;
++	e->errors = 0;
++	if (e->core != 0) {
++		msm_clocks(e);
++		hc_wr(e, MSM_VENDOR_SPEC, 0xa1c);                       /* as LK writes it first */
++		emmc_wr32(e->core + MSM_HC_MODE, emmc_rd32(e->core + MSM_HC_MODE) | 1u | 1u << 13);
++		emmc_log("%s: Qualcomm SDCC %x, SDHCI mode on\n", e->name, emmc_rd32(e->core + MSM_VERSION));
++	}
++	if (emmc_reset(e, RESET_ALL) != 0) {
++		return -1;
++	}
++	if (e->core != 0) {
++		/* a reset raises a request if the bus was on: acknowledged, then all four asked for */
++		msm_power_ack(e, 1000);
++		emmc_wr32(e->core + MSM_PWRCTL_MASK, 0xf);
++		/* the voltages are not in the SDHCI capabilities of this core: as LK says them (1.8 V) */
++		hc_wr(e, MSM_VENDOR_CAPS0, hc_rd(e, SDHCI_CAPS) | 1u << 26);
++	}
++	caps = hc_rd(e, SDHCI_CAPS);
++	e->base_hz = ((caps >> 8) & 0xff) * 1000000u;
++	if (e->core != 0 || e->base_hz == 0) {
++		e->base_hz = e->core != 0 ? SDCC_CLOCK_HZ : 50000000u;
++	}
++	emmc_log("%s: SDHCI version %u, capabilities %x, base clock %u Hz, present %x\n", e->name,
++	    ((hc_rd(e, SDHCI_VERSION) >> 16) & 0xff) + 1, caps, e->base_hz, hc_rd(e, SDHCI_PRESENT));
++
++	hc_wr(e, SDHCI_INT_ENABLE, 0xffffffffu & ~(1u << 8));         /* every status but the card interrupt; none signalled */
++	hc_wr(e, SDHCI_SIGNAL_ENABLE, 0);
++	/* bus power: 1.8 V for the Mi A1's eMMC (it signals at 1.8 V), 3.3 V for an SD card */
++	hc_wr(e, SDHCI_HOST_CONTROL, (hc_rd(e, SDHCI_HOST_CONTROL) & ~0xff00u) | (e->core ? POWER_180 : POWER_330));
++	hc_wr(e, SDHCI_HOST_CONTROL, hc_rd(e, SDHCI_HOST_CONTROL) | POWER_ON);
++	msm_power_ack(e, 10000);
++	emmc_udelay(10000);
++	if (emmc_set_clock(e, 400000) != 0) {
++		return -1;
++	}
++
++	emmc_command(e, 0, 0, RESP_NONE, 0, NULL);                      /* from sleep (or anything) to idle */
++	emmc_udelay(2000);
++	/* eMMC: CMD1 until it is ready; sector addressing, 1.7-1.95 V and 2.7-3.6 V */
++	for (int tries = 0; tries < 1000; tries++) {
++		if (emmc_command(e, 1, 0x40ff8080, R3, 0, r) != 0) {
++			break;
++		}
++		ocr = r[0];
++		if (ocr & 0x80000000u) {
++			break;
++		}
++		emmc_udelay(1000);
++	}
++	if (ocr & 0x80000000u) {
++		e->sectors_addressed = (ocr >> 30) & 1;
++	} else {
++		emmc_command(e, 0, 0, RESP_NONE, 0, NULL);
++		emmc_udelay(2000);
++		if (emmc_sd_identify(e, r) != 0) {
++			return -1;
++		}
++	}
++	if (emmc_command(e, 2, 0, R2, 0, e->cid) != 0) {
++		emmc_log("%s: CMD2 (CID) failed\n", e->name);
++		return -1;
++	}
++	if (e->sd) {
++		if (emmc_command(e, 3, 0, R1, 0, r) != 0) {
++			return -1;
++		}
++		e->rca = r[0] >> 16;
++	} else {
++		e->rca = 1;
++		if (emmc_command(e, 3, e->rca << 16, R1, 0, r) != 0) {
++			return -1;
++		}
++	}
++	if (emmc_command(e, 9, e->rca << 16, R2, 0, r) != 0) {
++		emmc_log("%s: CMD9 (CSD) failed\n", e->name);
++		return -1;
++	}
++	if (e->sd) {
++		/* CSD version 2: C_SIZE is bits 69:48 of the CSD, 61:40 of what SDHCI keeps (no CRC) */
++		uint64_t c_size = ((uint64_t)r[1] >> 8 | (uint64_t)r[2] << 24) & 0x3fffff;
++
++		e->sectors = (c_size + 1) * 1024;
++	}
++	if (emmc_command(e, 7, e->rca << 16, R1B, 0, r) != 0) {
++		emmc_log("%s: CMD7 (select) failed\n", e->name);
++		return -1;
++	}
++	if (emmc_set_clock(e, 25000000) != 0) {
++		return -1;
++	}
++	e->width = 1;
++	if (e->sd) {
++		if (emmc_command(e, 55, e->rca << 16, R1, 0, r) == 0 && emmc_command(e, 6, 2, R1, 0, r) == 0) {
++			hc_wr(e, SDHCI_HOST_CONTROL, hc_rd(e, SDHCI_HOST_CONTROL) | HOST_4BIT);
++			e->width = 4;
++		}
++	} else {
++		if (emmc_data(e, 8, 0, 1, ext_csd, 0) != 0) {
++			emmc_log("%s: CMD8 (EXT_CSD) failed\n", e->name);
++			return -1;
++		}
++		e->sectors = (uint32_t)ext_csd[EXT_CSD_SECTORS] | (uint32_t)ext_csd[EXT_CSD_SECTORS + 1] << 8 |
++		    (uint32_t)ext_csd[EXT_CSD_SECTORS + 2] << 16 | (uint32_t)ext_csd[EXT_CSD_SECTORS + 3] << 24;
++		emmc_log("%s: EXT_CSD revision %u, partition config %x, bus width %u, timing %u\n", e->name,
++		    ext_csd[EXT_CSD_REV], ext_csd[EXT_CSD_PARTITION_CONFIG], ext_csd[EXT_CSD_BUS_WIDTH], ext_csd[EXT_CSD_HS_TIMING]);
++		/* the user area, whatever the bootloader left selected (it reads the boot areas too) */
++		if (ext_csd[EXT_CSD_PARTITION_CONFIG] & 7) {
++			emmc_command(e, 6, 3u << 24 | EXT_CSD_PARTITION_CONFIG << 16 |
++			    (uint32_t)(ext_csd[EXT_CSD_PARTITION_CONFIG] & ~7u) << 8, R1B, 0, r);
++		}
++		/* 8 lines, then high speed timing at 50 MHz */
++		if (emmc_command(e, 6, 3u << 24 | EXT_CSD_BUS_WIDTH << 16 | 2u << 8, R1B, 0, r) == 0) {
++			hc_wr(e, SDHCI_HOST_CONTROL, (hc_rd(e, SDHCI_HOST_CONTROL) & ~HOST_4BIT) | HOST_8BIT);
++			e->width = 8;
++		}
++		if (emmc_command(e, 6, 3u << 24 | EXT_CSD_HS_TIMING << 16 | 1u << 8, R1B, 0, r) == 0) {
++			hc_wr(e, SDHCI_HOST_CONTROL, hc_rd(e, SDHCI_HOST_CONTROL) | HOST_HIGH_SPEED);
++			emmc_set_clock(e, 50000000);
++		}
++	}
++	if (!e->sectors_addressed && e->sd == 0 && e->sectors == 0) {
++		emmc_log("%s: a card of the old byte-addressed kind: not supported\n", e->name);
++		return -1;
++	}
++	emmc_command(e, 16, 512, R1, 0, r);                            /* ignored by high capacity cards */
++	if (emmc_command(e, 13, e->rca << 16, R1, 0, r) != 0) {
++		emmc_log("%s: CMD13 (status) failed\n", e->name);
++		return -1;
++	}
++	emmc_log("%s: %s ready: %llu MB, %u data lines at %u Hz, CID %x %x %x %x, status %x\n", e->name,
++	    e->sd ? "SD card" : "eMMC", (unsigned long long)(e->sectors / 2048), e->width, e->hz, e->cid[3], e->cid[2],
++	    e->cid[1], e->cid[0], r[0]);
++	return 0;
++}
++
++/* Read or write `count` sectors from `sector` on. */
++static int
++emmc_io(struct emmc *e, uint64_t sector, uint32_t count, uint8_t *buffer, int write)
++{
++	while (count > 0) {
++		uint32_t now = count > 2048 ? 2048 : count;
++		uint32_t argument = (uint32_t)(e->sectors_addressed ? sector : sector * 512);
++		int done = -1;
++
++		for (int attempt = 0; attempt < 3 && done != 0; attempt++) {
++			done = emmc_data(e, write ? (now > 1 ? 25 : 24) : (now > 1 ? 18 : 17), argument, now, buffer, write);
++		}
++		if (done != 0) {
++			return -1;
++		}
++		if (write) {
++			e->writes++;
++			e->written_sectors += now;
++		} else {
++			e->reads++;
++			e->read_sectors += now;
++		}
++		sector += now;
++		count -= now;
++		buffer += 512 * (uint64_t)now;
++	}
++	return 0;
++}
++
++/* ---- GPT --------------------------------------------------------------------------------------- */
++
++struct emmc_part {
++	char            name[37];
++	uint64_t        first, sectors;
++};
++
++/*
++ * Every partition of the GPT, to `each` (which returns nonzero to stop there). `sector` is a buffer
++ * of 512 bytes. Returns what `each` returned last, 0 at the end of the table, or -1.
++ */
++static int
++emmc_gpt_walk(struct emmc *e, uint8_t *sector, int (*each)(void *context, const struct emmc_part *part), void *context)
++{
++	uint64_t entries_lba = 0;
++	uint32_t entries, entry_size;
++	struct emmc_part part;
++
++	if (emmc_io(e, 1, 1, sector, 0) != 0) {
++		return -1;
++	}
++	if (sector[0] != 'E' || sector[1] != 'F' || sector[2] != 'I' || sector[3] != ' ' || sector[4] != 'P') {
++		emmc_log("%s: no GPT\n", e->name);
++		return -1;
++	}
++	for (int i = 7; i >= 0; i--) {
++		entries_lba = entries_lba << 8 | sector[72 + i];
++	}
++	entries = (uint32_t)sector[80] | (uint32_t)sector[81] << 8 | (uint32_t)sector[82] << 16 | (uint32_t)sector[83] << 24;
++	entry_size = (uint32_t)sector[84] | (uint32_t)sector[85] << 8;
++	if (entry_size < 128 || entry_size > 512 || 512 % entry_size != 0 || entries > 1024) {
++		emmc_log("%s: a GPT this code does not read (%u entries of %u bytes)\n", e->name, entries, entry_size);
++		return -1;
++	}
++	for (uint32_t n = 0; n < entries; n++) {
++		uint32_t at = (n * entry_size) % 512;
++		uint64_t first = 0, last = 0;
++		const uint8_t *p;
++		int i, stop;
++
++		if (at == 0 && emmc_io(e, entries_lba + n * entry_size / 512, 1, sector, 0) != 0) {
++			return -1;
++		}
++		p = sector + at;
++		for (i = 7; i >= 0; i--) {
++			first = first << 8 | p[32 + i];
++			last = last << 8 | p[40 + i];
++		}
++		if (first == 0 || last < first) {
++			continue;               /* an unused entry */
++		}
++		for (i = 0; i < 36; i++) {
++			part.name[i] = p[57 + 2 * i] != 0 ? '?' : (char)p[56 + 2 * i];
++		}
++		part.name[36] = 0;
++		part.first = first;
++		part.sectors = last - first + 1;
++		stop = each(context, &part);
++		if (stop != 0) {
++			return stop;
++		}
++	}
++	return 0;
++}
++
++struct emmc_find {
++	const char *            name;
++	struct emmc_part *      part;
++};
++
++static int
++emmc_find_each(void *context, const struct emmc_part *part)
++{
++	struct emmc_find *find = context;
++	int i;
++
++	for (i = 0; find->name[i] != 0 && find->name[i] == part->name[i]; i++) {
++	}
++	if (find->name[i] != 0 || part->name[i] != 0) {
++		return 0;
++	}
++	*find->part = *part;
++	return 1;
++}
++
++/* A partition by name (ASCII, against the GPT's UTF-16 name). Returns 0 and fills `part`, or -1. */
++static int
++emmc_find_partition(struct emmc *e, const char *name, struct emmc_part *part, uint8_t *sector)
++{
++	struct emmc_find find = { .name = name, .part = part };
++	int found = emmc_gpt_walk(e, sector, emmc_find_each, &find);
++
++	if (found == 0) {
++		emmc_log("%s: no partition named %s\n", e->name, name);
++	}
++	return found == 1 ? 0 : -1;
++}
++
++#endif
 diff --git a/xnu/files/bsd/dev/redwood_tissot_touch.c b/xnu/files/bsd/dev/redwood_tissot_touch.c
 new file mode 100644
 index 0000000..ec68b89
@@ -911,16 +2122,33 @@ index 0000000..ec68b89
 +		thread_deallocate(thread);
 +	}
 +}
+diff --git a/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c b/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c
+index 8f0ed38..007a3df 100644
+--- a/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c
++++ b/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c
+@@ -1120,7 +1120,8 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
+ 		dev_t rdev = vnode_specrdev(devvp);
+ 		uint32_t cheap;
+ 
+-		am->am_nx.cheap_requests = !redwood_ufs_dev(rdev) && !redwood_virtio_blk_dev(rdev);
++		am->am_nx.cheap_requests = !redwood_ufs_dev(rdev) && !redwood_virtio_blk_dev(rdev) &&
++		    !redwood_tissot_emmc_dev(rdev);
+ 		if (PE_parse_boot_argn("apfs_cheap", &cheap, sizeof(cheap))) {
+ 			am->am_nx.cheap_requests = (cheap != 0);
+ 		}
 diff --git a/xnu/files/bsd/sys/redwood_input.h b/xnu/files/bsd/sys/redwood_input.h
-index bb8ad1b..dac71cd 100644
+index bb8ad1b..c2ca3c3 100644
 --- a/xnu/files/bsd/sys/redwood_input.h
 +++ b/xnu/files/bsd/sys/redwood_input.h
-@@ -48,6 +48,9 @@ bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */
+@@ -48,6 +48,12 @@ bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */
  void redwood_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
  int redwood_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
  /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/redwood_buttons.c) */
 +void redwood_tissot_touch_init(void);   /* boot-arg tissot=1: the Mi A1's FocalTech touch screen */
 +void redwood_tissot_buttons_init(void); /* boot-arg tissot=1: the Mi A1's power and volume keys */
++void redwood_tissot_emmc_init(void);    /* boot-arg tissot=1: the Mi A1's eMMC (/dev/emmc_NAME); emmc_pci=1: QEMU's sdhci-pci */
++void redwood_tissot_emmc_report(void);
++bool redwood_tissot_emmc_dev(dev_t dev);    /* one of the eMMC's devices */
 +const char *redwood_tissot_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count);
  void redwood_spmi_lock(void);
  void redwood_spmi_unlock(void);
@@ -1172,7 +2400,7 @@ index 63ffd4b..7f6ed1d 100644
  	}
  
 diff --git a/xnu/redwood.patch b/xnu/redwood.patch
-index 8f7dd87..f7cb451 100644
+index 8f7dd87..50e0d11 100644
 --- a/xnu/redwood.patch
 +++ b/xnu/redwood.patch
 @@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
@@ -1180,50 +2408,119 @@ index 8f7dd87..f7cb451 100644
   
  diff --git a/bsd/conf/files b/bsd/conf/files
 -index 44274016a4cf..9cd24b42caca 100644
-+index 44274016a4cf..4311189cc400 100644
++index 44274016a4cf..3e44e4a7c14b 100644
  --- a/bsd/conf/files
  +++ b/bsd/conf/files
 -@@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
-+@@ -109,6 +109,39 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
++@@ -109,6 +109,40 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
   bsd/dev/unix_startup.c			standard
   
   bsd/dev/monotonic.c optional monotonic
-@@ -73,6 +73,8 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -73,6 +73,9 @@ index 44274016a4cf..9cd24b42caca 100644
  +bsd/dev/redwood_virtio_input.c	standard
  +bsd/dev/redwood_goodix.c	standard
  +bsd/dev/redwood_buttons.c	standard
 ++bsd/dev/redwood_tissot_touch.c	standard
+++bsd/dev/redwood_tissot_emmc.c	standard
 ++bsd/dev/redwood_tissot_buttons.c	standard
  +bsd/dev/redwood_battery.c	standard
  +bsd/dev/redwood_ufs.c	standard
  +bsd/dev/redwood_ufshc.c	standard
-@@ -103,7 +105,7 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -103,7 +106,7 @@ index 44274016a4cf..9cd24b42caca 100644
   bsd/dev/dev_perfmon.c optional config_perfmon
   
   bsd/libkern/crc32.c			standard
 -@@ -155,6 +186,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
-+@@ -155,6 +188,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
++@@ -155,6 +189,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
   bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
   bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
   bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
-@@ -118,7 +120,7 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -118,7 +121,7 @@ index 44274016a4cf..9cd24b42caca 100644
   
   bsd/miscfs/routefs/routefs_ops.c	optional routefs
   
 -@@ -361,6 +400,7 @@ bsd/security/audit/audit_syscalls.c		standard
-+@@ -361,6 +402,7 @@ bsd/security/audit/audit_syscalls.c		standard
++@@ -361,6 +403,7 @@ bsd/security/audit/audit_syscalls.c		standard
   bsd/security/audit/audit_worker.c		optional config_audit
   
   bsd/pthread/pthread_shims.c		standard
-@@ -126,7 +128,7 @@ index 44274016a4cf..9cd24b42caca 100644
+@@ -126,7 +129,7 @@ index 44274016a4cf..9cd24b42caca 100644
   bsd/pthread/pthread_priority.c		standard
   bsd/pthread/pthread_workqueue.c		standard
   
 -@@ -383,6 +423,7 @@ bsd/kern/kern_debug.c			standard
-+@@ -383,6 +425,7 @@ bsd/kern/kern_debug.c			standard
++@@ -383,6 +426,7 @@ bsd/kern/kern_debug.c			standard
   bsd/kern/kern_symfile.c			standard
   bsd/kern/kern_descrip.c			standard
   bsd/kern/kern_guarded.c			standard
+@@ -1680,10 +1683,18 @@ index 2b14eda8f68f..09337bad5b01 100644
+ +#endif
+      ")";
+ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+-index 5219fb0d9ed6..29978e9cff43 100644
++index 5219fb0d9ed6..792e258dcabb 100644
+ --- a/iokit/bsddev/IOKitBSDInit.cpp
+ +++ b/iokit/bsddev/IOKitBSDInit.cpp
+-@@ -683,7 +683,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++@@ -62,6 +62,7 @@ extern "C" {
++ 
++ extern dev_t mdevadd(int devid, uint64_t base, unsigned int size, int phys);
++ extern dev_t mdevlookup(int devid);
+++extern dev_t redwood_tissot_emmc_root(const char *name);
++ extern void mdevremoveall(void);
++ extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
++ extern void di_root_ramfile(IORegistryEntry * entry);
++@@ -683,7 +684,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+  	assert(matching);
+  	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
+  
+@@ -1699,7 +1710,7 @@ index 5219fb0d9ed6..29978e9cff43 100644
+  		OSSafeReleaseNULL(service);
+  	} else {
+  		IOLog("!BSD\n");
+-@@ -762,6 +769,17 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++@@ -762,10 +770,48 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+  #endif /* __LP64__ */
+  				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
+  			}
+@@ -1717,6 +1728,37 @@ index 5219fb0d9ed6..29978e9cff43 100644
+  			regEntry->release();                                                            /* Toss the entry */
+  		}
+  	}
++ 
+++	/*
+++	 * The Mi A1's eMMC (bsd/dev/redwood_tissot_emmc.c): emmc_root=NAME, a GPT partition, is the
+++	 * root -- a disk with no IOKit storage stack above it, so nothing IOMedia matching would find.
+++	 * rd= stays md0: the kernel (bsd_rooted_ramdisk) and launchd treat the boot as a RAM disk
+++	 * boot from that, which is what this port's images are made for (unsealed, no boot tasks of
+++	 * a real device).
+++	 */
+++	{
+++		char emmcName[kMaxBootVar];
+++
+++		if (PE_parse_boot_argn("emmc_root", emmcName + 5, sizeof(emmcName) - 5)) {
+++			dev_t emmcRoot;
+++
+++			memcpy(emmcName, "emmc_", 5);
+++			emmcRoot = redwood_tissot_emmc_root(emmcName);
+++			if (emmcRoot == NODEV) {
+++				panic("IOFindBSDRoot: no eMMC partition %s for the root", emmcName);
+++			}
+++			OSSafeReleaseNULL(matching);
+++			*root = emmcRoot;
+++			strlcpy(rootName, emmcName, rootNameSize);
+++			*oflags = 0;
+++			IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
+++			goto iofrootx;
+++		}
+++	}
+++
++ //
++ //	Now check if we are trying to root on a memory device
++ //
+ diff --git a/iokit/conf/files b/iokit/conf/files
+ index 5fb0a52062e0..6c430c2b23c7 100644
+ --- a/iokit/conf/files
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
 index 640b05d..4a2d74b 100644
 --- a/xnuloader/loader.c
