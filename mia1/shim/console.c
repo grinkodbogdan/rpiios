@@ -86,14 +86,34 @@ void
 keep_start(void)
 {
 	if (keep->magic == KEEP_MAGIC && keep->len > 0 && keep->len <= KEEP_BYTES) {
-		uint64_t from = keep->len > 1500 ? keep->len - 1500 : 0;
+		uint64_t from = keep->len > 1800 ? keep->len - 1800 : 0, hz = READ_SYSREG(cntfrq_el0), t;
 
+		/* what the kernel said, if it got that far: everything after the loader's last line */
+		for (uint64_t i = 0; i + 10 < keep->len; i++) {
+			if (keep->text[i] == 'j' && keep->text[i + 1] == 'u' && keep->text[i + 2] == 'm' &&
+			    keep->text[i + 3] == 'p' && keep->text[i + 4] == 'i' && keep->text[i + 5] == 'n' &&
+			    keep->text[i + 6] == 'g' && keep->text[i + 7] == ' ' && keep->text[i + 8] == 't' &&
+			    keep->text[i + 9] == 'o') {
+				from = i;
+			}
+		}
+		if (keep->len - from > 1800) {
+			from = keep->len - 1800;
+		}
 		text_colour = 0xffd040;
 		say("--- the run before this one ended with: ---\n");
 		for (uint64_t i = from; i < keep->len; i++) {
 			put_raw(keep->text[i]);
 		}
 		say("\n--- (end) ---\n");
+		/* time for a photograph */
+		for (int left = 30; left > 0; left--) {
+			say("%d ", left);
+			t = READ_SYSREG(cntpct_el0);
+			while (READ_SYSREG(cntpct_el0) - t < hz) {
+			}
+		}
+		say("\n");
 		text_colour = 0xffffff;
 	}
 	keep->magic = KEEP_MAGIC;
