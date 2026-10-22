@@ -1,0 +1,17 @@
+/*
+ * The device tree appended to the shim. aboot picks an appended tree by these
+ * IDs (the ones lk2nd and mainline Linux use for the Mi A1), then fills in
+ * /memory and /chosen before starting the image.
+ */
+/dts-v1/;
+/ {
+	model = "Xiaomi Mi A1 (rpiios shim)";
+	compatible = "xiaomi,tissot", "qcom,msm8953";
+	qcom,msm-id = <293 0>;
+	qcom,board-id = <0x1000b 0>;
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	chosen { };
+	memory@0 { device_type = "memory"; reg = <0 0 0 0>; };
+};
