@@ -101,9 +101,9 @@ shim_main(const void *fdt, uint64_t loaded_at)
 		    (unsigned long long)(banks[i].base + banks[i].size), (unsigned long long)(banks[i].size >> 20));
 		total += banks[i].size;
 	}
+	say("  %llu MB in all\n", (unsigned long long)(total >> 20));
 #ifndef SHIM_UART
-	say("  %llu MB in all; watchdog: %x %x (off)\n", (unsigned long long)(total >> 20),
-	    *(volatile uint32_t *)(WDOG_BASE + 0x04), *(volatile uint32_t *)(WDOG_BASE + 0x08));
+	say("watchdog: %x %x (off)\n", *(volatile uint32_t *)(WDOG_BASE + 0x04), *(volatile uint32_t *)(WDOG_BASE + 0x08));
 #endif
 	if (fdt_initrd(fdt, &initrd, &initrd_end) != 0) {
 		stop("aboot gave no ramdisk (no linux,initrd-start in /chosen)\n");
