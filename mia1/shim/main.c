@@ -138,17 +138,62 @@ gic_state(const char *when)
 	    READ_SYSREG(cntfrq_el0), READ_SYSREG(daif));
 }
 
+/* One timer's interrupt (PPI `ppi`), polled at the CPU interface for up to a second. */
+static void
+timer_try(const char *name, uint32_t ppi, int physical)
+{
+	uint64_t hz = READ_SYSREG(cntfrq_el0), t;
+	uint32_t iar = 1023, istatus = 0, pending = 0, enabled;
+
+	R32(GICD + 0x400 + ppi / 4 * 4) = (R32(GICD + 0x400 + ppi / 4 * 4) & ~(0xffu << (ppi % 4 * 8))) | 0xa0u << (ppi % 4 * 8);
+	R32(GICD + 0x100) = 1u << ppi;
+	__asm__ volatile("dsb sy; isb");
+	enabled = R32(GICD + 0x100);
+	say("%s (PPI %u): enable written, ISENABLER0 now %x: %s\n", name, ppi, enabled,
+	    enabled & 1u << ppi ? "it took" : "IGNORED (not ours)");
+	if (physical) {
+		WRITE_SYSREG(cntp_tval_el0, hz / 10);
+		WRITE_SYSREG(cntp_ctl_el0, 1);
+	} else {
+		WRITE_SYSREG(cntv_tval_el0, hz / 10);
+		WRITE_SYSREG(cntv_ctl_el0, 1);
+	}
+	__asm__ volatile("isb");
+	t = READ_SYSREG(cntpct_el0);
+	while (READ_SYSREG(cntpct_el0) - t < hz) {
+		uint64_t ctl = physical ? READ_SYSREG(cntp_ctl_el0) : READ_SYSREG(cntv_ctl_el0);
+
+		if (ctl & 4) {
+			istatus++;
+		}
+		if (R32(GICD + 0x200) & 1u << ppi) {
+			pending++;
+		}
+		if (istatus > 0) {
+			iar = R32(GICC + 0xc);
+			if ((iar & 0x3ff) < 1020) {
+				break;
+			}
+		}
+	}
+	if ((iar & 0x3ff) < 1020) {
+		R32(GICC + 0x10) = iar;
+	}
+	if (physical) {
+		WRITE_SYSREG(cntp_ctl_el0, 2);
+	} else {
+		WRITE_SYSREG(cntv_ctl_el0, 2);
+	}
+	say("%s: fired %u, pending in the distributor %u, IAR %x: %s\n", name, istatus, pending, iar,
+	    (iar & 0x3ff) == ppi ? "THE INTERRUPT ARRIVES" : (iar & 0x3ff) == 1022 ? "a secure interrupt is pending" :
+	    (iar & 0x3ff) < 1020 ? "another interrupt arrived" : "NOTHING ARRIVES");
+}
+
 static void
 gictest(void)
 {
-	uint64_t hz = READ_SYSREG(cntfrq_el0), t;
-	uint32_t iar = 1023, seen_pending = 0, seen_istatus = 0;
-
-	say("GIC test: the virtual timer's interrupt through the GICv2, polled\n");
+	say("GIC test: the two EL1 timers' interrupts through the GICv2, polled\n");
 	gic_state("as LK left it");
-	/* as the kernel does it, but with 32-bit accesses */
-	R32(GICD + 0x418) = (R32(GICD + 0x418) & ~(0xffu << 24)) | 0xa0u << 24;      /* priority of 27 */
-	R32(GICD + 0x100) = 1u << 27;                                                 /* enable 27 */
 	if (!(R32(GICD) & 1)) {
 		R32(GICD) = 1;
 	}
@@ -159,34 +204,10 @@ gictest(void)
 	R32(GICC + 8) = 0;
 	R32(GICC) = 1;
 	__asm__ volatile("dsb sy; isb");
-	/* the timer: 100 ms from now */
-	WRITE_SYSREG(cntv_tval_el0, hz / 10);
-	WRITE_SYSREG(cntv_ctl_el0, 1);
-	__asm__ volatile("isb");
-	gic_state("set up, timer armed");
-	t = READ_SYSREG(cntpct_el0);
-	while (READ_SYSREG(cntpct_el0) - t < hz) {
-		if (READ_SYSREG(cntv_ctl_el0) & 4) {
-			seen_istatus++;
-		}
-		if (R32(GICD + 0x200) & 1u << 27) {
-			seen_pending++;
-		}
-		if (seen_istatus > 0) {
-			iar = R32(GICC + 0xc);
-			if ((iar & 0x3ff) < 1020) {
-				break;
-			}
-		}
-	}
-	gic_state("after up to 1 s");
-	say("timer fired (ISTATUS) %u times, 27 pending in the distributor %u times, IAR %x: %s\n", seen_istatus,
-	    seen_pending, iar, (iar & 0x3ff) == 27 ? "THE INTERRUPT ARRIVES" : (iar & 0x3ff) == 1022 ?
-	    "a group 0 (secure) interrupt is pending: 27 is not ours" : "NOTHING ARRIVES");
-	if ((iar & 0x3ff) < 1020) {
-		R32(GICC + 0x10) = iar;
-	}
-	WRITE_SYSREG(cntv_ctl_el0, 2);
+	timer_try("virtual timer", 27, 0);
+	say("next: the physical timer (if its registers are not ours, an exception is shown)\n");
+	timer_try("physical timer", 30, 1);
+	gic_state("at the end");
 	stop("GIC test done\n");
 }
 #endif
