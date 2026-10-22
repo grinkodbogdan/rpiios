@@ -13,15 +13,31 @@ iOS 16.5's user space ran there with no illegal-instruction faults.
 
 ## Files
 
-- `a53-kernel.py`: patches HackiOS's prebuilt kernel for ARMv8.0 (PAN writes -> NOP, PAN
-  reads -> "set"). Its LSE atomics are only in the ath11k Wi-Fi driver.
-- `hackios-xnu-kernel.diff`: local changes to their kernel repo:
-  - `xnuloader/loader.c`: the ramfb completion check read a non-volatile copy of the DMA
-    control word, so the loader kept the firmware's 800x600 mode while QEMU showed its new
-    1125x2436 buffer (black screen with Ubuntu's AAVMF firmware);
-  - `qemu/run.sh`: `QEMU_CPU` selects the CPU model (default cortex-a76).
+- `hackios-xnu-kernel.diff`: changes to their kernel repo (`git apply` in a fresh checkout):
+  - `xnuloader/loader.c`:
+    - on a core without PAN (ARMv8.0: Cortex-A53) the loader patches the kernel's PAN
+      instructions out of `__TEXT_EXEC` in memory before starting it (writes -> NOP, reads ->
+      "PAN set"); one kernel then runs on both kinds of core;
+    - a core without the GICv3 system-register interface gets a GICv2 described in the
+      device tree (`arm,gic-v2`; second range = the CPU interface, `gic_cpu` per platform);
+    - the ramfb completion check read a non-volatile copy of the DMA control word, so the
+      loader kept the firmware's 800x600 mode while QEMU showed its new 1125x2436 buffer
+      (black screen with Ubuntu's AAVMF firmware);
+  - `xnu/files/osfmk/arm64/gic_v3_irq.c`: GICv2 (the Mi A1's Snapdragon 625 has one): banked
+    distributor for SGIs/PPIs, memory-mapped CPU interface, `GICD_ITARGETSR` routing,
+    `GICD_SGIR` signals; chosen at run time from `ID_AA64PFR0_EL1.GIC`;
+  - `qemu/run.sh`: `QEMU_CPU` and `QEMU_GIC` select the CPU model and GIC version.
+- `a53-kernel.py`: the same PAN patch applied to a kernel file (for their prebuilt kernel with
+  an unmodified loader). Its LSE atomics are only in the ath11k Wi-Fi driver.
 - `hackios-xnu-userland.diff`: `userland/build.sh` builds on hosts without `timedatectl`
   and with a prebuilt set that lacks the `drawable_test` program.
+
+## Building the kernel here
+
+Their `xnu/README.md` steps work on Ubuntu with: theos in `~/theos` with the Linux iOS toolchain
+(`L1ghtmann/llvm-project` release `iOSToolchain-x86_64.tar.xz` in `toolchain/`) and
+`iPhoneOS16.5.sdk` from `theos/sdks` in `sdks/`; and GNU awk as `awk` (with mawk XNU's
+`makesyscalls.sh` writes a broken `init_sysent.c`).
 
 ## Reproduce
 
