@@ -32,6 +32,27 @@ static const struct region firmware[] = {
 	{ 0x9ff00000, 0x00100000, 0, "persistent log" },
 };
 
+/*
+ * The application processor's watchdog (APSS WDOG, 0x0b017000): aboot enables it, bite after 10 s
+ * (LK platform/msm_shared/wdog.c, msm_wdog_init), and leaves the feeding to the kernel it starts
+ * (Linux's msm_watchdog). Nothing here or in XNU feeds it: switched off. LK's msm8952 headers say
+ * the enable bit is at +0x04 and the pet at +0x08, Linux's driver the other way round: 0 to both
+ * disables it either way, and the bite time goes to its maximum besides.
+ */
+#define WDOG_BASE       0x0b017000UL
+
+static void
+watchdog_off(void)
+{
+#ifdef SHIM_UART
+	return;                 /* QEMU: nothing there */
+#endif
+	*(volatile uint32_t *)(WDOG_BASE + 0x04) = 0;
+	*(volatile uint32_t *)(WDOG_BASE + 0x08) = 0;
+	*(volatile uint32_t *)(WDOG_BASE + 0x10) = 0xfffff;
+	*(volatile uint32_t *)(WDOG_BASE + 0x14) = 0xfffff;
+}
+
 struct container_entry {
 	char name[16];
 	uint64_t offset, size;
@@ -64,6 +85,7 @@ shim_main(const void *fdt, uint64_t loaded_at)
 	uint64_t initrd = 0, initrd_end = 0, total = 0, largest, largest_size, payload_at;
 	int nbanks, nreserved = 0;
 
+	watchdog_off();
 	nbanks = fdt_memory(fdt, banks, 16);
 	if (nbanks <= 0) {
 		/* nothing to go by: the region aboot itself runs in, which is RAM on every MSM8953 */
@@ -79,7 +101,10 @@ shim_main(const void *fdt, uint64_t loaded_at)
 		    (unsigned long long)(banks[i].base + banks[i].size), (unsigned long long)(banks[i].size >> 20));
 		total += banks[i].size;
 	}
-	say("  %llu MB in all\n", (unsigned long long)(total >> 20));
+#ifndef SHIM_UART
+	say("  %llu MB in all; watchdog: %x %x (off)\n", (unsigned long long)(total >> 20),
+	    *(volatile uint32_t *)(WDOG_BASE + 0x04), *(volatile uint32_t *)(WDOG_BASE + 0x08));
+#endif
 	if (fdt_initrd(fdt, &initrd, &initrd_end) != 0) {
 		stop("aboot gave no ramdisk (no linux,initrd-start in /chosen)\n");
 	}
