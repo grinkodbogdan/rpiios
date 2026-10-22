@@ -116,6 +116,81 @@ memprobe(void)
 }
 #endif
 
+#ifdef GICTEST
+/*
+ * mia1-gictest.img: does the virtual timer's interrupt (PPI 27) reach this processor through the
+ * GICv2 at all, set up the way the kernel sets it up (osfmk/arm64/gic_v3_irq.c, gic_v2_cpu_init)?
+ * The kernel stops at its first wait for a timer. Everything here is on the screen, then a stop.
+ */
+#define GICD            0x0b000000UL
+#define GICC            0x0b002000UL
+#define R32(a)          (*(volatile uint32_t *)(a))
+
+static void
+gic_state(const char *when)
+{
+	say("%s: GICD CTLR %x TYPER %x IIDR %x IGROUPR0 %x ISENABLER0 %x ISPENDR0 %x ISACTIVER0 %x\n", when, R32(GICD),
+	    R32(GICD + 4), R32(GICD + 8), R32(GICD + 0x80), R32(GICD + 0x100), R32(GICD + 0x200), R32(GICD + 0x300));
+	say("  IPRIORITYR[24..27] %x ITARGETSR[0..3] %x ICFGR1 %x; GICC CTLR %x PMR %x BPR %x RPR %x HPPIR %x IIDR %x\n",
+	    R32(GICD + 0x418), R32(GICD + 0x800), R32(GICD + 0xc04), R32(GICC), R32(GICC + 4), R32(GICC + 8),
+	    R32(GICC + 0x14), R32(GICC + 0x18), R32(GICC + 0xfc));
+	say("  CNTV_CTL %llx CNTKCTL %llx CNTFRQ %llu DAIF %llx\n", READ_SYSREG(cntv_ctl_el0), READ_SYSREG(cntkctl_el1),
+	    READ_SYSREG(cntfrq_el0), READ_SYSREG(daif));
+}
+
+static void
+gictest(void)
+{
+	uint64_t hz = READ_SYSREG(cntfrq_el0), t;
+	uint32_t iar = 1023, seen_pending = 0, seen_istatus = 0;
+
+	say("GIC test: the virtual timer's interrupt through the GICv2, polled\n");
+	gic_state("as LK left it");
+	/* as the kernel does it, but with 32-bit accesses */
+	R32(GICD + 0x418) = (R32(GICD + 0x418) & ~(0xffu << 24)) | 0xa0u << 24;      /* priority of 27 */
+	R32(GICD + 0x100) = 1u << 27;                                                 /* enable 27 */
+	if (!(R32(GICD) & 1)) {
+		R32(GICD) = 1;
+	}
+	for (int i = 0; i < 4; i++) {
+		R32(GICC + 0xd0 + 4 * i) = 0;
+	}
+	R32(GICC + 4) = 0xff;
+	R32(GICC + 8) = 0;
+	R32(GICC) = 1;
+	__asm__ volatile("dsb sy; isb");
+	/* the timer: 100 ms from now */
+	WRITE_SYSREG(cntv_tval_el0, hz / 10);
+	WRITE_SYSREG(cntv_ctl_el0, 1);
+	__asm__ volatile("isb");
+	gic_state("set up, timer armed");
+	t = READ_SYSREG(cntpct_el0);
+	while (READ_SYSREG(cntpct_el0) - t < hz) {
+		if (READ_SYSREG(cntv_ctl_el0) & 4) {
+			seen_istatus++;
+		}
+		if (R32(GICD + 0x200) & 1u << 27) {
+			seen_pending++;
+		}
+		if (seen_istatus > 0) {
+			iar = R32(GICC + 0xc);
+			if ((iar & 0x3ff) < 1020) {
+				break;
+			}
+		}
+	}
+	gic_state("after up to 1 s");
+	say("timer fired (ISTATUS) %u times, 27 pending in the distributor %u times, IAR %x: %s\n", seen_istatus,
+	    seen_pending, iar, (iar & 0x3ff) == 27 ? "THE INTERRUPT ARRIVES" : (iar & 0x3ff) == 1022 ?
+	    "a group 0 (secure) interrupt is pending: 27 is not ours" : "NOTHING ARRIVES");
+	if ((iar & 0x3ff) < 1020) {
+		R32(GICC + 0x10) = iar;
+	}
+	WRITE_SYSREG(cntv_ctl_el0, 2);
+	stop("GIC test done\n");
+}
+#endif
+
 struct container_entry {
 	char name[16];
 	uint64_t offset, size;
@@ -158,6 +233,9 @@ shim_main(const void *fdt, uint64_t loaded_at)
 	mmu_on(banks, nbanks);
 	display_init();
 	keep_start();
+#ifdef GICTEST
+	gictest();
+#endif
 	say("rpiios Mi A1 shim at %llx, EL%llu, timer %llu Hz, device tree at %p\n", (unsigned long long)loaded_at,
 	    (unsigned long long)(READ_SYSREG(CurrentEL) >> 2), (unsigned long long)READ_SYSREG(cntfrq_el0), fdt);
 	for (int i = 0; i < nbanks; i++) {

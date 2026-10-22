@@ -54,6 +54,12 @@ if [ -n "${WDT_TESTS:-}" ]; then
 	done
 	exit 0
 fi
+if [ -n "${GICTEST:-}" ]; then
+	SHIM_CFLAGS="-DGICTEST" GICTEST= "$0" "$out/gictest" "$hack" >/dev/null
+	cp "$out/gictest/mia1-ios.img" "$out/mia1-gictest.img"
+	echo "shim: $out/mia1-gictest.img"
+	exit 0
+fi
 if [ -n "${STEPS:-}" ]; then
 	SHIM_CFLAGS="-DSTEPS" STEPS= "$0" "$out/steps" "$hack" >/dev/null
 	cp "$out/steps/mia1-ios.img" "$out/mia1-steps.img"
