@@ -416,10 +416,10 @@ index 0000000..0f707cb
 +}
 diff --git a/xnu/files/bsd/dev/redwood_tissot_emmc.c b/xnu/files/bsd/dev/redwood_tissot_emmc.c
 new file mode 100644
-index 0000000..2554e7d
+index 0000000..40ac06a
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_emmc.c
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,590 @@
 +/*
 + * The Mi A1's storage (tissot: 64 GB of eMMC on the Snapdragon 625's SDCC1): a block device and a
 + * character device for the whole of it and for every GPT partition -- /dev/emmc, /dev/emmc_NAME
@@ -464,6 +464,7 @@ index 0000000..2554e7d
 +#include <sys/redwood_input.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void IOSleep(unsigned int milliseconds);
 +
 +void redwood_tissot_log(const char *format, ...) __printflike(1, 2);
 +
@@ -922,9 +923,21 @@ index 0000000..2554e7d
 +	}
 +	bounce = kalloc_data(BOUNCE_BYTES, Z_WAITOK);
 +	lck_mtx_lock(&emmc_lock);
-+	if (bounce == NULL || emmc_init(&emmc) != 0) {
++	/* it has come up on the first try and failed on another: up to three, the whole of it each time */
++	for (int attempt = 1; bounce != NULL; attempt++) {
++		if (emmc_init(&emmc) == 0) {
++			break;
++		}
++		if (attempt == 3) {
++			lck_mtx_unlock(&emmc_lock);
++			emmc_log("no storage\n");
++			return;
++		}
++		emmc_log("attempt %d failed: again, from the start\n", attempt);
++		IOSleep(100);
++	}
++	if (bounce == NULL) {
 +		lck_mtx_unlock(&emmc_lock);
-+		printf("tissot-emmc: no storage\n");
 +		return;
 +	}
 +	strlcpy(parts[0].name, "(whole)", sizeof(parts[0].name));
@@ -999,10 +1012,10 @@ index 0000000..2554e7d
 +}
 diff --git a/xnu/files/bsd/dev/redwood_tissot_emmc_core.h b/xnu/files/bsd/dev/redwood_tissot_emmc_core.h
 new file mode 100644
-index 0000000..1441783
+index 0000000..5cd2ae9
 --- /dev/null
 +++ b/xnu/files/bsd/dev/redwood_tissot_emmc_core.h
-@@ -0,0 +1,711 @@
+@@ -0,0 +1,717 @@
 +/*
 + * eMMC (and SD) over an SDHCI controller, by programmed I/O: what the Mi A1's boot shim and its
 + * kernel driver (bsd/dev/redwood_tissot_emmc.c, which carries a copy of this file) both use to
@@ -1137,7 +1150,7 @@ index 0000000..1441783
 +	uint32_t        hz;
 +	uint32_t        cid[4];
 +	/* how it has gone */
-+	uint64_t        reads, read_sectors, writes, written_sectors, errors;
++	uint64_t        reads, read_sectors, writes, written_sectors, errors, power_acks;
 +	uint32_t        last_error;     /* SDHCI's error bits of the last failure */
 +	uint32_t        base_hz;
 +};
@@ -1179,9 +1192,9 @@ index 0000000..1441783
 +	if (e->core == 0) {
 +		return;
 +	}
-+	for (uint32_t waited = 0; waited < us; waited += 10) {
++	for (uint32_t waited = 0;; waited += 10) {
 +		status = emmc_rd32(e->core + MSM_PWRCTL_STATUS);
-+		if (status != 0) {
++		if (status != 0 || waited >= us) {
 +			break;
 +		}
 +		emmc_udelay(10);
@@ -1191,6 +1204,7 @@ index 0000000..1441783
 +	}
 +	emmc_wr32(e->core + MSM_PWRCTL_CLEAR, status);
 +	emmc_wr32(e->core + MSM_PWRCTL_CTL, ((status & 3) ? 1u : 0) | ((status & 0xc) ? 4u : 0));
++	e->power_acks++;
 +}
 +
 +static int
@@ -1248,8 +1262,13 @@ index 0000000..1441783
 +		if (status & (INT_COMMAND_DONE | INT_ERROR)) {
 +			break;
 +		}
++		/* a power-control request of Qualcomm's core holds everything until it is answered */
++		if ((waited & 1023) == 1023) {
++			msm_power_ack(e, 0);
++		}
 +		if (waited >= 1000000) {
-+			emmc_log("%s: CMD%u: no answer\n", e->name, index);
++			emmc_log("%s: CMD%u: no answer (status %x, present %x)\n", e->name, index, hc_rd(e, SDHCI_INT_STATUS),
++			    hc_rd(e, SDHCI_PRESENT));
 +			emmc_reset(e, RESET_CMD | RESET_DATA);
 +			return -1;
 +		}

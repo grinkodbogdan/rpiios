@@ -132,7 +132,7 @@ struct emmc {
 	uint32_t        hz;
 	uint32_t        cid[4];
 	/* how it has gone */
-	uint64_t        reads, read_sectors, writes, written_sectors, errors;
+	uint64_t        reads, read_sectors, writes, written_sectors, errors, power_acks;
 	uint32_t        last_error;     /* SDHCI's error bits of the last failure */
 	uint32_t        base_hz;
 };
@@ -174,9 +174,9 @@ msm_power_ack(struct emmc *e, uint32_t us)
 	if (e->core == 0) {
 		return;
 	}
-	for (uint32_t waited = 0; waited < us; waited += 10) {
+	for (uint32_t waited = 0;; waited += 10) {
 		status = emmc_rd32(e->core + MSM_PWRCTL_STATUS);
-		if (status != 0) {
+		if (status != 0 || waited >= us) {
 			break;
 		}
 		emmc_udelay(10);
@@ -186,6 +186,7 @@ msm_power_ack(struct emmc *e, uint32_t us)
 	}
 	emmc_wr32(e->core + MSM_PWRCTL_CLEAR, status);
 	emmc_wr32(e->core + MSM_PWRCTL_CTL, ((status & 3) ? 1u : 0) | ((status & 0xc) ? 4u : 0));
+	e->power_acks++;
 }
 
 static int
@@ -243,8 +244,13 @@ emmc_command(struct emmc *e, uint32_t index, uint32_t argument, uint32_t flags, 
 		if (status & (INT_COMMAND_DONE | INT_ERROR)) {
 			break;
 		}
+		/* a power-control request of Qualcomm's core holds everything until it is answered */
+		if ((waited & 1023) == 1023) {
+			msm_power_ack(e, 0);
+		}
 		if (waited >= 1000000) {
-			emmc_log("%s: CMD%u: no answer\n", e->name, index);
+			emmc_log("%s: CMD%u: no answer (status %x, present %x)\n", e->name, index, hc_rd(e, SDHCI_INT_STATUS),
+			    hc_rd(e, SDHCI_PRESENT));
 			emmc_reset(e, RESET_CMD | RESET_DATA);
 			return -1;
 		}
