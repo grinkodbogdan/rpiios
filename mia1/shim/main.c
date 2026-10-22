@@ -120,6 +120,7 @@ shim_main(const void *fdt, uint64_t loaded_at)
 	}
 	mmu_on(banks, nbanks);
 	display_init();
+	keep_start();
 	say("rpiios Mi A1 shim at %llx, EL%llu, timer %llu Hz, device tree at %p\n", (unsigned long long)loaded_at,
 	    (unsigned long long)(READ_SYSREG(CurrentEL) >> 2), (unsigned long long)READ_SYSREG(cntfrq_el0), fdt);
 	for (int i = 0; i < nbanks; i++) {

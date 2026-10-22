@@ -6,7 +6,8 @@
  * the XNU loader, which expects what UEFI gives it: every address mapped to
  * itself, RAM cacheable. So: 2 MB blocks over the first 8 GB, RAM (the banks
  * aboot reports) normal and write-back, the display's memory normal and not
- * cached (the display processor reads it from DRAM), everything else device.
+ * cached (the display processor reads it from DRAM), as is the 2 MB with the persistent log
+ * (console.c, 0x9ff00000), everything else device.
  */
 #include "shim.h"
 
@@ -50,7 +51,7 @@ mmu_on(const struct ram_bank *banks, int nbanks)
 		for (int i = 0; i < 512; i++) {
 			uint64_t a = (uint64_t)g * GB + (uint64_t)i * MB2, d = a | BLOCK | AF;
 
-			if (a + MB2 > (FB_BASE & ~(MB2 - 1)) && a < FB_BASE + FB_REGION_SIZE) {
+			if ((a + MB2 > (FB_BASE & ~(MB2 - 1)) && a < FB_BASE + FB_REGION_SIZE) || a == 0x9fe00000) {
 				d |= ATTRIDX(ATTR_NC) | SH_INNER;
 			} else if (in_ram(banks, nbanks, a, MB2)) {
 				d |= ATTRIDX(ATTR_NORMAL) | SH_INNER;

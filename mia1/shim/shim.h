@@ -31,6 +31,7 @@ void udelay(uint64_t us);
 /* console.c */
 void display_init(void);
 void console_putc(char c);
+void keep_start(void);
 void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void stop(const char *fmt, ...) __attribute__((format(printf, 1, 2), noreturn));
 extern uint32_t display_bpp;          /* 32 once the display has been switched, 24 before */

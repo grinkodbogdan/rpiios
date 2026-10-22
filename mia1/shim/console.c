@@ -51,6 +51,56 @@ static uint32_t old_format;
 
 static uint32_t col, row;
 
+/*
+ * Everything written here also goes to memory that survives a reset: the firmware's region for
+ * a persistent log (ramoops, 0x9ff00000, 1 MB; mapped uncached by mmu.c so that nothing of it
+ * waits in a cache when the reset comes). The next boot shows the end of it: when the phone
+ * resets with nothing on the screen to say why, the run before says how far it got.
+ */
+#define KEEP_BASE       0x9ff00000UL
+#define KEEP_MAGIC      0x31414d4950454b52ull       /* "RKEEPMA1" */
+#define KEEP_BYTES      (0x100000u - 16)
+
+struct keep {
+	uint64_t magic, len;
+	char text[KEEP_BYTES];
+};
+
+static volatile struct keep *const keep = (volatile struct keep *)KEEP_BASE;
+static int keeping, line_start = 1;
+
+static void
+keep_char(char c)
+{
+	if (keeping && keep->len < KEEP_BYTES) {
+		keep->text[keep->len] = c;
+		keep->len = keep->len + 1;
+	}
+}
+
+static uint32_t text_colour = 0xffffff;
+static void put_raw(char c);
+
+/* The end of what the run before wrote, then a fresh log for this one. */
+void
+keep_start(void)
+{
+	if (keep->magic == KEEP_MAGIC && keep->len > 0 && keep->len <= KEEP_BYTES) {
+		uint64_t from = keep->len > 1500 ? keep->len - 1500 : 0;
+
+		text_colour = 0xffd040;
+		say("--- the run before this one ended with: ---\n");
+		for (uint64_t i = from; i < keep->len; i++) {
+			put_raw(keep->text[i]);
+		}
+		say("\n--- (end) ---\n");
+		text_colour = 0xffffff;
+	}
+	keep->magic = KEEP_MAGIC;
+	keep->len = 0;
+	keeping = 1;
+}
+
 static inline uint32_t
 mmio_rd(uint64_t a)
 {
@@ -143,10 +193,30 @@ newline(void)
 	    (uint64_t)CELL_H * FB_WIDTH * bytes);
 }
 
-static uint32_t text_colour = 0xffffff;
-
 void
 console_putc(char c)
+{
+	keep_char(c);
+	if (line_start && c != '\n' && keeping) {
+		uint64_t t = READ_SYSREG(cntpct_el0), hz = READ_SYSREG(cntfrq_el0);
+		char stamp[24];
+
+		line_start = 0;
+		snprintf(stamp, sizeof(stamp), "%llu.%03llu ", (unsigned long long)(t / hz),
+		    (unsigned long long)(t % hz * 1000 / hz));
+		for (char *p = stamp; *p; p++) {
+			keep_char(*p);
+			put_raw(*p);
+		}
+	}
+	if (c == '\n') {
+		line_start = 1;
+	}
+	put_raw(c);
+}
+
+static void
+put_raw(char c)
 {
 #ifdef SHIM_UART
 	/* testing under QEMU: a PL011 as well */
