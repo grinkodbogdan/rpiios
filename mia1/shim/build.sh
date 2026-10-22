@@ -43,7 +43,8 @@ image() {   # NAME CMDLINE
 		--ramdisk "$out/ramdisk-$1" --base 0x80000000 --pagesize 2048 --cmdline "rpiios" -o "$out/$1.img"
 	echo "shim: $out/$1.img ($(stat -c %s "$out/$1.img") bytes): $2"
 }
-# tissot=1: the Mi A1's drivers (eMMC, touch, buttons); emmc_root: the iOS volume on userdata;
+# tissot=1: the Mi A1's drivers (eMMC, touch, buttons); vtimer_ppi=20: its virtual timer's interrupt
+# (the MSM8953 wires the generic timers to PPIs 1-4); emmc_root: the iOS volume on userdata;
 # -v: the kernel's text on the screen, the only log there is
 if [ -n "${WDT_TESTS:-}" ]; then
 	# the watchdog tests: count 40 s, then (modes 8 and 4) boot as mia1-ios.img does
@@ -82,5 +83,5 @@ if [ -n "${SHIM_CMDLINE:-}" ]; then
 	image mia1-test "$SHIM_CMDLINE"
 	exit 0
 fi
-image mia1-ios "-v tissot=1 emmc_root=userdata"
-image mia1-ios-4cpu "-v tissot=1 emmc_root=userdata cpus=4"
+image mia1-ios "-v tissot=1 vtimer_ppi=20 emmc_root=userdata"
+image mia1-ios-4cpu "-v tissot=1 vtimer_ppi=20 emmc_root=userdata cpus=4"

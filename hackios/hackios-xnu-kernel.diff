@@ -2243,7 +2243,7 @@ index bb8ad1b..c2ca3c3 100644
  void redwood_spmi_unlock(void);
  /*
 diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
-index 63ffd4b..2b6879e 100644
+index 63ffd4b..46fb767 100644
 --- a/xnu/files/osfmk/arm64/gic_v3_irq.c
 +++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
 @@ -23,6 +23,12 @@
@@ -2259,7 +2259,7 @@ index 63ffd4b..2b6879e 100644
   */
  #include <mach/mach_types.h>
  #include <kern/debug.h>
-@@ -70,6 +76,17 @@
+@@ -70,9 +76,27 @@
  #define GICR_IPRIORITYR(n)      (GICR_SGI_BASE + 0x0400 + (n))
  #define GICR_IGRPMODR0          (GICR_SGI_BASE + 0x0d00)
  
@@ -2276,8 +2276,19 @@ index 63ffd4b..2b6879e 100644
 +
  #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
  #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
- #define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
-@@ -81,6 +98,12 @@
+-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
++#define GIC_INTID_VTIMER        gic_vtimer_intid
++
++/*
++ * The EL1 virtual timer's PPI: 27 on most GICs, but the Snapdragon 625 (Mi A1) wires the four
++ * generic timers to PPIs 1-4 -- the virtual one is interrupt 20 there (msm8953.dtsi, "timer";
++ * seen on the phone: 27 never goes pending, 20 does). Boot-arg vtimer_ppi=N.
++ */
++static uint32_t gic_vtimer_intid = 27;
+ #define GIC_INTID_SPI_MIN       32
+ #define GIC_INTID_SPURIOUS_MIN  1020
+ #define GIC_SPI_MOST            48          /* attached at a time */
+@@ -81,6 +105,12 @@
  static vm_offset_t gicd_base, gicr_base;
  static vm_size_t   gicr_size;
  static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
@@ -2290,7 +2301,7 @@ index 63ffd4b..2b6879e 100644
  
  /*
   * Acknowledged, not yet EOI'd; 0: none. The signal between processors is interrupt 0 and reads
-@@ -135,7 +158,9 @@ gic_write32(vm_offset_t addr, uint32_t value)
+@@ -135,7 +165,9 @@ gic_write32(vm_offset_t addr, uint32_t value)
  static void
  gic_mask(uint32_t intid)
  {
@@ -2301,7 +2312,7 @@ index 63ffd4b..2b6879e 100644
  		gic_write32(gicr_cpu_base[cpu_number()] + GICR_ICENABLER0, 1u << intid);
  	} else {
  		gic_write32(gicd_base + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
-@@ -153,6 +178,15 @@ gic_send_sgi(uint32_t phys_id, uint32_t sgi)
+@@ -153,6 +185,15 @@ gic_send_sgi(uint32_t phys_id, uint32_t sgi)
  {
  	uint64_t aff0 = phys_id & 0xff, aff1 = (phys_id >> 8) & 0xff;
  
@@ -2317,7 +2328,7 @@ index 63ffd4b..2b6879e 100644
  	__builtin_arm_wsr64("ICC_SGI1R_EL1", ((uint64_t)sgi << 24) | (aff1 << 16) | (1ULL << (aff0 & 15)));
  	__builtin_arm_isb(ISB_SY);
  }
-@@ -193,7 +227,7 @@ gic_spi_handle(uint32_t intid)
+@@ -193,7 +234,7 @@ gic_spi_handle(uint32_t intid)
  static void
  gic_distributor_settle(void)
  {
@@ -2326,7 +2337,7 @@ index 63ffd4b..2b6879e 100644
  		/* wait for the change to take effect */
  	}
  }
-@@ -254,13 +288,20 @@ gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint
+@@ -254,13 +295,20 @@ gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint
  	gic_v3_spi_mask(intid);
  	gic_write32(gicd_base + GICD_ICPENDR(intid / 32), 1u << (intid % 32));
  	gic_write32(gicd_base + GICD_ICACTIVER(intid / 32), 1u << (intid % 32));
@@ -2351,7 +2362,7 @@ index 63ffd4b..2b6879e 100644
  	gic_distributor_settle();
  	gic_v3_spi_unmask(intid);
  	return KERN_SUCCESS;
-@@ -296,14 +337,30 @@ gic_v3_spi_count(uint32_t intid)
+@@ -296,14 +344,30 @@ gic_v3_spi_count(uint32_t intid)
  	return 0;
  }
  
@@ -2384,7 +2395,7 @@ index 63ffd4b..2b6879e 100644
  
  		if (intid >= GIC_INTID_SPURIOUS_MIN) {
  			break;
-@@ -311,6 +368,10 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
+@@ -311,6 +375,10 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
  		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
  
  		if (intid == GIC_INTID_VTIMER) {
@@ -2395,7 +2406,7 @@ index 63ffd4b..2b6879e 100644
  			/* same sequence as the FIQ path in sleh_fiq() */
  			getCpuDatap()->cpu_decrementer = -1; /* Large */
  			rtclock_intr(TRUE);
-@@ -328,8 +389,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
+@@ -328,8 +396,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
  			gic_last_unhandled = intid;
  		}
  
@@ -2405,7 +2416,7 @@ index 63ffd4b..2b6879e 100644
  		gic_active_iar[cpu] = 0;
  	}
  }
-@@ -358,8 +418,7 @@ gic_v3_irq_quiesce(void)
+@@ -358,8 +425,7 @@ gic_v3_irq_quiesce(void)
  		}
  	}
  	if (gic_active_iar[cpu] != 0) {
@@ -2415,7 +2426,7 @@ index 63ffd4b..2b6879e 100644
  		gic_active_iar[cpu] = 0;
  	}
  }
-@@ -382,6 +441,15 @@ gic_v3_irq_cpu_shutdown(void)
+@@ -382,6 +448,15 @@ gic_v3_irq_cpu_shutdown(void)
  		return;
  	}
  	gic_v3_irq_quiesce();
@@ -2431,7 +2442,7 @@ index 63ffd4b..2b6879e 100644
  	gicr = gicr_cpu_base[cpu_number()];
  	if (gicr != 0) {
  		gic_write32(gicr + GICR_ICENABLER0, 0xffffffffu);
-@@ -412,6 +480,54 @@ gic_find_redistributor(void)
+@@ -412,6 +487,54 @@ gic_find_redistributor(void)
  	panic("gic: no redistributor for MPIDR 0x%llx", mpidr);
  }
  
@@ -2486,10 +2497,17 @@ index 63ffd4b..2b6879e 100644
  /* Per-CPU bring-up: every processor calls this for itself, the boot processor first. */
  void
  gic_v3_irq_cpu_init(void)
-@@ -434,13 +550,20 @@ gic_v3_irq_cpu_init(void)
+@@ -434,13 +557,27 @@ gic_v3_irq_cpu_init(void)
  		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
  
  		simple_lock_init(&gic_spi_lock, 0);
++		{
++			uint32_t ppi;
++
++			if (PE_parse_boot_argn("vtimer_ppi", &ppi, sizeof(ppi)) && ppi >= 16 && ppi < 32) {
++				gic_vtimer_intid = ppi;
++			}
++		}
 +		/* ID_AA64PFR0_EL1.GIC [27:24]: 0 = no GICv3 system-register interface, so a GICv2 */
 +		gic_v2 = ((__builtin_arm_rsr64("ID_AA64PFR0_EL1") >> 24) & 0xf) == 0;
  		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
