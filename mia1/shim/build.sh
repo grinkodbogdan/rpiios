@@ -45,6 +45,15 @@ image() {   # NAME CMDLINE
 }
 # tissot=1: the Mi A1's drivers (eMMC, touch, buttons); emmc_root: the iOS volume on userdata;
 # -v: the kernel's text on the screen, the only log there is
+if [ -n "${WDT_TESTS:-}" ]; then
+	# the watchdog tests: count 40 s, then (modes 8 and 4) boot as mia1-ios.img does
+	for mode in 0 8 4; do
+		SHIM_CFLAGS="-DWDT_MODE=$mode -DWDT_WATCH_S=40" WDT_TESTS= "$0" "$out/wdt$mode" "$hack" >/dev/null
+		cp "$out/wdt$mode/mia1-ios.img" "$out/mia1-wdt$mode.img"
+		echo "shim: $out/mia1-wdt$mode.img"
+	done
+	exit 0
+fi
 if [ -n "${SHIM_CMDLINE:-}" ]; then
 	image mia1-test "$SHIM_CMDLINE"
 	exit 0

@@ -41,16 +41,42 @@ static const struct region firmware[] = {
  */
 #define WDOG_BASE       0x0b017000UL
 
+/*
+ * What to do about it is being found out on the phone (WDT_MODE, set by build.sh for the test
+ * images): 0 leave it alone, 8 write 0 to +0x08 (Linux's WDT_EN), 4 write 0 to +0x04 (LK msm8952's
+ * CTL). Each test image counts seconds on the screen before going on, so a photo shows when (and
+ * whether) the phone resets.
+ */
+#ifndef WDT_MODE
+#define WDT_MODE 0
+#endif
+#ifndef WDT_WATCH_S
+#define WDT_WATCH_S 0
+#endif
+
 static void
 watchdog_off(void)
 {
-#ifdef SHIM_UART
-	return;                 /* QEMU: nothing there */
+#if WDT_MODE == 8 || WDT_MODE == 4
+	*(volatile uint32_t *)(WDOG_BASE + WDT_MODE) = 0;
 #endif
-	*(volatile uint32_t *)(WDOG_BASE + 0x04) = 0;
-	*(volatile uint32_t *)(WDOG_BASE + 0x08) = 0;
-	*(volatile uint32_t *)(WDOG_BASE + 0x10) = 0xfffff;
-	*(volatile uint32_t *)(WDOG_BASE + 0x14) = 0xfffff;
+}
+
+static void
+watchdog_watch(void)
+{
+	uint64_t start = READ_SYSREG(cntpct_el0), hz = READ_SYSREG(cntfrq_el0);
+
+	if (WDT_WATCH_S == 0) {
+		return;
+	}
+	say("watchdog test, mode %d: seconds since the shim started (and since power on):\n", WDT_MODE);
+	for (uint64_t s = 0; s <= WDT_WATCH_S; s++) {
+		while (READ_SYSREG(cntpct_el0) - start < s * hz) {
+		}
+		say(" %llu(%llu)", (unsigned long long)s, (unsigned long long)(READ_SYSREG(cntpct_el0) / hz));
+	}
+	say("\nstill here after %d s: going on\n", WDT_WATCH_S);
 }
 
 struct container_entry {
@@ -102,9 +128,7 @@ shim_main(const void *fdt, uint64_t loaded_at)
 		total += banks[i].size;
 	}
 	say("  %llu MB in all\n", (unsigned long long)(total >> 20));
-#ifndef SHIM_UART
-	say("watchdog: %x %x (off)\n", *(volatile uint32_t *)(WDOG_BASE + 0x04), *(volatile uint32_t *)(WDOG_BASE + 0x08));
-#endif
+	watchdog_watch();
 	if (fdt_initrd(fdt, &initrd, &initrd_end) != 0) {
 		stop("aboot gave no ramdisk (no linux,initrd-start in /chosen)\n");
 	}
