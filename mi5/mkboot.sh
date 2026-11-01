@@ -59,6 +59,8 @@ GL=
 if [[ -s $W/sweetgl/sweetgl.dylib && -z ${NOGL:-} ]]; then
 	GL=" sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib"
 	echo "mkboot.sh: sweetgl.dylib built: GPU drawing on (the root must be made by mkroot.sh after it)"
+elif [[ -n ${NOGL:-} ]]; then
+	echo "mkboot.sh: NOGL set: CoreAnimation draws on the CPU"
 else
 	echo "mkboot.sh: no $W/sweetgl/sweetgl.dylib: CoreAnimation draws on the CPU"
 fi
