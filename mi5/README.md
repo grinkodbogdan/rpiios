@@ -107,7 +107,17 @@ photo of the screen.
 
 ## Status
 
-This is built and checked here, but **not yet run on a Mi 5**: there is no phone on this side.
+First run on a Mi 5 (3 GB model, Synaptics touch), 1 November 2026:
+- LK boots the image. The shim finds the display, and XNU's verbose log shows on the panel.
+- UFS works: `userdata` is found on LUN 0.
+- Touch: Synaptics RMI4 (F12, 1079x1919, interrupt on GPIO 125), with coordinates matching the
+  panel.
+- Keys: power, volume up and volume down.
+- GPU: SMMU, microcode and the RBCCU/SP power-up all succeed. Charger and fuel gauge work.
+- The root did not mount because the phone's `userdata` still held Android's data (no
+  `ios-root.img` flashed yet). The kernel now says so in plain words (`SWEET UFS: *** ...`).
+
+Not yet seen on the phone: everything from the root mount on.
 
 Done:
 - kernel, shim, ADT, payload and boot image build on Linux from these scripts;

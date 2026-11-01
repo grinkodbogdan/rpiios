@@ -409,6 +409,48 @@ index 3f2c89d..8d73929 100644
  			if (err) {
  				if ((errors++ % 100u) == 0) {
  					printf("SWEET TOUCH: read err=%d status=%#x flags=%#x\n",
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 8b52190..c5712d7 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -39,6 +39,7 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
++#include <pexpert/arm64/board_config.h>
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+@@ -635,6 +636,29 @@ sweet_ufs_init(void)
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++#if SWEET_MI5
++	/*
++	 * Say what the partition holds when it is not the iOS root (HFS+ "H+"/"HX" at byte
++	 * 1024): otherwise all one sees is hfs_mount's "unknown Volume Signature", again and
++	 * again while the kernel waits for a root.
++	 */
++	if (!error && ufs_read_blocks(su.first_block, 1) == 0) {
++		const uint8_t *v = (const uint8_t *)(su.dma + DMA_BOUNCE);
++		uint16_t hfs = (uint16_t)(v[1024] << 8 | v[1025]);
++		uint16_t ext = (uint16_t)(v[1024 + 56] | v[1024 + 57] << 8);
++		uint32_t f2fs = (uint32_t)v[1024] | (uint32_t)v[1025] << 8 | (uint32_t)v[1026] << 16 |
++		    (uint32_t)v[1027] << 24;
++		const char *what = (hfs == 0x482b || hfs == 0x4858) ? NULL :
++		    ext == 0xef53 ? "ext4 (Android's data)" :
++		    f2fs == 0xf2f52010u ? "F2FS (Android's data)" :
++		    (v[0] == 0 && v[1024] == 0 && v[1025] == 0) ? "nothing (erased)" :
++		    "no HFS+ volume (encrypted Android data?)";
++		for (int i = 0; what != NULL && i < 3; i++) {
++			printf("SWEET UFS: *** \"%s\" holds %s, not the iOS root: build it with "
++			    "mi5/mkroot.sh, then fastboot flash userdata ios-root.img ***\n", want, what);
++		}
++	}
++#endif
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 index fce5fb7..8204dfd 100644
 --- a/pexpert/arm/pe_serial.c
