@@ -117,7 +117,10 @@ First run on a Mi 5 (3 GB model, Synaptics touch), 1 November 2026:
 - The root did not mount because the phone's `userdata` still held Android's data (no
   `ios-root.img` flashed yet). The kernel now says so in plain words (`SWEET UFS: *** ...`).
 
-Not yet seen on the phone: everything from the root mount on.
+Second run, with `ios-root.img` flashed (CPU drawing): **iOS 16.7.16 boots to the lock screen
+and the home screen** (status bar, dock, widgets, Low Battery alert). Power, volume and home work,
+and home unlocks. Touch did not reach iOS, although the kernel logged touches before iOS started;
+this is being investigated.
 
 Done:
 - kernel, shim, ADT, payload and boot image build on Linux from these scripts;
