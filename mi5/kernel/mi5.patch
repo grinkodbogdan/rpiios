@@ -1,0 +1,589 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 0c548d1..9bf1e8b 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -6,12 +6,21 @@
+  *   volume up    TLMM GPIO 126, active low
+  *   volume down  TLMM GPIO 121, active low -> reported as Home (the iPhone 8
+  *                userland needs a Home button; the Pixel has none)
++ * Xiaomi Mi 5 (SWEET_MI5; msm8996-xiaomi-common.dtsi gpio_keys and pon):
++ *   power        PM8994 PON RT_STS bit 0 (KPDPWR), as above
++ *   volume up    PM8994 GPIO 2 (ppid 0x0c1, STATUS1 0x08 bit 0), active low
++ *   volume down  PM8994 PON RT_STS bit 1 (RESIN)
++ *   Home         TLMM GPIO 34 ("dome", the button under the screen), active low
+  * Keys only read the PMIC (EXT_READL on an observer channel);
+  * sweet_pmic_write (the battery's charger setup) writes through the
+  * peripheral's own channel. The volume GPIOs only get their pull-up (as Linux's
+  * tlmm_gpio_key_active pinctrl) if the bootloader left them without one.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/arm64/board_config.h>
++#if !defined(SWEET_MI5)
++#error "pexpert/arm64/SWEET.h not seen"
++#endif
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+@@ -37,10 +46,16 @@ bool sweet_pmic_write(uint16_t ppid, uint8_t addr, uint8_t val);
+ #define KEYS_NO_APID     0xffffu
+ /* pinctrl@1010000, one 4 KiB tile per GPIO: CFG +0, IN_OUT +4 */
+ #define KEYS_TLMM_PA     0x01010000u
++#if SWEET_MI5
++#define KEYS_GPIO_HOME   34u
++#define KEYS_PMIC_VOLUP  0x0c1u          /* PM8994 GPIO 2 */
++#define KEYS_PMIC_GPIO_STATUS 0x08u
++#else
+ #define KEYS_GPIO_VOLUP  126u
+ #define KEYS_GPIO_VOLDN  121u
++#endif
+ 
+-enum { KEY_POWER = 0, KEY_VOLUP = 1, KEY_HOME = 3 };
++enum { KEY_POWER = 0, KEY_VOLUP = 1, KEY_VOLDN = 2, KEY_HOME = 3 };
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg, keys_volup, keys_voldn;
+ static uint16_t keys_pon_apid = KEYS_NO_APID;
+@@ -228,6 +243,42 @@ keys_wait(void)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++#if SWEET_MI5
++static vm_offset_t keys_home;
++
++static void
++keys_thread(void *arg, wait_result_t result)
++{
++	static const int code[4] = {KEY_POWER, KEY_VOLUP, KEY_VOLDN, KEY_HOME};
++	int state[4] = {0, 0, 0, 0};
++	unsigned errors = 0;
++	(void)arg;
++	(void)result;
++	for (;;) {
++		uint8_t pon = 0, volup = 1;
++		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++		bool vok = sweet_pmic_read(KEYS_PMIC_VOLUP, KEYS_PMIC_GPIO_STATUS, &volup);
++		int now[4] = {
++			!!(pon & 1u),
++			vok && !(volup & 1u),
++			!!(pon & 2u),
++			!(keys_rd(keys_home, 4) & 1u),
++		};
++		bool ok[4] = {pok, vok, pok, true};
++		if (!pok && keys_pon_apid != KEYS_NO_APID && (errors++ % 250u) == 0) {
++			printf("SWEET KEYS: PON read error arb-status=%#x\n", keys_last_status);
++		}
++		for (int k = 0; k < 4; ++k) {
++			if (ok[k] && now[k] != state[k]) {
++				state[k] = now[k];
++				printf("SWEET KEYS: key=%d down=%d\n", code[k], state[k]);
++				sweet_hid_key(code[k], state[k]);
++			}
++		}
++		keys_wait();
++	}
++}
++#else
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+@@ -257,6 +308,7 @@ keys_thread(void *arg, wait_result_t result)
+ 		keys_wait();
+ 	}
+ }
++#endif
+ 
+ void
+ sweet_keys_init(void)
+@@ -274,9 +326,14 @@ sweet_keys_init(void)
+ 	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x1000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
++#if SWEET_MI5
++	keys_home = keys_gpio_map(KEYS_GPIO_HOME);
++	if (!keys_core || !keys_cnfg || !keys_home) {
++#else
+ 	keys_volup = keys_gpio_map(KEYS_GPIO_VOLUP);
+ 	keys_voldn = keys_gpio_map(KEYS_GPIO_VOLDN);
+ 	if (!keys_core || !keys_cnfg || !keys_volup || !keys_voldn) {
++#endif
+ 		printf("SWEET KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
+@@ -294,8 +351,13 @@ sweet_keys_init(void)
+ 	}
+ 	uint8_t pon = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++#if SWEET_MI5
++	printf("SWEET KEYS: arb=%#x pon-apid=%u pon=%#x/%d (Mi 5: Home = the button under the screen)\n",
++	    keys_version, keys_pon_apid, pon, pok);
++#else
+ 	printf("SWEET KEYS: arb=%#x pon-apid=%u pon=%#x/%d (Home = volume down)\n",
+ 	    keys_version, keys_pon_apid, pon, pok);
++#endif
+ 	if (!pok) {
+ 		printf("SWEET KEYS: power key unreadable; volume keys only\n");
+ 		keys_pon_apid = KEYS_NO_APID;
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 3f2c89d..8d73929 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -18,8 +18,23 @@
+  *            synaptics_dsx_core.c synaptics_rmi4_f12_init
+  * Coordinates are panel pixels (F12 max 1079 x 1919). Writes to the IC: the
+  * page select, the F01 interrupt enable.
++ *
++ * Xiaomi Mi 5 (SWEET_MI5; msm8996-xiaomi-gemini-common.dtsi, i2c@75ba000):
++ * the same reset (89) and attention (125) pins, on BLSP2 QUP6 (0x75ba000,
++ * TLMM 87/88 function 3 = blsp_i2c12; GCC BLSP2 AHB vote bit 15, QUP6 I2C
++ * CBCR 0x330008 / RCGR 0x330020, Linux gcc-msm8996.c). No I2C mux; TLMM 73
++ * is the touch AVDD enable (disp_vddts_vreg) and PM8994 L6 (1.8 V) the I/O
++ * supply. Two controllers were fitted, with the panel:
++ *   Synaptics (JDI in-cell, dsx-i2c) at 0x20: RMI4, as the Pixel's
++ *   Atmel maXTouch mXT641T (Sharp) at 0x4a: object protocol (Linux
++ *   atmel_mxt_ts.c): the information block at 0, T5 messages, T100 touches
++ * The Synaptics one is tried first, the Atmel one when nothing answers at 0x20.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/arm64/board_config.h>
++#if !defined(SWEET_MI5)
++#error "pexpert/arm64/SWEET.h not seen"
++#endif
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+@@ -38,15 +53,26 @@ extern bool sweet_rpm_ldoa(unsigned ldo, uint32_t uv);
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_GCC_VOTE_PA 0x00352000u   /* +4: APCS_CLOCK_BRANCH_ENA_VOTE */
++#define TOUCH_TLMM_PA     0x01010000u   /* one 4 KiB tile per GPIO: CFG +0, IN_OUT +4 */
++#define TOUCH_RESET       89u
++#define TOUCH_ATTN        125u
++#if SWEET_MI5
++#define TOUCH_GCC_QUP_PA  0x00330000u   /* +8: BLSP2 QUP6 I2C CBCR, +0x20: RCGR */
++#define TOUCH_QUP_PA      0x075ba000u
++#define TOUCH_AHB_VOTE    (1u << 15)    /* BLSP2 */
++#define TOUCH_SDA         87u
++#define TOUCH_SCL         88u
++#define TOUCH_SWITCH      73u           /* not a mux here: the touch AVDD enable */
++#else
+ #define TOUCH_GCC_QUP_PA  0x0031d000u   /* +8: QUP3 I2C CBCR, +0x20: RCGR */
+ #define TOUCH_QUP_PA      0x07577000u
+-#define TOUCH_TLMM_PA     0x01010000u   /* one 4 KiB tile per GPIO: CFG +0, IN_OUT +4 */
++#define TOUCH_AHB_VOTE    (1u << 17)    /* BLSP1 */
+ #define TOUCH_SDA         47u
+ #define TOUCH_SCL         48u
+-#define TOUCH_RESET       89u
+-#define TOUCH_ATTN        125u
+ #define TOUCH_SWITCH      80u
++#endif
+ #define TOUCH_ADDR        0x20u
++#define TOUCH_ADDR_MXT    0x4au
+ #define TOUCH_MAX         10u
+ 
+ /* QUP registers (mainline i2c-qup.c) */
+@@ -101,7 +127,13 @@ static struct {
+ 	uint32_t active;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ 	uint32_t last_status, last_err;
+-} st;
++	uint8_t addr;           /* the controller's I2C address */
++	bool mxt;               /* Atmel maXTouch rather than Synaptics */
++	uint16_t t5_addr, t100_addr;
++	uint8_t t5_size, t100_min, t100_max;
++	uint32_t xrange, yrange;
++	bool swap_xy;
++} st = { .addr = TOUCH_ADDR };
+ 
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+@@ -186,8 +218,8 @@ touch_gpio(unsigned idx, unsigned func, unsigned pull, unsigned ma, bool out, bo
+ static bool
+ touch_clocks(void)
+ {
+-	touch_wr(st.vote, 4, touch_rd(st.vote, 4) | (1u << 17));      /* BLSP1 AHB */
+-	touch_wr(st.gccqup, 8, touch_rd(st.gccqup, 8) | 1u);         /* QUP3 I2C */
++	touch_wr(st.vote, 4, touch_rd(st.vote, 4) | TOUCH_AHB_VOTE);  /* BLSP AHB */
++	touch_wr(st.gccqup, 8, touch_rd(st.gccqup, 8) | 1u);         /* QUP I2C */
+ 	for (unsigned i = 0; i < 1000; i++) {
+ 		if (!(touch_rd(st.gccqup, 8) & (1u << 31))) {
+ 			printf("SWEET TOUCH: clocks on (vote=%#x cbcr=%#x rcgr=%#x/%#x)\n",
+@@ -225,7 +257,7 @@ static int
+ qup_msg(bool rd, uint8_t *buf, unsigned len)
+ {
+ 	unsigned tx = rd ? 2u : len + 1u;
+-	uint32_t a8 = (TOUCH_ADDR << 1) | (rd ? 1u : 0u);
++	uint32_t a8 = ((uint32_t)st.addr << 1) | (rd ? 1u : 0u);
+ 	if (!qup_state(QUP_STATE_RESET) ||
+ 	    !(touch_rd(st.qup, QUP_STATE) & QUP_STATE_MASTER)) {
+ 		return EIO;
+@@ -501,6 +533,133 @@ touch_poll(void)
+ 	return 0;
+ }
+ 
++/*
++ * ---- Atmel maXTouch (Mi 5 with the Sharp panel) ----
++ * Registers are 16-bit, little-endian addresses. The information block at 0:
++ * 7 bytes (family, variant, version, build, matrix X, matrix Y, objects), then
++ * 6 bytes per object (type, start address LE16, size - 1, instances - 1,
++ * report IDs per instance). Report IDs are numbered from 1 in object order.
++ * T5 (message processor) holds the next message: report ID (0xff: none), then
++ * the object's data. T100 (multiple touch): its first ID is the screen status,
++ * the second reserved, the rest one per finger; data byte 0 bit 7 = detected,
++ * bits 6:4 the type (1 finger, 2 stylus, 4 glove), then X and Y as LE16.
++ * The attention line (CHG) is low while messages wait.
++ */
++static int
++mxt_read(uint16_t reg, uint8_t *buf, unsigned n)
++{
++	while (n > 0) {
++		unsigned chunk = MIN(n, st.rx_max);
++		uint8_t a[2] = {(uint8_t)reg, (uint8_t)(reg >> 8)};
++		int err = qup_msg(false, a, 2);
++		if (err || (err = qup_msg(true, buf, chunk))) {
++			return err;
++		}
++		reg += chunk;
++		buf += chunk;
++		n -= chunk;
++	}
++	return 0;
++}
++
++static bool
++mxt_init(void)
++{
++	uint8_t info[7], obj[6], cfg[26];
++	int err = mxt_read(0, info, 7);
++	if (err) {
++		printf("SWEET TOUCH: mXT info block err=%d status=%#x flags=%#x\n", err, st.last_status, st.last_err);
++		return false;
++	}
++	printf("SWEET TOUCH: Atmel maXTouch family %#x variant %#x version %u.%u build %#x, matrix %ux%u, %u objects\n",
++	    info[0], info[1], info[2] >> 4, info[2] & 15u, info[3], info[4], info[5], info[6]);
++	unsigned report = 1;
++	for (unsigned i = 0; i < info[6]; i++) {
++		if ((err = mxt_read((uint16_t)(7u + 6u * i), obj, 6))) {
++			printf("SWEET TOUCH: mXT object table err=%d\n", err);
++			return false;
++		}
++		uint16_t start = (uint16_t)(obj[1] | obj[2] << 8);
++		unsigned ids = obj[5] * (obj[4] + 1u);
++		if (obj[0] == 5) {
++			st.t5_addr = start;
++			st.t5_size = (uint8_t)MIN(obj[3] + 1u, 16u);
++		} else if (obj[0] == 100) {
++			st.t100_addr = start;
++			st.t100_min = (uint8_t)report;
++			st.t100_max = (uint8_t)(report + ids - 1);
++		}
++		report += ids;
++	}
++	if (st.t5_addr == 0 || st.t100_addr == 0 || st.t100_max < st.t100_min + 2) {
++		printf("SWEET TOUCH: mXT without T5/T100 (T5 %#x T100 %#x)\n", st.t5_addr, st.t100_addr);
++		return false;
++	}
++	/* T100 config: byte 1 CFG1 (bit 5 SWITCHXY), XRANGE at 13, YRANGE at 24 */
++	if (mxt_read(st.t100_addr, cfg, sizeof(cfg)) == 0) {
++		st.swap_xy = (cfg[1] & 0x20u) != 0;
++		st.xrange = cfg[13] | cfg[14] << 8;
++		st.yrange = cfg[24] | cfg[25] << 8;
++	}
++	if (st.xrange == 0 || st.yrange == 0) {
++		st.xrange = 1079;
++		st.yrange = 1919;
++	}
++	st.objects = MIN((unsigned)(st.t100_max - st.t100_min - 1), TOUCH_MAX);
++	printf("SWEET TOUCH: mXT T5 at %#x (%u bytes), T100 at %#x reports %u..%u, range %ux%u%s, %u fingers\n",
++	    st.t5_addr, st.t5_size, st.t100_addr, st.t100_min, st.t100_max, st.xrange, st.yrange,
++	    st.swap_xy ? " (x/y switched)" : "", st.objects);
++	return true;
++}
++
++static int
++mxt_poll(void)
++{
++	int x[TOUCH_MAX], y[TOUCH_MAX];
++	uint32_t mask = st.active;
++	for (unsigned i = 0; i < TOUCH_MAX; i++) {
++		x[i] = st.x[i];
++		y[i] = st.y[i];
++	}
++	bool any = false;
++	for (unsigned m = 0; m < 16; m++) {
++		uint8_t msg[16];
++		int err = mxt_read(st.t5_addr, msg, st.t5_size);
++		if (err) {
++			return err;
++		}
++		if (msg[0] == 0xff || msg[0] == 0) {
++			break;
++		}
++		if (msg[0] < st.t100_min + 2 || msg[0] > st.t100_max) {
++			continue;       /* screen status, other objects */
++		}
++		unsigned id = msg[0] - st.t100_min - 2u;
++		if (id >= TOUCH_MAX) {
++			continue;
++		}
++		unsigned type = (msg[1] >> 4) & 7u;
++		any = true;
++		if ((msg[1] & 0x80u) && (type == 1 || type == 2 || type == 4)) {
++			uint32_t rx = msg[2] | msg[3] << 8, ry = msg[4] | msg[5] << 8;
++			if (st.swap_xy) {
++				uint32_t t = rx;
++				rx = ry;
++				ry = t;
++			}
++			x[id] = (int)(rx * 1079u / MAX(st.swap_xy ? st.yrange : st.xrange, 1u));
++			y[id] = (int)(ry * 1919u / MAX(st.swap_xy ? st.xrange : st.yrange, 1u));
++			mask |= 1u << id;
++		} else {
++			mask &= ~(1u << id);
++		}
++	}
++	if (any) {
++		touch_report(mask, x, y);
++	}
++	return 0;
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -530,7 +689,11 @@ touch_thread(void *arg, wait_result_t result)
+ 	(void)PE_parse_boot_argn("sweetrpm", &rails, sizeof(rails));
+ 	if (rails) {
+ 		static const struct { unsigned ldo; uint32_t uv; } on[] = {
++#if SWEET_MI5
++			{6, 1800000},   /* the Mi 5's touch I/O supply; AVDD is TLMM 73 below */
++#else
+ 			{6, 1800000}, {17, 3300000}, {18, 1800000}, {19, 2850000}, {23, 1800000},
++#endif
+ 		};
+ 		for (unsigned i = 0; i < sizeof(on) / sizeof(on[0]); i++) {
+ 			(void)sweet_rpm_ldoa(on[i].ldo, on[i].uv);
+@@ -553,8 +716,15 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (!touch_clocks()) {
+ 		goto out;
+ 	}
++#if SWEET_MI5
++	if (!(touch_rd(st.gpio[4], 4) & 1u) || !(touch_rd(st.gpio[4], 0) & 0x200u)) {
++		touch_gpio(4, 0, 0, 2, true, true);     /* disp_vddts_vreg: touch AVDD on */
++		touch_wait(5);                          /* DT startup-delay-us 4000 */
++	}
++#else
+ 	touch_gpio(4, 0, 0, 2, true, false);    /* I2C mux to the AP */
+-	touch_gpio(0, 3, 0, 8, false, false);   /* blsp_i2c3, no pull (board pull-ups) */
++#endif
++	touch_gpio(0, 3, 0, 8, false, false);   /* blsp_i2c (function 3 on both boards), no pull (board pull-ups) */
+ 	touch_gpio(1, 3, 0, 8, false, false);
+ 	touch_gpio(3, 0, 3, 16, false, false);  /* attention: input, pull-up */
+ 	/* DT: reset-active-ms 1, reset-delay-ms 20; give the firmware more time to boot. */
+@@ -565,8 +735,20 @@ touch_thread(void *arg, wait_result_t result)
+ 	printf("SWEET TOUCH: after reset: sda=%u scl=%u attn=%u mux=%#x/%u\n",
+ 	    touch_rd(st.gpio[0], 4) & 1u, touch_rd(st.gpio[1], 4) & 1u, touch_rd(st.gpio[3], 4) & 1u,
+ 	    touch_rd(st.gpio[4], 0), touch_rd(st.gpio[4], 4) & 1u);
+-	if (!qup_init() || !rmi_init()) {
++	if (!qup_init()) {
++		goto out;
++	}
++	if (!rmi_init()) {
++#if SWEET_MI5
++		/* nothing at 0x20: the Atmel controller of the Sharp panel */
++		st.addr = TOUCH_ADDR_MXT;
++		st.mxt = true;
++		if (!mxt_init()) {
++			goto out;
++		}
++#else
+ 		goto out;
++#endif
+ 	}
+ 	uint32_t hz = 60;
+ 	(void)PE_parse_boot_argn("sweettouchhz", &hz, sizeof(hz));
+@@ -589,7 +771,7 @@ touch_thread(void *arg, wait_result_t result)
+ 		 * anyway after a second.
+ 		 */
+ 		if (!(touch_rd(st.gpio[3], 4) & 1u) || touch_irq_on || (++ticks % 20u) == 0) {
+-			int err = touch_poll();
++			int err = st.mxt ? mxt_poll() : touch_poll();
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+ 					printf("SWEET TOUCH: read err=%d status=%#x flags=%#x\n",
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index fce5fb7..8204dfd 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -23,6 +23,10 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/protos.h>
+ #include <pexpert/device_tree.h>
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(SWEET_MI5)
++#error "pexpert/arm64/SWEET.h not seen: the Mi 5's display settings would be left out"
++#endif
+ #include <pexpert/arm/consistent_debug.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <arm64/proc_reg.h>
+@@ -774,6 +778,15 @@ fbcon_newline(void)
+ #define FBCON_PP0_DONE  (1u << 8)
+ static volatile uint32_t *fbcon_intr;   /* MDP INTR_STATUS; CLEAR is the next word */
+ static volatile uint32_t *fbcon_vig0;   /* MDP VIG0 pipe (the panel's source) */
++/*
++ * Mi 5: the pipe the bootloader scans out from may be another (RGB0, DMA0), and
++ * its panel may run in video mode (sweetfb_pipe=PA, sweetfb_video=1, from the
++ * rpiios mi5 shim, which reads both off the MDP). Video mode: the timing engine
++ * fetches every frame by itself; CTL0_FLUSH takes new pipe settings at the next
++ * vsync, and there is no START and no PING_PONG_DONE to wait for.
++ */
++static uint32_t fbcon_pipe_flush = 1u;  /* CTL0_FLUSH bit of that pipe (VIG0 0, RGB0 3, DMA0 11) */
++static bool fbcon_video;
+ static uint64_t fbcon_src_next;
+ static uint32_t fbcon_src_stride;
+ uint64_t sweet_fbcon_stat_kicks, sweet_fbcon_stat_done, sweet_fbcon_stat_timeout;
+@@ -787,7 +800,7 @@ static bool fbcon_kick_pending = true;  /* the shim's last frame may still be ou
+ static bool
+ fbcon_frame_done(uint64_t now)
+ {
+-	if (!fbcon_kick_pending) {
++	if (!fbcon_kick_pending || fbcon_video) {
+ 		return true;
+ 	}
+ 	if (fbcon_intr != NULL && (*fbcon_intr & FBCON_PP0_DONE)) {
+@@ -821,7 +834,7 @@ fbcon_try_kick(void)
+ 			fbcon_vig0[0x24 / 4] = fbcon_src_stride;        /* SRC_YSTRIDE0 */
+ 			fbcon_vig0[0x30 / 4] = 0x000236ffu;             /* SRC_FORMAT: XRGB8888, 4 bpp */
+ 			fbcon_vig0[0x34 / 4] = 0x03020001u;             /* UNPACK: bytes B, G, R, X */
+-			flush |= 1u;                                    /* VIG0 */
++			flush |= fbcon_pipe_flush;                      /* VIG0 (or the Mi 5's pipe) */
+ 		}
+ 		if (layer != 0) {
+ 			fbcon_kickoff[-7] = layer;                      /* CTL0 LAYER(LM0) */
+@@ -832,9 +845,11 @@ fbcon_try_kick(void)
+ 			fbcon_kickoff[-1] = flush;                      /* CTL0_FLUSH */
+ 		}
+ 		__builtin_arm_dsb(DSB_SY);
+-		*fbcon_kickoff = 1;
++		if (!fbcon_video) {
++			*fbcon_kickoff = 1;
++		}
+ 		fbcon_kick_last = now;
+-		fbcon_kick_pending = true;
++		fbcon_kick_pending = !fbcon_video;
+ 		sweet_fbcon_stat_kicks++;
+ 	}
+ 	os_atomic_store(&fbcon_kick_lock, 0u, release);
+@@ -854,6 +869,17 @@ sweet_fbcon_dcs(uint8_t cmd, uint8_t param)
+ {
+ 	volatile uint32_t *d = fbcon_dsi;
+ 
++#if SWEET_MI5
++	/*
++	 * Mi 5: the backlight is PMI8994's WLED (panel dtsi bl_ctrl_wled), not a
++	 * DCS command, and a command sent while a video-mode panel streams would
++	 * have to fit its blanking. Brightness stays where the bootloader set it.
++	 */
++	(void)cmd;
++	(void)param;
++	(void)d;
++	return false;
++#endif
+ 	if (d == NULL) {
+ 		return false;
+ 	}
+@@ -1029,6 +1055,7 @@ fbcon_probe(void)
+ 	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
+ 		return;
+ 	}
++	uint64_t fb_pa = reg[0], fb_size = reg[1];
+ 	if (SecureDTGetProperty(entry, "width", (void const **)&val, &size) == kSuccess) {
+ 		fbcon_width = *val;
+ 	}
+@@ -1042,6 +1069,27 @@ fbcon_probe(void)
+ 	    (*val == 24 || *val == 32)) {
+ 		fbcon_bypp = *val / 8;
+ 	}
++#if SWEET_MI5
++	/* what the shim found on the MDP outweighs the device tree's defaults */
++	{
++		uint64_t v = 0;
++		uint32_t w = 0;
++		if (PE_parse_boot_argn("sweetfb_pa", &v, sizeof(v)) && v != 0) {
++			fb_pa = v;
++		}
++		if (PE_parse_boot_argn("sweetfb_stride", &w, sizeof(w)) && w != 0) {
++			fbcon_stride = w;
++		}
++		if (PE_parse_boot_argn("sweetfb_bpp", &w, sizeof(w)) && (w == 24 || w == 32)) {
++			fbcon_bypp = w / 8;
++		}
++		w = 0;
++		if (PE_parse_boot_argn("sweetfb_video", &w, sizeof(w))) {
++			fbcon_video = w != 0;
++		}
++		fb_size = (uint64_t)fbcon_stride * fbcon_height;
++	}
++#endif
+ 	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * fbcon_bypp) {
+ 		return;
+ 	}
+@@ -1058,6 +1106,19 @@ fbcon_probe(void)
+ 		 * map is full and even one page panicked kmem_alloc (0164b).
+ 		 */
+ 		uint64_t vig = *kick - 0x1c + 0x3000;
++#if SWEET_MI5
++		{
++			uint64_t pipe = 0;
++			if (PE_parse_boot_argn("sweetfb_pipe", &pipe, sizeof(pipe)) && pipe != 0) {
++				uint64_t off = pipe - (*kick - 0x1c - 0x1000);  /* from the MDP base */
++				vig = pipe;
++				/* mdp5 FLUSH bits: VIG0..2 0..2, RGB0..2 3..5, DMA0 11, DMA1 12, VIG3 18, RGB3 19 */
++				fbcon_pipe_flush = off == 0x4000 ? 1u << 0 : off == 0x6000 ? 1u << 1 : off == 0x8000 ? 1u << 2 :
++				    off == 0x14000 ? 1u << 3 : off == 0x16000 ? 1u << 4 : off == 0x18000 ? 1u << 5 :
++				    off == 0x24000 ? 1u << 11 : off == 0x26000 ? 1u << 12 : 1u << 0;
++			}
++		}
++#endif
+ 		page = ml_io_map(trunc_page_64(vig), PAGE_SIZE);
+ 		if (page != 0) {
+ 			fbcon_vig0 = (volatile uint32_t *)(page + (vig & PAGE_MASK));
+@@ -1075,7 +1136,7 @@ fbcon_probe(void)
+ 			fbcon_dsi = (volatile uint32_t *)(page + (dsi & PAGE_MASK));
+ 		}
+ 	}
+-	fbcon_base = (volatile uint8_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	fbcon_base = (volatile uint8_t *)ml_io_map_wcomb(fb_pa, fb_size);
+ 	sweet_early_mark(18, "fbcon mapping returned");
+ 	if (fbcon_base != NULL) {
+ 		register_serial_functions(&sweet_fbcon_serial_functions);
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 5d2856f..faee8d2 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -37,11 +37,25 @@
+ #define __ARM_16K_PG__            1
+ 
+ /*
+- * Early boot log (osfmk/arm64/sweet_early.c): the Pixel 1 ramoops console
+- * zone and the 32MB block start.s / arm_vm_init map around it.
++ * This tree is built for the Xiaomi Mi 5 (gemini, MSM8996): the Pixel 1's SoC,
++ * another board. SWEET_MI5 selects the Mi 5's side wherever the two differ
++ * (rpiios mi5/: the ramoops zone below, the display pipe, keys, touch).
+  */
++#define SWEET_MI5                 1
++
++/*
++ * Early boot log (osfmk/arm64/sweet_early.c): the ramoops console zone and the
++ * 32MB block start.s / arm_vm_init map around it. Pixel 1: 0x83500000, 8 dump
++ * records first. Mi 5 (msm8996-xiaomi-common.dtsi ramoops_mem@92900000, 1 MB:
++ * 4 x 32K dump records, then the 512K console zone).
++ */
++#if SWEET_MI5
++#define SWEET_EARLY_LOG_BLOCK     0x92000000
++#define SWEET_EARLY_LOG_PRZ       0x92920000
++#else
+ #define SWEET_EARLY_LOG_BLOCK     0x82000000
+ #define SWEET_EARLY_LOG_PRZ       0x83540000
++#endif
+ 
+ #define HAS_GIC_V3                1
+ 

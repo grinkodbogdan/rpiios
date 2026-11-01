@@ -1,0 +1,126 @@
+# iOS 16.7 on the Xiaomi Mi 5 (gemini)
+
+The Mi 5 is the Pixel 1's SoC (MSM8996) on another board, so this is
+[ios-sailfish](https://github.com/joranv1/ios-sailfish) (joranv1's iOS 16.7 port to the Pixel 1)
+moved to the Mi 5. Everything here builds on **Linux or WSL2 on Windows: no Mac is needed**.
+
+Nothing is flashed to `boot`, `recovery` or any firmware partition: the phone runs this through
+`fastboot boot`, once per boot. Only **`userdata` is overwritten** (the iOS root lives there), so
+everything on the phone is lost. Back it up first. To go back to Android, format data from
+recovery (or `fastboot erase userdata`, then boot Android).
+
+## What is different from the Pixel
+
+| | Pixel 1 (sailfish) | Mi 5 (this) |
+|---|---|---|
+| Bootloader | Google's ABL | Qualcomm LK: Image.gz with DTBs appended, kernel at 0x80080000 |
+| Display | VIG0, command-mode panel | the shim reads **whatever LK left running** off the MDP: pipe, buffer, stride, depth, command or video mode (`shim/mi5.c`) and passes it as `sweetfb_*` boot-args |
+| Backlight | DCS brightness | the WLED, left on by LK (`sweetbl=0`) |
+| Memory | 4 GB | upper bank size taken from LK's `/memory` (3 GB and 4 GB models) |
+| Touch | Synaptics | **both Mi 5 controllers, found at boot**: Synaptics RMI4 at I²C 0x20, else Atmel mXT641T at 0x4a (BLSP2 QUP6, reset GPIO 89, IRQ 125, AVDD GPIO 73, L6 1.8 V) |
+| Keys | power, volume | power, volume up (PM8994 GPIO 2), volume down (RESIN), **home** (TLMM 34) |
+| RAM console | Pixel's ramoops | 0x92920000 (the Mi 5's ramoops console zone) |
+
+Storage (UFS), GPU (Adreno 530) and the rest are the same SoC blocks and use sailfish's drivers
+unchanged.
+
+## What you need
+
+- A Mi 5 with an unlocked bootloader. The 3 GB / 32 GB and 4 GB models both work.
+- A PC with Linux, or Windows 10/11 with WSL2 (Ubuntu 24.04). About **50 GB free** inside WSL's
+  own disk (`~`), **not** under `/mnt/c`: the files' owners must be kept.
+- The phone's own Adreno firmware: `a530_pm4.fw`, `a530_pfp.fw`, `a530_zap.mdt`, `a530_zap.b02`.
+  With LineageOS on the phone: `adb pull /vendor/firmware/a530_pm4.fw` (and the same for the
+  others; on some builds they are in `/system/vendor/firmware` or `/firmware/image`). They are
+  Qualcomm's and Xiaomi's files and are not in this repository.
+
+Packages (Ubuntu/WSL):
+
+```sh
+sudo apt install git curl build-essential clang lld llvm flex bison m4 perl python3 autoconf \
+    cmake rsync 7zip lzfse device-tree-compiler hfsprogs libguestfs-tools linux-image-generic
+```
+
+`7zip` must be 7-Zip **23 or newer** (Ubuntu 24.04's `7zip` package; the old `p7zip-full` cannot
+read APFS). On WSL, `libguestfs-tools` is what writes the HFS+ volume, because WSL's kernel has
+no hfsplus. It runs a small VM and needs `linux-image-generic` for that VM's kernel. On native
+Linux with hfsplus, the volume is mounted directly instead.
+
+## Build
+
+```sh
+git clone https://github.com/grinkodbogdan/rpiios && cd rpiios
+git clone https://github.com/oosexgang/hackios-xnu-kernel ~/hackios
+(cd ~/hackios && xnu-deps/setup.sh --stage1)        # Darwin toolchain: cctools, ld64, mig, SDK overlay
+
+mi5/kernel/setup.sh ~/mi5 ~/hackios                 # XNU 8796.141.3 + sailfish + Linux + Mi 5 patches
+mi5/kernel/build.sh ~/mi5 ~/hackios                 # -> ~/mi5/xnu/BUILD/obj/kernel.development.sweet
+mi5/mkboot.sh ~/mi5 ~/a530-firmware                 # -> ~/mi5/mi5-boot.img
+sudo mi5/mkroot.sh ~/mi5 ~/hackios ~/mi5/ios-root.img   # -> the iOS root (downloads 7.4 GB from Apple)
+```
+
+`mkroot.sh` takes 30 to 90 minutes. It fetches the iPhone 8 iOS 16.7.16 (20H392) images straight
+from Apple's CDN, extracts them with 7-Zip and HackiOS's LZBITMAP decoder, restores owners, modes
+and links from 7-Zip's listing (`tools/fixmeta.py`), adds what sailfish adds, and writes the HFS+
+volume.
+
+## Flash and boot
+
+From Windows, run Google's platform-tools `fastboot.exe` on the files in WSL
+(`\\wsl$\Ubuntu\root\mi5\...`); WSL itself does not see USB without usbipd. Hold volume down +
+power for fastboot mode, then:
+
+```sh
+fastboot flash userdata ios-root.img     # 16 GB, sent in sparse chunks: takes a while
+fastboot boot mi5-boot.img
+```
+
+What you should see:
+
+1. The shim's screen for a moment: `SHIM xiaomi mi 5`, the display pipe it found
+   (`VIG0`, `RGB0` or `DMA0`), command or video mode, the RAM size.
+2. The XNU verbose log (`-v`), which stays on screen until SpringBoard draws.
+3. The first boot takes several minutes longer: iOS builds its caches and runs its data
+   migration. Then the lock screen. The home key unlocks, as on an iPhone 8.
+
+The kernel log goes to the RAM console (it survives a warm reset) and to a 4 MiB ring at the end
+of `userdata`. To read it, boot TWRP for gemini with `fastboot boot twrp.img`, then run
+sailfish's `tools/sweet-log-pull.sh OUT.txt`. When reporting a problem, send that file and a
+photo of the screen.
+
+## Status
+
+This is built and checked here, but **not yet run on a Mi 5**: there is no phone on this side.
+
+Done:
+- kernel, shim, ADT, payload and boot image build on Linux from these scripts;
+- the shim's FDT memory-bank parser was tested on the host against the Mi 5's DTBs;
+- the root builder's extract, metadata and HFS+ steps were tested end to end on the App cryptex
+  (owners, modes and 194 hard links kept; `fsck.hfsplus` clean).
+
+The first boot on the phone is what will show whether LK's display state, the touch rails and
+the keys match the Mi 5 device trees they were taken from.
+
+Not there yet:
+- **Wi-Fi.** The QCA6174 is the same chip on the same PCIe port as the Pixel's, but its
+  `qwlan30.bin` / `otp30.bin` / `bdwlan30.*` are not in the payload yet (`sailfishwlan=0`).
+- **GPU-accelerated drawing.** The GPU firmware is loaded (`sweetgpu=8`), but sailfish's
+  `sweetgl.dylib` (Mesa for backboardd) is built on a Mac, so CoreAnimation draws on the CPU.
+  It is slower, but it works.
+- No modem, camera, audio, sensors or fingerprint, the same as on the Pixel.
+
+## Files
+
+| | |
+|---|---|
+| `kernel/setup.sh`, `kernel/build.sh` | the XNU tree (Apple's xnu-8796.141.3 + sailfish's patches) and its Linux build |
+| `kernel/linux.patch` | what building that tree with stock clang and HackiOS's toolchain takes |
+| `kernel/mi5.patch` | the Mi 5 board: framebuffer from boot-args (any pipe, video-mode panels), Atmel mXT touch next to Synaptics, the four keys, the RAM console address |
+| `sailfish.patch` | sailfish's shim and ADT generator for the Mi 5 (`shim/mi5.c`, `shim/build-mi5.sh`, `mkadt.py --mi5`) |
+| `dtb.sh` | the Mi 5's device trees from LineageOS's kernel, for LK |
+| `mkboot.sh` | `mi5-boot.img`: shim + kernel + ADT + boot-args + GPU firmware |
+| `mkroot.sh`, `tools/fixmeta.py`, `tools/ipsw.py` | the iOS root, on Linux or WSL |
+
+ios-sailfish has no license file, so none of its files are copied here: they are fetched at
+commit `6f27e41f` and changed by `sailfish.patch`. Apple's images are fetched from Apple's own
+CDN by the scripts, and the vendor firmware comes from the phone.

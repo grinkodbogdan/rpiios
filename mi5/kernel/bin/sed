@@ -1,0 +1,4 @@
+#!/bin/bash
+# BSD sed's "-i ''" on GNU sed
+args=(); while [ $# -gt 0 ]; do if [ "$1" = -i ] && [ "${2-x}" = "" ]; then args+=(-i); shift 2; else args+=("$1"); shift; fi; done
+exec /usr/bin/sed "${args[@]}"

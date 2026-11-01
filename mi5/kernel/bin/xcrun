@@ -1,0 +1,4 @@
+#!/bin/bash
+# xcrun stand-in: --sdk X --show-sdk-path -> the iOS SDK; anything else -> HackiOS's shim
+for a in "$@"; do [ "$a" = --show-sdk-path ] && { echo "${XNU_SDK_PATH:?}"; exit 0; }; done
+exec /home/user/oosexgang/hackios-xnu-kernel/xnu-deps/host/bin/xcrun "$@"

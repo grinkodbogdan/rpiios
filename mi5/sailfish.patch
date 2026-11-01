@@ -1,0 +1,549 @@
+diff --git a/shim/build-mi5.sh b/shim/build-mi5.sh
+new file mode 100755
+index 0000000..e187de9
+--- /dev/null
++++ b/shim/build-mi5.sh
+@@ -0,0 +1,47 @@
++#!/bin/bash
++# Build the Xiaomi Mi 5 (gemini) shim and its boot image (rpiios mi5/): start.S + mi5.c
++# + pstore.c + console.c + fdt.c + loader.c, with clang and lld; the payload
++# (tools/mkpayload.py) appended at _end; the Image gzipped with the Mi 5's DTBs
++# appended (LK picks the one for the board), in a v0 boot image for `fastboot boot`.
++# Usage: shim/build-mi5.sh DTB_DIR [PAYLOAD]   -> shim/out/mi5-boot.img
++#   DTB_DIR: the Mi 5's compiled device trees (rpiios mi5/dtb.sh)
++set -euo pipefail
++dtbs=$(realpath "$1")
++payload=${2:+$(realpath "$2")}
++cd "$(dirname "$0")"
++CC="clang --target=aarch64-none-elf"
++CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DMI5"
++mkdir -p out/mi5
++for f in start.S mi5.c pstore.c console.c fdt.c loader.c; do
++	$CC $CFLAGS -c $f -o out/mi5/${f%.*}.o
++done
++# No relocation pass at runtime: only start.o's image_size may be absolute.
++abs=$(llvm-readelf -r out/mi5/mi5.o out/mi5/pstore.o out/mi5/console.o out/mi5/fdt.o out/mi5/loader.o | grep -c ABS64 || true)
++[ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
++ld.lld -static -T shim.ld --build-id=none -N \
++	out/mi5/start.o out/mi5/mi5.o out/mi5/pstore.o out/mi5/console.o out/mi5/fdt.o out/mi5/loader.o -o out/mi5/shim.elf
++llvm-objcopy -O binary out/mi5/shim.elf out/mi5/Image
++size=$(llvm-nm out/mi5/shim.elf | awk '$3=="_end"{print $1}')
++truncate -s $((16#$size)) out/mi5/Image
++[ -z "$payload" ] || cat "$payload" >> out/mi5/Image
++# LK: kernel at 0x80080000, the DTB at 0x82000000 (platform/msm8996 ABOOT_FORCE_*):
++# the Image may not reach it
++img=$(stat -c %s out/mi5/Image)
++[ "$img" -lt $((0x82000000 - 0x80080000)) ] || { echo "error: Image of $img bytes runs into LK's DTB at 0x82000000" >&2; exit 1; }
++gzip -9 -n -c out/mi5/Image > out/mi5/Image.gz
++cat out/mi5/Image.gz "$dtbs"/*.dtb > out/mi5/Image.gz-dtb
++head -c 4096 /dev/zero | gzip -9 -n > out/mi5/ramdisk.gz	# LK wants one; nothing reads it
++python3 - out/mi5/Image.gz-dtb out/mi5/ramdisk.gz out/mi5-boot.img <<'EOF'
++# Android boot image, header v0 (AOSP mkbootimg's layout): base 0x80000000, 4K pages
++import hashlib, struct, sys
++kernel, ramdisk = (open(f, 'rb').read() for f in sys.argv[1:3])
++page, base = 4096, 0x80000000
++sha = hashlib.sha1()
++for part in (kernel, ramdisk, b''):
++	sha.update(part); sha.update(struct.pack('<I', len(part)))
++h = struct.pack('<8s10I16s512s32s1024s', b'ANDROID!', len(kernel), base + 0x8000, len(ramdisk), base + 0x1000000,
++	0, base + 0xf00000, base + 0x100, page, 0, 0, b'', b'rpiios-mi5', sha.digest().ljust(32, b'\0'), b'')
++pad = lambda d: d + b'\0' * (-len(d) % page)
++open(sys.argv[3], 'wb').write(pad(h) + pad(kernel) + pad(ramdisk))
++print(f'{sys.argv[3]}: {len(pad(h) + pad(kernel) + pad(ramdisk))} bytes, kernel {len(kernel)}')
++EOF
+diff --git a/shim/console.c b/shim/console.c
+index abcf2f1..0f391e3 100644
+--- a/shim/console.c
++++ b/shim/console.c
+@@ -11,13 +11,26 @@
+ #define MARGIN		24
+ #define LABEL_COLS	8
+ 
++#ifdef MI5
++volatile uint32_t *con_fb;	/* set by mi5.c (con_clear maps it from FB_BASE) */
++#else
+ volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
++#endif
+ static uint32_t con_bg;
+ static int row;
+ 
+ static void put_px(int x, int y, uint32_t c)
+ {
+-#if FB_BPP == 3
++#ifdef MI5
++	if (FB_BPP == 3) {
++		volatile uint8_t *p = (volatile uint8_t *)con_fb + y * FB_STRIDE + x * 3;
++		p[0] = c;
++		p[1] = c >> 8;
++		p[2] = c >> 16;
++	} else {
++		*(volatile uint32_t *)((uintptr_t)con_fb + y * FB_STRIDE + x * 4) = c;
++	}
++#elif FB_BPP == 3
+ 	/* MDP unpack pattern 0x00020001: bytes B, G, R */
+ 	volatile uint8_t *p = (volatile uint8_t *)con_fb + y * FB_STRIDE + x * 3;
+ 	p[0] = c;
+@@ -30,7 +43,12 @@ static void put_px(int x, int y, uint32_t c)
+ 
+ void con_flush(void)
+ {
+-#ifdef PIXEL1
++#ifdef MI5
++	/* a video-mode panel shows the memory as it changes; a command-mode one as the Pixel's below */
++	if (mi5_fb_video)
++		return;
++#endif
++#if defined(PIXEL1) || defined(MI5)
+ 	/*
+ 	 * Command-mode panel, no autorefresh: MDP CTL0 START sends one frame
+ 	 * (TE wait + transfer, up to ~32 ms). Clear PING_PONG_0_DONE (MDP
+@@ -54,6 +72,9 @@ void con_flush(void)
+ 
+ void con_clear(uint32_t bg)
+ {
++#ifdef MI5
++	con_fb = (volatile uint32_t *)FB_BASE;
++#endif
+ 	for (int y = 0; y < FB_H; y++)
+ 		for (int x = 0; x < FB_W; x++)
+ 			put_px(x, y, bg);
+diff --git a/shim/console.h b/shim/console.h
+index 6255edf..468ad02 100644
+--- a/shim/console.h
++++ b/shim/console.h
+@@ -1,7 +1,16 @@
+ #pragma once
+ #include <stdint.h>
+ 
+-#ifdef PIXEL1
++#ifdef MI5
++/* Xiaomi Mi 5: what LK left on the MDP, read by mi5.c before anything is drawn */
++extern uintptr_t mi5_fb_base;
++extern uint32_t mi5_fb_stride, mi5_fb_bpp, mi5_fb_video;
++#define FB_BASE		mi5_fb_base
++#define FB_W		1080
++#define FB_H		1920
++#define FB_BPP		mi5_fb_bpp	/* bytes a pixel: 3 (RGB888) or 4 */
++#define FB_STRIDE	mi5_fb_stride
++#elif defined(PIXEL1)
+ #define FB_BASE		0xc0001000UL	/* cont_splash_mem = MDP VIG0 SRC0_ADDR */
+ #define FB_W		1080
+ #define FB_H		1920
+@@ -12,7 +21,9 @@
+ #define FB_H		2400
+ #define FB_BPP		4		/* a8r8g8b8, matches mainline simplefb */
+ #endif
++#ifndef MI5
+ #define FB_STRIDE	(FB_W * FB_BPP)
++#endif
+ 
+ #define RED	0xffff0000U
+ #define BLUE	0xff0000a0U
+diff --git a/shim/fdt.c b/shim/fdt.c
+index f553f82..2fc1d51 100644
+--- a/shim/fdt.c
++++ b/shim/fdt.c
+@@ -82,3 +82,59 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
+ 		}
+ 	}
+ }
++
++static int starts(const char *a, const char *b)
++{
++	while (*b && *a == *b)
++		a++, b++;
++	return *b == 0 && (*a == 0 || *a == '@');
++}
++
++int fdt_memory_bank(uintptr_t fdt, uint64_t min_base, uint64_t *base, uint64_t *size)
++{
++	if (!fdt || be32(fdt) != FDT_MAGIC)
++		return 0;
++	uintptr_t p = fdt + be32(fdt + 8);
++	uintptr_t strings = fdt + be32(fdt + 12);
++	int depth = 0, in_mem = 0, found = 0;
++
++	*size = 0;
++	for (;;) {
++		uint32_t tok = be32(p);
++		p += 4;
++		switch (tok) {
++		case FDT_BEGIN_NODE: {
++			const char *name = (const char *)p;
++			depth++;
++			in_mem = depth == 2 && starts(name, "memory");
++			p = align4(skip_str(p));
++			break;
++		}
++		case FDT_END_NODE:
++			in_mem = 0;
++			depth--;
++			break;
++		case FDT_PROP: {
++			uint32_t len = be32(p), nameoff = be32(p + 4);
++			uintptr_t val = p + 8;
++			if (in_mem && streq((const char *)(strings + nameoff), "reg")) {
++				for (uint32_t o = 0; o + 16 <= len; o += 16) {
++					uint64_t b = (uint64_t)be32(val + o) << 32 | be32(val + o + 4);
++					uint64_t s = (uint64_t)be32(val + o + 8) << 32 | be32(val + o + 12);
++					if (b >= min_base && s > *size) {
++						*base = b;
++						*size = s;
++						found = 1;
++					}
++				}
++			}
++			p = align4(val + len);
++			break;
++		}
++		case FDT_NOP:
++			break;
++		default:
++			return found;
++		}
++	}
++}
+diff --git a/shim/fdt.h b/shim/fdt.h
+index df141f7..a1f9292 100644
+--- a/shim/fdt.h
++++ b/shim/fdt.h
+@@ -3,3 +3,5 @@
+ 
+ /* Read a u32/u64 (cell-size agnostic) property of /chosen. Returns 0 if absent. */
+ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out);
++/* The largest bank of /memory (2-cell addresses and sizes) at or above min_base. Returns 0 if none. */
++int fdt_memory_bank(uintptr_t fdt, uint64_t min_base, uint64_t *base, uint64_t *size);
+diff --git a/shim/loader.c b/shim/loader.c
+index 69e5fb4..618d72a 100644
+--- a/shim/loader.c
++++ b/shim/loader.c
+@@ -139,6 +139,42 @@ const char *loader_boot_rd(uint64_t rd_start, uint64_t rd_end)
+ 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
+ 		ba->CommandLine[i] = p->cmdline[i];
+ 	ba->memSizeActual = p->mem_size;
++#ifdef MI5
++	/*
++	 * The size LK reported for the upper bank (3 or 4 GB models), not the one
++	 * the payload was built with: into boot_args and into the ADT's
++	 * /chosen dram-size (a property is a 32-byte name, a u32 length, the value).
++	 */
++	if (mi5_mem_size != 0) {
++		ba->memSize = mi5_mem_size;
++		ba->memSizeActual = mi5_mem_size;
++		for (uint64_t o = 0; o + 44 <= p->adt_size; o += 4) {
++			const volatile char *n = (const volatile char *)(adt_pa + o);
++			static const char want[] = "dram-size";
++			int k;
++			for (k = 0; k < (int)sizeof(want) && n[k] == want[k]; k++)
++				;
++			if (k == (int)sizeof(want) && *(volatile uint32_t *)(adt_pa + o + 32) == 8) {
++				*(volatile uint32_t *)(adt_pa + o + 36) = (uint32_t)mi5_mem_size;
++				*(volatile uint32_t *)(adt_pa + o + 40) = (uint32_t)(mi5_mem_size >> 32);
++				con_hex("DRAMSIZE", mi5_mem_size);
++				break;
++			}
++		}
++	}
++	/* boot-args: the payload's, then what mi5.c found on the MDP */
++	{
++		int n = 0;
++		while (n < BOOT_LINE_LENGTH - 1 && ba->CommandLine[n])
++			n++;
++		for (int i = 0; mi5_bootargs[i] && n < BOOT_LINE_LENGTH - 2; i++) {
++			if (i == 0)
++				ba->CommandLine[n++] = ' ';
++			ba->CommandLine[n++] = mi5_bootargs[i];
++		}
++		ba->CommandLine[n] = 0;
++	}
++#endif
+ 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
+ 
+ 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
+diff --git a/shim/loader.h b/shim/loader.h
+index 0b48d13..26c8a50 100644
+--- a/shim/loader.h
++++ b/shim/loader.h
+@@ -5,3 +5,8 @@
+ const char *loader_boot(uintptr_t dtb);
+ /* Same, for a payload already at [rd_start, rd_end). */
+ const char *loader_boot_rd(uint64_t rd_start, uint64_t rd_end);
++#ifdef MI5
++/* Mi 5: set by mi5.c before loader_boot_rd: RAM for the kernel, and boot-args to add */
++extern uint64_t mi5_mem_size;
++extern char mi5_bootargs[160];
++#endif
+diff --git a/shim/mi5.c b/shim/mi5.c
+new file mode 100644
+index 0000000..ddb83b3
+--- /dev/null
++++ b/shim/mi5.c
+@@ -0,0 +1,209 @@
++/*
++ * Xiaomi Mi 5 (gemini, MSM8996) shim: the Pixel 1's (pixel.c) on another board of
++ * the same SoC. Before anything is drawn it reads, off the MDP, what LK left
++ * running (rpiios mi5/README.md):
++ *   pipe     the one staged on layer mixer 0 by CTL0 (LAYER0 0x902000: VIG0 [2:0],
++ *            RGB0 [11:9], DMA0 [20:18]); its SRC0_ADDR, YSTRIDE and SRC_FORMAT
++ *            (bytes a pixel - 1 in [10:9]) are the splash framebuffer
++ *   mode     CTL0 OP (0x902014) bit 17: a command-mode panel (refreshed by CTL0
++ *            START, as the Pixel's) or a video-mode one (refreshes by itself)
++ *   memory   the upper DDR bank from LK's /memory (1 GB on the 3 GB model, 2 GB
++ *            on the 4 GB one): XNU's, as on the Pixel
++ * and hands them to the kernel as boot-args (sweetfb_*: pexpert/arm/pe_serial.c)
++ * and in boot_args/ADT (loader.c). The payload is appended at _end as on the
++ * Pixel; LK puts the DTB at 0x82000000, which bounds it.
++ * Progress also goes to the ramoops console zone (pstore.c, 0x92920000).
++ */
++#include <stdint.h>
++#include "console.h"
++#include "fdt.h"
++#include "loader.h"
++#include "pstore.h"
++
++#define PSCI_SYSTEM_RESET	0x84000009UL
++#define APSS_WDT		0x9830000UL	/* qcom,wdt@9830000 (msm8996.dtsi) */
++#define WDT_EN			0x08
++
++#define MDP			0x901000UL	/* MDSS + 0x1000 */
++#define CTL0_LAYER0		0x902000UL
++#define CTL0_OP			0x902014UL
++#define CTL_OP_CMD_MODE		(1u << 17)
++#define SSPP_SRC0_ADDR		0x14
++#define SSPP_SRC_YSTRIDE	0x24
++#define SSPP_SRC_FORMAT		0x30
++
++#define UPPER_BANK		0x100000000UL
++
++#define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
++
++static inline uint32_t rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
++static inline void wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
++
++uintptr_t mi5_fb_base = 0x83401000UL;	/* msm8996.dtsi cont_splash_mem, until read */
++uint32_t mi5_fb_stride = 1080 * 3, mi5_fb_bpp = 3, mi5_fb_video;
++uint64_t mi5_mem_size;
++char mi5_bootargs[160];
++
++extern char _end[];
++
++static void __attribute__((noreturn)) psci_reset(void)
++{
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++	__asm__ volatile("dsb sy; smc #0" : "+r"(x0) : : "memory");
++	for (;;)
++		__asm__ volatile("wfe");
++}
++
++static void delay_ms(unsigned ms)
++{
++	uint64_t end = rsr("cntpct_el0") + rsr("cntfrq_el0") / 1000 * ms;
++	while (rsr("cntpct_el0") < end)
++		;
++}
++
++/* tiny formatting for the boot-args: decimal and 0x-hex */
++static char *put_s(char *o, char *end, const char *s)
++{
++	while (*s && o < end)
++		*o++ = *s++;
++	return o;
++}
++
++static char *put_u(char *o, char *end, uint64_t v, int hex)
++{
++	char t[20];
++	int n = 0;
++	if (hex)
++		o = put_s(o, end, "0x");
++	do {
++		t[n++] = "0123456789abcdef"[v % (hex ? 16 : 10)];
++		v /= hex ? 16 : 10;
++	} while (v && n < 20);
++	while (n && o < end)
++		*o++ = t[--n];
++	return o;
++}
++
++static const char *pipe_name(uintptr_t pipe)
++{
++	switch (pipe - MDP) {
++	case 0x4000: return "VIG0";
++	case 0x6000: return "VIG1";
++	case 0x14000: return "RGB0";
++	case 0x16000: return "RGB1";
++	case 0x24000: return "DMA0";
++	default: return "?";
++	}
++}
++
++/* The pipe on mixer 0 and its buffer; 0 if LK left none we know. */
++static uintptr_t display_probe(void)
++{
++	static const struct { uint32_t shift; uintptr_t pipe; } stages[] = {
++		{0, MDP + 0x4000}, {3, MDP + 0x6000}, {9, MDP + 0x14000}, {12, MDP + 0x16000}, {18, MDP + 0x24000},
++	};
++	uint32_t layer = rd32(CTL0_LAYER0);
++	uintptr_t pipe = 0;
++
++	for (unsigned i = 0; i < sizeof(stages) / sizeof(stages[0]); i++) {
++		if (((layer >> stages[i].shift) & 7u) != 0 && rd32(stages[i].pipe + SSPP_SRC0_ADDR) != 0) {
++			pipe = stages[i].pipe;
++			break;
++		}
++	}
++	if (pipe == 0)
++		return 0;
++	uint32_t addr = rd32(pipe + SSPP_SRC0_ADDR);
++	uint32_t stride = rd32(pipe + SSPP_SRC_YSTRIDE) & 0xffffu;
++	uint32_t bpp = ((rd32(pipe + SSPP_SRC_FORMAT) >> 9) & 3u) + 1u;
++	if ((bpp != 3 && bpp != 4) || stride < 1080 * bpp)
++		return 0;
++	mi5_fb_base = addr;
++	mi5_fb_stride = stride;
++	mi5_fb_bpp = bpp;
++	mi5_fb_video = !(rd32(CTL0_OP) & CTL_OP_CMD_MODE);
++	return pipe;
++}
++
++void shim_main(uint64_t dtb)
++{
++	/* LK leaves the APSS watchdog running. */
++	uint32_t wdt_en = rd32(APSS_WDT + WDT_EN);
++	wr32(APSS_WDT + WDT_EN, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	plog_init();
++	plog_str("MI5 SHIM: loader\n");
++	plog_hex("WDT_EN was", wdt_en);
++	plog_hex("DTB", dtb);
++	plog_hex("PAYLOAD", (uintptr_t)_end);
++
++	uintptr_t pipe = display_probe();
++	plog_hex("PIPE", pipe);
++	plog_hex("FB", mi5_fb_base);
++	plog_hex("STRIDE", mi5_fb_stride);
++	plog_hex("VIDEO", mi5_fb_video);
++
++	con_clear(0);
++	con_str("SHIM", "xiaomi mi 5 (gemini) loader");
++	con_skip();
++	con_str("DISPLAY", pipe ? pipe_name(pipe) : "pipe not found, LK's default assumed");
++	con_hex2("FB", "pa=", (uint32_t)mi5_fb_base, "stride=", mi5_fb_stride);
++	con_str("PANEL", mi5_fb_video ? "video mode" : "command mode");
++
++	uint64_t base = 0, size = 0;
++	if (fdt_memory_bank(dtb, UPPER_BANK, &base, &size) && base == UPPER_BANK) {
++		mi5_mem_size = size & ~0x3fffUL;
++		con_hex2("RAM", "4G+ MB=", (uint32_t)(size >> 20), (const char *)0, 0);
++	} else {
++		con_str("RAM", "no upper bank in LK's /memory: the payload's size");
++	}
++	plog_hex("MEM", mi5_mem_size);
++
++	char *o = mi5_bootargs, *end = mi5_bootargs + sizeof(mi5_bootargs) - 1;
++	o = put_s(o, end, "sweetfb_pa=");
++	o = put_u(o, end, mi5_fb_base, 1);
++	o = put_s(o, end, " sweetfb_stride=");
++	o = put_u(o, end, mi5_fb_stride, 0);
++	o = put_s(o, end, " sweetfb_bpp=");
++	o = put_u(o, end, mi5_fb_bpp * 8, 0);
++	o = put_s(o, end, " sweetfb_video=");
++	o = put_u(o, end, mi5_fb_video, 0);
++	if (pipe) {
++		o = put_s(o, end, " sweetfb_pipe=");
++		o = put_u(o, end, pipe, 1);
++	}
++	*o = 0;
++	plog_str(mi5_bootargs);
++	plog_str("\n");
++
++	/* the payload ends below the DTB LK placed: anything else means it was cut short */
++	const char *why;
++	if (dtb <= (uintptr_t)_end)
++		why = "the DTB lies inside the payload: image too large for LK";
++	else
++		why = loader_boot_rd((uintptr_t)_end, dtb);
++	plog_str("LOADER: ");
++	plog_str(why);
++	plog_str("\n");
++	con_str("LOADER", why);
++	con_str("RESET", "in 15s");
++	con_flush();
++	delay_ms(15000);
++	psci_reset();
++}
++
++void secondary_main(uint64_t idx)
++{
++	(void)idx;
++}
++
++void exc_handler(uint64_t slot, uint64_t *regs)
++{
++	(void)regs;
++	plog_hex("EXC slot", slot);
++	plog_hex("ESR", rsr("esr_el1"));
++	plog_hex("FAR", rsr("far_el1"));
++	plog_hex("ELR", rsr("elr_el1"));
++	psci_reset();
++}
+diff --git a/shim/pstore.c b/shim/pstore.c
+index 0027951..4017913 100644
+--- a/shim/pstore.c
++++ b/shim/pstore.c
+@@ -7,7 +7,12 @@
+  */
+ #include "pstore.h"
+ 
++#ifdef MI5
++/* Mi 5: ramoops_mem@92900000 (1 MB): 4 x 32K dump records, then the 512K console zone */
++#define PRZ_BASE	0x92920000UL
++#else
+ #define PRZ_BASE	0x83540000UL
++#endif
+ #define PRZ_DATA_MAX	(0x80000UL - 12)
+ #define PRZ_SIG		0x43474244U	/* "DBGC" */
+ 
+diff --git a/tools/mkadt.py b/tools/mkadt.py
+index dd13ad8..a5fd864 100644
+--- a/tools/mkadt.py
++++ b/tools/mkadt.py
+@@ -2,7 +2,7 @@
+ """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
+ 
+ Only what the early boot path actually reads (see NOTES.md); every MMIO
+-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--pixel1]
++address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--pixel1] [--mi5]
+ --pixel1: Google Pixel 1 (sailfish, MSM8996) presented as an iPhone 8 instead.
+ """
+ import hashlib, os, struct, sys
+@@ -47,6 +47,18 @@ PIXEL1 = dict(
+           (0x100, 1, 2150400000), (0x101, 1, 2150400000)],
+ )
+ 
++# Xiaomi Mi 5 (gemini, MSM8996; rpiios mi5/): the Pixel 1's SoC, so everything
++# but the board: LK's splash at msm8996.dtsi cont_splash_mem (the shim reads the
++# real one off the MDP and passes it as boot-args), a 1 GB upper bank (the 3 GB
++# model; the shim writes the size LK reports into dram-size and boot_args), and
++# MSM8996's clocks (1.59 + 2.15 GHz; the Pixel's 821 runs faster).
++MI5 = dict(
++    phys_base=0x100000000, mem_size=0x40000000,
++    fb=0x83401000, fb_size=0x23ff000,
++    cpus=[(0x0, 0, 1593600000), (0x1, 0, 1593600000),
++          (0x100, 1, 2150400000), (0x101, 1, 2150400000)],
++)
++
+ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
+ 
+ # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
+@@ -310,6 +322,9 @@ def build(seed=None, qemu=False, highmem=False, pixel1=False):
+ 
+ 
+ if __name__ == '__main__':
++    if '--mi5' in sys.argv:
++        PIXEL1.update(MI5)
++        sys.argv.append('--pixel1')
+     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, pixel1='--pixel1' in sys.argv)
+     blob = adt.serialize(root)
+     open(sys.argv[1], 'wb').write(blob)
