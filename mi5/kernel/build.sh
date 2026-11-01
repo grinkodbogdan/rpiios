@@ -37,6 +37,7 @@ if [ ! -f "$W/sdk/.firehose-macos" ]; then
 		-I$hdrs/osfmk -I$hdrs/bsd -I$hdrs/libkern -I$hdrs/pexpert -I$hdrs/iokit -I$hdrs/security \
 		-I$W/xnu/libkern/firehose -I$hdrs/libkern/os -I$W/xnu/EXTERNAL_HEADERS -I$SDK/usr/local/include/kernel \
 		-o "$W/firehose/firehose_buffer.o" libdispatch/src/firehose/firehose_buffer.c)
+	mkdir -p "$SDK/usr/local/lib/kernel"
 	rm -f "$SDK/usr/local/lib/kernel/libfirehose_kernel.a"
 	libtool -static -o "$SDK/usr/local/lib/kernel/libfirehose_kernel.a" "$W/firehose/firehose_buffer.o"
 	touch "$W/sdk/.firehose-macos"

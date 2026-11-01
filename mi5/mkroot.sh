@@ -10,7 +10,7 @@
 #      7-Zip's own listing of each image
 #   3. sailfish's additions on that tree: the shared cache and the cryptex files linked where
 #      dyld looks at ignition level 1, logd's stores, the plain system keybag, the stock apps
-#      moved into /Applications, then its tools/sweet-root-tweaks.py
+#      moved into /Applications, sweetgl.dylib if built, then its tools/sweet-root-tweaks.py
 #   4. a case-sensitive journaled HFS+ volume (mkfs.hfsplus), filled through the kernel's
 #      hfsplus where there is one, else through libguestfs (WSL2's kernel has no hfsplus), then
 #      fsck.hfsplus
@@ -134,6 +134,13 @@ if [[ -d $S/private/var/staged_system_apps ]]; then
 		[[ -e $a ]] || continue
 		[[ -e $S/Applications/${a##*/} ]] || mv "$a" "$S/Applications/"
 	done
+fi
+# the GL library for backboardd (mi5/sweetgl/build.sh; mkboot.sh injects it when it is built)
+if [[ -s $W/sweetgl/sweetgl.dylib ]]; then
+	install -m 0755 -o 0 -g 0 "$W/sweetgl/sweetgl.dylib" "$S/usr/lib/sweetgl.dylib"
+	echo "mkroot.sh: /usr/lib/sweetgl.dylib installed"
+else
+	echo "mkroot.sh: no $W/sweetgl/sweetgl.dylib: the root has no GPU drawing (mi5/sweetgl/build.sh)"
 fi
 python3 -I "$W/sailfish/tools/sweet-root-tweaks.py" "$S"
 du -sh "$S"

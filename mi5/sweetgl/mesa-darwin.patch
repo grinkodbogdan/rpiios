@@ -1,0 +1,30 @@
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -25,7 +25,11 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include "drm-uapi/drm_fourcc.h"
++#ifdef __APPLE__
++#include "util/os_misc.h"
++#else
+ #include <sys/sysinfo.h>
++#endif
+ 
+ #include "freedreno_fence.h"
+ #include "freedreno_perfetto.h"
+@@ -1009,9 +1013,15 @@
+    if (driQueryOptionb(config->options, "disable_explicit_sync_heuristic"))
+       fd_device_disable_explicit_sync_heuristic(dev);
+ 
++#ifdef __APPLE__
++   uint64_t ram_size = 0;
++   os_get_total_physical_memory(&ram_size);
++   screen->ram_size = ram_size;
++#else
+    struct sysinfo si;
+    sysinfo(&si);
+    screen->ram_size = si.totalram;
++#endif
+ 
+    DBG("Pipe Info:");
+    DBG(" GPU-id:          %s", fd_dev_name(screen->dev_id));

@@ -33,6 +33,15 @@ unchanged.
   With LineageOS on the phone: `adb pull /vendor/firmware/a530_pm4.fw` (and the same for the
   others; on some builds they are in `/system/vendor/firmware` or `/firmware/image`). They are
   Qualcomm's and Xiaomi's files and are not in this repository.
+- For Wi-Fi, also the phone's QCA6174 files: `otp30.bin`, `qwlan30.bin`, `bdwlan30.bin` and any
+  `bdwlan30.b??` next to them. They are not in LineageOS's vendor tree but on the phone's
+  firmware partitions; find them with a root shell:
+  `adb shell su -c "find / -name 'qwlan30*' -o -name 'otp30*' -o -name 'bdwlan30*' 2>/dev/null"`.
+  Put them in the same folder as the Adreno files. Without them, everything else still works,
+  only without Wi-Fi.
+- [Theos](https://theos.dev/docs/installation-linux) with its Linux toolchain, and the iOS 16.5
+  SDK from [theos/sdks](https://github.com/theos/sdks) in `~/theos/sdks`. HackiOS's toolchain
+  builds on top of it.
 
 Packages (Ubuntu/WSL):
 
@@ -52,12 +61,19 @@ Linux with hfsplus, the volume is mounted directly instead.
 git clone https://github.com/grinkodbogdan/rpiios && cd rpiios
 git clone https://github.com/oosexgang/hackios-xnu-kernel ~/hackios
 (cd ~/hackios && xnu-deps/setup.sh --stage1)        # Darwin toolchain: cctools, ld64, mig, SDK overlay
+python3 -m venv ~/hackios/xnu-deps/build/mesa/venv && ~/hackios/xnu-deps/build/mesa/venv/bin/pip install meson mako
 
 mi5/kernel/setup.sh ~/mi5 ~/hackios                 # XNU 8796.141.3 + sailfish + Linux + Mi 5 patches
 mi5/kernel/build.sh ~/mi5 ~/hackios                 # -> ~/mi5/xnu/BUILD/obj/kernel.development.sweet
-mi5/mkboot.sh ~/mi5 ~/a530-firmware                 # -> ~/mi5/mi5-boot.img
+mi5/sweetgl/build.sh ~/mi5 ~/hackios                # -> ~/mi5/sweetgl/sweetgl.dylib (GPU drawing)
+mi5/mkboot.sh ~/mi5 ~/mi5-firmware                  # -> ~/mi5/mi5-boot.img
 sudo mi5/mkroot.sh ~/mi5 ~/hackios ~/mi5/ios-root.img   # -> the iOS root (downloads 7.4 GB from Apple)
 ```
+
+Keep that order: `sweetgl/build.sh` before the other two. `mkboot.sh` turns GPU drawing on when
+`sweetgl.dylib` exists, and `mkroot.sh` installs it into the root. A boot image with GPU drawing
+on a root without the library leaves the screen on the boot log. `NOGL=1 mi5/mkboot.sh ...`
+makes a CPU-drawing image, which works on any root.
 
 `mkroot.sh` takes 30 to 90 minutes. It fetches the iPhone 8 iOS 16.7.16 (20H392) images straight
 from Apple's CDN, extracts them with 7-Zip and HackiOS's LZBITMAP decoder, restores owners, modes
@@ -79,7 +95,8 @@ What you should see:
 
 1. The shim's screen for a moment: `SHIM xiaomi mi 5`, the display pipe it found
    (`VIG0`, `RGB0` or `DMA0`), command or video mode, the RAM size.
-2. The XNU verbose log (`-v`), which stays on screen until SpringBoard draws.
+2. The XNU verbose log (`-v`). It stays on screen until iOS shows its first frame
+   (`sweetfb_noconsole=1`), and after that it only goes to the logs.
 3. The first boot takes several minutes longer: iOS builds its caches and runs its data
    migration. Then the lock screen. The home key unlocks, as on an iPhone 8.
 
@@ -94,6 +111,9 @@ This is built and checked here, but **not yet run on a Mi 5**: there is no phone
 
 Done:
 - kernel, shim, ADT, payload and boot image build on Linux from these scripts;
+- `sweetgl.dylib` builds on Linux: Mesa 26.1.0 with sailfish's patch, linked with ld64 against
+  Theos's iOS 16.5 SDK (sailfish uses Xcode's 17.5 SDK, targeting iOS 16.0 too), signed ad hoc
+  with ldid;
 - the shim's FDT memory-bank parser was tested on the host against the Mi 5's DTBs;
 - the root builder's extract, metadata and HFS+ steps were tested end to end on the App cryptex
   (owners, modes and 194 hard links kept; `fsck.hfsplus` clean).
@@ -102,11 +122,10 @@ The first boot on the phone is what will show whether LK's display state, the to
 the keys match the Mi 5 device trees they were taken from.
 
 Not there yet:
-- **Wi-Fi.** The QCA6174 is the same chip on the same PCIe port as the Pixel's, but its
-  `qwlan30.bin` / `otp30.bin` / `bdwlan30.*` are not in the payload yet (`sailfishwlan=0`).
-- **GPU-accelerated drawing.** The GPU firmware is loaded (`sweetgpu=8`), but sailfish's
-  `sweetgl.dylib` (Mesa for backboardd) is built on a Mac, so CoreAnimation draws on the CPU.
-  It is slower, but it works.
+- **Wi-Fi** needs the phone's own firmware files (see *What you need*). With them, `mkboot.sh`
+  adds them and turns Wi-Fi on (`sailfishwlan=1`). The QCA6174 is the same chip on the same
+  PCIe port as the Pixel's, and the kernel picks the board file from the board ID that the chip
+  reports. Join a network from Settings, or add `ARGS_EXTRA="sailfishssid=NAME sailfishpsk=PASS"`.
 - No modem, camera, audio, sensors or fingerprint, the same as on the Pixel.
 
 ## Files
@@ -118,7 +137,8 @@ Not there yet:
 | `kernel/mi5.patch` | the Mi 5 board: framebuffer from boot-args (any pipe, video-mode panels), Atmel mXT touch next to Synaptics, the four keys, the RAM console address |
 | `sailfish.patch` | sailfish's shim and ADT generator for the Mi 5 (`shim/mi5.c`, `shim/build-mi5.sh`, `mkadt.py --mi5`) |
 | `dtb.sh` | the Mi 5's device trees from LineageOS's kernel, for LK |
-| `mkboot.sh` | `mi5-boot.img`: shim + kernel + ADT + boot-args + GPU firmware |
+| `mkboot.sh` | `mi5-boot.img`: shim + kernel + ADT + boot-args + GPU (and Wi-Fi) firmware |
+| `sweetgl/build.sh`, `sweetgl/mesa-darwin.patch` | sailfish's `sweetgl.dylib` (Mesa freedreno for backboardd) built on Linux |
 | `mkroot.sh`, `tools/fixmeta.py`, `tools/ipsw.py` | the iOS root, on Linux or WSL |
 
 ios-sailfish has no license file, so none of its files are copied here: they are fetched at
