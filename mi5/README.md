@@ -120,7 +120,13 @@ First run on a Mi 5 (3 GB model, Synaptics touch), 1 November 2026:
 Second run, with `ios-root.img` flashed (CPU drawing): **iOS 16.7.16 boots to the lock screen
 and the home screen** (status bar, dock, widgets, Low Battery alert). Power, volume and home work,
 and home unlocks. Touch did not reach iOS, although the kernel logged touches before iOS started;
-this is being investigated.
+this was the touch and key drivers giving up after one failed start-up step, fixed by
+retrying (commit "touch and keys recover").
+
+Third run, with `sweetgl.dylib` in the root: **GPU drawing works** (backboardd loads it, Mesa
+freedreno on the Adreno 530), together with touch and all four keys. Some stutter: sailfish's CPU
+boost (`ARGS_EXTRA="sweetboost=1824 sweetboostpwr=1478"`, clamped to the 820's 2150/1593 MHz)
+is the next thing to try.
 
 Done:
 - kernel, shim, ADT, payload and boot image build on Linux from these scripts;
