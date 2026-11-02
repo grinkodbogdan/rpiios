@@ -138,7 +138,7 @@ index 0c548d1..d25ea9c 100644
  	if (kr == KERN_SUCCESS) {
  		thread_deallocate(thread);
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 3f2c89d..46f07c1 100644
+index 3f2c89d..53249ee 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
 @@ -18,8 +18,23 @@
@@ -364,7 +364,31 @@ index 3f2c89d..46f07c1 100644
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -530,7 +689,11 @@ touch_thread(void *arg, wait_result_t result)
+@@ -526,11 +685,35 @@ touch_thread(void *arg, wait_result_t result)
+ 	    touch_rd(st.gpio[1], 4) & 1u, touch_rd(st.gpio[2], 0), touch_rd(st.gpio[2], 4) & 1u,
+ 	    touch_rd(st.gpio[3], 0), touch_rd(st.gpio[3], 4) & 1u, touch_rd(st.gpio[4], 0),
+ 	    touch_rd(st.gpio[4], 4) & 1u);
++#if SWEET_MI5
++	/*
++	 * Mi 5: touch did not come up on some boots (with the keys and the battery's charger
++	 * set-up running at the same time), and stayed dead for the whole boot. Every attempt
++	 * here does the whole start-up again: rail, clocks, the controller's AVDD switched off
++	 * and on (a real power cycle), reset, probe. Retried every 2 s until it answers, and
++	 * again after ~3 s of failed reads later on.
++	 */
++	unsigned attempt = 0;
++probe:
++	if (attempt++ > 0) {
++		printf("SWEET TOUCH: start-up attempt %u: power cycle\n", attempt);
++		touch_gpio(2, 0, 3, 16, true, false);   /* reset held low */
++		touch_gpio(4, 0, 0, 2, true, false);    /* AVDD off */
++		touch_wait(100);
++		if (attempt > 2) {
++			touch_wait(1900);
++		}
++	}
++#endif
+ 	int rails = 1;
  	(void)PE_parse_boot_argn("sweetrpm", &rails, sizeof(rails));
  	if (rails) {
  		static const struct { unsigned ldo; uint32_t uv; } on[] = {
@@ -376,36 +400,30 @@ index 3f2c89d..46f07c1 100644
  		};
  		for (unsigned i = 0; i < sizeof(on) / sizeof(on[0]); i++) {
  			(void)sweet_rpm_ldoa(on[i].ldo, on[i].uv);
-@@ -553,8 +716,27 @@ touch_thread(void *arg, wait_result_t result)
- 	if (!touch_clocks()) {
- 		goto out;
+@@ -551,10 +734,21 @@ touch_thread(void *arg, wait_result_t result)
+ 		    ok ? "ok" : "READ FAILED", en, rng, vset);
  	}
+ 	if (!touch_clocks()) {
++#if SWEET_MI5
++		goto probe;
++#else
+ 		goto out;
++#endif
++	}
 +#if SWEET_MI5
 +	if (!(touch_rd(st.gpio[4], 4) & 1u) || !(touch_rd(st.gpio[4], 0) & 0x200u)) {
 +		touch_gpio(4, 0, 0, 2, true, true);     /* disp_vddts_vreg: touch AVDD on */
 +		touch_wait(5);                          /* DT startup-delay-us 4000 */
-+	}
+ 	}
 +#else
  	touch_gpio(4, 0, 0, 2, true, false);    /* I2C mux to the AP */
 -	touch_gpio(0, 3, 0, 8, false, false);   /* blsp_i2c3, no pull (board pull-ups) */
-+#endif
-+#if SWEET_MI5
-+	/*
-+	 * Mi 5: the controller did not always answer its one probe (touch dead for that boot):
-+	 * reset and probe again every 2 s until it does, and again if reads keep failing later.
-+	 */
-+	unsigned attempt = 0;
-+probe:
-+	if (attempt++ > 0) {
-+		printf("SWEET TOUCH: probe attempt %u\n", attempt);
-+		touch_wait(2000);
-+	}
 +#endif
 +	touch_gpio(0, 3, 0, 8, false, false);   /* blsp_i2c (function 3 on both boards), no pull (board pull-ups) */
  	touch_gpio(1, 3, 0, 8, false, false);
  	touch_gpio(3, 0, 3, 16, false, false);  /* attention: input, pull-up */
  	/* DT: reset-active-ms 1, reset-delay-ms 20; give the firmware more time to boot. */
-@@ -565,8 +747,28 @@ touch_thread(void *arg, wait_result_t result)
+@@ -565,8 +759,28 @@ touch_thread(void *arg, wait_result_t result)
  	printf("SWEET TOUCH: after reset: sda=%u scl=%u attn=%u mux=%#x/%u\n",
  	    touch_rd(st.gpio[0], 4) & 1u, touch_rd(st.gpio[1], 4) & 1u, touch_rd(st.gpio[3], 4) & 1u,
  	    touch_rd(st.gpio[4], 0), touch_rd(st.gpio[4], 4) & 1u);
@@ -435,7 +453,7 @@ index 3f2c89d..46f07c1 100644
  	}
  	uint32_t hz = 60;
  	(void)PE_parse_boot_argn("sweettouchhz", &hz, sizeof(hz));
-@@ -575,7 +777,7 @@ touch_thread(void *arg, wait_result_t result)
+@@ -575,7 +789,7 @@ touch_thread(void *arg, wait_result_t result)
  	}
  	int irq = 1;
  	(void)PE_parse_boot_argn("sweettouchirq", &irq, sizeof(irq));
@@ -444,7 +462,7 @@ index 3f2c89d..46f07c1 100644
  		touch_wr(st.gpio[3], TLMM_INTR_CFG, TLMM_INTR_CFG_ON);
  		touch_wr(st.gpio[3], TLMM_INTR_STATUS, 0);
  		touch_irq_on = sweet_spi_attach(TOUCH_IRQ_INTID, false, touch_irq, NULL);
-@@ -589,7 +791,7 @@ touch_thread(void *arg, wait_result_t result)
+@@ -589,7 +803,7 @@ touch_thread(void *arg, wait_result_t result)
  		 * anyway after a second.
  		 */
  		if (!(touch_rd(st.gpio[3], 4) & 1u) || touch_irq_on || (++ticks % 20u) == 0) {
@@ -453,7 +471,7 @@ index 3f2c89d..46f07c1 100644
  			if (err) {
  				if ((errors++ % 100u) == 0) {
  					printf("SWEET TOUCH: read err=%d status=%#x flags=%#x\n",
-@@ -598,6 +800,13 @@ touch_thread(void *arg, wait_result_t result)
+@@ -598,6 +812,13 @@ touch_thread(void *arg, wait_result_t result)
  				if (errors == 10) {
  					touch_report(0, st.x, st.y);   /* release after persistent bad reads */
  				}
